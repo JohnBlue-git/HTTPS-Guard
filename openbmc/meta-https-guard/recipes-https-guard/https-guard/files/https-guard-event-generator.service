@@ -1,0 +1,13 @@
+[Unit]
+Description=HTTPS-Guard eBPF Signal Generator (QEMU simulation)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/https-guard
+ExecStart=/usr/sbin/https-guard-event-generator
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

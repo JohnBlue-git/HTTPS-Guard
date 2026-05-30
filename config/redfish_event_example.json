@@ -1,0 +1,18 @@
+{
+  "@odata.type": "#Event.v1_7_0.Event",
+  "Name": "Platform Security Anomaly Event",
+  "Id": "98452",
+  "Events": [
+    {
+      "EventId": "abc8723-ef88",
+      "Severity": "Critical",
+      "MessageId": "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation",
+      "Message": "Security violation: Process 'curl' (PID 12043) attempted an HTTPS connection using an insecure TLS version (TLS 1.0). Packet was blocked.",
+      "MessageArgs": ["curl", "12043", "TLS 1.0"],
+      "EventTimestamp": "2026-05-30T15:45:00Z",
+      "OriginOfCondition": {
+        "@odata.id": "/redfish/v1/Managers/BMC"
+      }
+    }
+  ]
+}

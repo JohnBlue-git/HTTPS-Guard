@@ -1,0 +1,14 @@
+[Unit]
+Description=HTTPS-Guard Event Bridge (DBus/Journal)
+After=network.target xyz.openbmc_project.Logging.service
+Wants=xyz.openbmc_project.Logging.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/https-guard
+ExecStart=/usr/sbin/https-guard-event-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
