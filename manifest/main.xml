@@ -1,0 +1,9 @@
+<manifest>
+	<remote name="openbmc" fetch="https://github.com/" />
+	<remote name="johnblue" fetch="https://github.com/JohnBlue-git/" />
+
+	<default remote="johnblue" revision="main" sync-j="4" />
+
+	<project remote="openbmc" name="openbmc/openbmc" revision="master" path="." />
+	<project remote="johnblue" name="HTTPS-Guard" revision="main" path="meta-https-guard" />
+</manifest>

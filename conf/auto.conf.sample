@@ -1,0 +1,5 @@
+# Sample auto.conf additions for building with HTTPS-Guard layer
+# Add these lines to build/<machine>/conf/auto.conf
+BBLAYERS:append = " ${TOPDIR}/.."
+IMAGE_INSTALL:append = " https-guard-openbmc"
+DISTRO_FEATURES:append = " systemd"
