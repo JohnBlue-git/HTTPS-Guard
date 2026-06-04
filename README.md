@@ -228,5 +228,3 @@ curl -k -N \
 ```
 
 If BMC authentication is enabled, add `-u <user>:<password>` to the `curl` commands above. Use the HTTPS push subscription when you want the BMC to POST events to another service. Use SSE when you want to watch the event stream directly from a terminal without creating a subscription destination.
-
-For architecture and data-flow details, see `docs/architecture.md`.
