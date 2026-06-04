@@ -17,6 +17,12 @@ BB_DISKMON_DIRS ??= "\
     HALT,/tmp,10M,1K"
 CONF_VERSION = "2"
 
+# Force selecting compiler for bitbake nodejs-native
+HOSTTOOLS += " gcc-12 g++-12 cpp-12"
+BUILD_CC:pn-nodejs-native = "gcc-12 "
+BUILD_CXX:pn-nodejs-native = "g++-12 "
+BUILD_CPP:pn-nodejs-native = "cpp-12 "
+
 # Shallow git fetching: download only the specific commit instead of full
 # repo history. Critical for large repos like openbmc/linux (~5GB full mirror).
 BB_GIT_SHALLOW = "1"
@@ -25,5 +31,3 @@ BB_GIT_SHALLOW_DEPTH = "1"
 # Increase git fetch timeout for large repos on slow connections
 BB_FETCH_PREMIRRORONLY = "0"
 FETCHCMD_git = "git -c core.fsyncobjectfiles=0"
-
-require conf/machine/include/obmc-bsp-common.inc
