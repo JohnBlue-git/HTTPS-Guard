@@ -30,19 +30,34 @@ HTTPS-Guard is a Network Security Observability Agent that implements a Detect -
 
 ## Architecture
 
+### Mission
+
+HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
+
+1. Detect and deny in kernel space with eBPF.
+2. Translate and enrich anomalies in user space.
+3. Dispatch events as Redfish EventService-compatible payloads.
+
+### Why this design
+
+- eBPF keeps enforcement at line-rate and close to the attack surface.
+- User-space daemon keeps policy updates and payload shaping flexible.
+- Redfish integration leverages existing BMC EventService fan-out instead of building a custom notification stack.
+
+### Data Flow
+
 ```mermaid
 flowchart TD
-		A[Intrusive HTTPS Request] --> B[eBPF XDP and uprobe layer]
-		B --> C[XDP_DROP for severe TLS policy violation]
-		B --> D[Ring buffer event stream]
-		D --> E[C++ HTTPS-Guard daemon]
-		E --> F[Redfish Event JSON line]
-		F --> G[/var/log/redfish/https_guard_events.log]
-		G --> H[Redfish EventService watcher]
-		H --> I[HTTPS push to subscribed clients]
+    A[Intrusive HTTPS Request] --> B[eBPF XDP/uprobes]
+    B -->|XDP_DROP| C[Deny in kernel]
+    B -->|ring buffer metadata| D[C++ daemon]
+    D --> E[Redfish event JSON]
+    E --> F[/var/log/redfish/https_guard_events.log]
+    F --> G[Redfish EventService watcher]
+    G --> H[HTTPS push to subscribers]
 ```
 
-## Repository layout
+### Repository layout
 
 - `conf/`: Yocto layer configuration for HTTPS-Guard.
 - `manifest/`: repo manifest for syncing OpenBMC and HTTPS-Guard.
@@ -51,7 +66,24 @@ flowchart TD
 - `recipes-phosphor/images/`: image append to install HTTPS-Guard into `obmc-phosphor-image`.
 - `docs/architecture.md`: Design and data flow details.
 
-## Prerequisites
+### Recipe recipes-https-guard Components
+
+- ebpf/https_guard.bpf.c
+  - XDP path: drops TLS 1.0/1.1 ClientHello (hard deny).
+  - Uprobe path: inspects SSL_write plaintext snippets for suspicious patterns.
+  - Emits normalized hg_event records to ring buffer map events.
+
+- src/main.cpp
+  - Loads BPF object and reads ring buffer events.
+  - Applies user-space anomaly rules for HTTP payloads.
+  - Formats Redfish-compatible JSON and appends to output log path.
+
+- config/security_message_registry/OemSecurityEvent.1.0.0.json
+  - OEM registry with strongly typed message IDs and argument schema.
+
+## Build
+
+Prerequisites
 
 - Linux kernel with eBPF/XDP support.
 - clang/llvm, cmake, pkg-config.
@@ -64,8 +96,6 @@ Ubuntu example dependencies:
 sudo apt-get update
 sudo apt-get install -y clang llvm cmake pkg-config libbpf-dev linux-headers-$(uname -r)
 ```
-
-## Build
 
 Build BPF object:
 
@@ -105,143 +135,98 @@ The daemon writes one Redfish Event JSON record per line. This file path is inte
 - Add unit tests for detector and payload formatter.
 - Add integration tests with replayed PCAP and synthetic SSL_write traffic.
 
-## OpenBMC QEMU Integration
+## OpenBMC Build
 
-This repository now includes a ready-to-use OpenBMC manifest and Yocto layer for QEMU simulation.
+This repository includes a ready-to-use OpenBMC manifest and Yocto layer (`meta-https-guard`) that integrates HTTPS-Guard into an OpenBMC image.
 
-### Configure OpenBMC build
+> **Note:** Adding `meta-https-guard` to the build is handled automatically by
+> `meta-https-guard/conf/templates/default/bblayers.conf.sample`, which is picked up
+> by the `setup` script when you initialise the build environment. No manual
+> `BBLAYERS` edits are needed.
 
-1. Create and enter the OpenBMC working directory:
+### Setup and build
 
-```bash
-mkdir -p ~/openbmc
-cd ~/openbmc
-```
-
-2. Initialize repo using the local manifest:
+1. Create and enter a working directory:
 
 ```bash
-repo init -u /path/to/HTTPS-Guard/manifest/main.xml
+mkdir <work_dir>
+cd <work_dir>
 ```
 
-3. Sync the repositories:
+2. Initialise the repo manifest:
+
+```bash
+repo init -u https://github.com/JohnBlue-git/HTTPS-Guard.git -m manifest/main.xml
+```
+
+3. Sync all repositories (replace `<cpucore>` with your CPU thread count, e.g. `$(nproc)`):
 
 ```bash
 repo sync -j$(nproc)
 ```
 
-4. Set up the OpenBMC build environment:
+4. Create a tracking branch across all projects:
 
 ```bash
-source ./setup qemuarm
+repo start master --all
 ```
 
-5. Enable the HTTPS-Guard layer and package in your auto.conf:
+5. Set up the OpenBMC build environment:
 
 ```bash
-cat >> build/qemuarm/conf/auto.conf <<'EOF'
-BBLAYERS:append = " ${TOPDIR}/.."
-IMAGE_INSTALL:append = " https-guard-openbmc"
-DISTRO_FEATURES:append = " systemd"
-EOF
-```
-
-### Build the image
-
-```bash
-bitbake obmc-phosphor-image
-```
-
-### Run QEMU
-
-```bash
-cd ~/openbmc/build/qemuarm
-runqemu nographic slirp
-```
-
-### Verify services in QEMU
-
-```bash
-systemctl status https-guard-event-generator.service
-systemctl status https-guard-event-bridge.service
-```
-
-### Validate logging
-
-```bash
-journalctl -u https-guard-event-bridge -f
-busctl tree xyz.openbmc_project.Logging
-```
-
-### Redfish validation
-
-```bash
-curl -k https://<bmc-ip>/redfish/v1/EventService
-```
-
-## Usage Instructions
-
-1. Create an OpenBMC working directory outside this repository:
-
-```bash
-mkdir -p ~/openbmc
-cd ~/openbmc
-```
-
-2. Initialize repo with this repository's manifest:
-
-```bash
-repo init -u /path/to/HTTPS-Guard/manifest/main.xml
-```
-
-3. Sync the repositories:
-
-```bash
-repo sync -j$(nproc)
-```
-
-4. Set up the OpenBMC build environment:
-
-```bash
-source ./setup qemuarm
-```
-
-5. Append the HTTPS-Guard layer and package to auto.conf:
-
-```bash
-cat >> build/qemuarm/conf/auto.conf <<'EOF'
-BBLAYERS:append = " ${TOPDIR}/.."
-IMAGE_INSTALL:append = " https-guard-openbmc"
-DISTRO_FEATURES:append = " systemd"
-EOF
+. setup johnblue
 ```
 
 6. Build the image:
 
 ```bash
+# build image
 bitbake obmc-phosphor-image
+
+# run qemu
+runqemu johnblue slirp nographic
 ```
 
-7. Start QEMU:
-
-```bash
-cd ~/openbmc/build/qemuarm
-runqemu nographic slirp
-```
-
-8. Check the services:
+### Verify services (QEMU or real hardware)
 
 ```bash
 systemctl status https-guard-event-generator.service
+journalctl -u https-guard-event-generator -f
+
 systemctl status https-guard-event-bridge.service
+journalctl -u https-guard-event-bridge -f
 ```
 
-9. Check logs and Redfish:
+### Validate logging and Redfish
 
 ```bash
-journalctl -u https-guard-event-bridge -f
 busctl tree xyz.openbmc_project.Logging
+
 curl -k https://<bmc-ip>/redfish/v1/EventService
+curl -k https://<bmc-ip>/redfish/v1/EventService/Subscriptions
 ```
 
-For more details, see docs/openbmc-qemu-integration.md.
+Create a Redfish HTTPS push subscription:
+
+```bash
+curl -k -X POST https://<bmc-ip>/redfish/v1/EventService/Subscriptions \
+	-H "Content-Type: application/json" \
+	-d '{
+		"Destination": "https://<listener-ip>:8443/events",
+		"Protocol": "Redfish",
+		"SubscriptionType": "RedfishEvent",
+		"Context": "https-guard-demo"
+	}'
+```
+
+Listen to Redfish events over Server-Sent Events (SSE):
+
+```bash
+curl -k -N \
+	-H "Accept: text/event-stream" \
+	https://<bmc-ip>/redfish/v1/EventService/SSE
+```
+
+If BMC authentication is enabled, add `-u <user>:<password>` to the `curl` commands above. Use the HTTPS push subscription when you want the BMC to POST events to another service. Use SSE when you want to watch the event stream directly from a terminal without creating a subscription destination.
+
+For architecture and data-flow details, see `docs/architecture.md`.
