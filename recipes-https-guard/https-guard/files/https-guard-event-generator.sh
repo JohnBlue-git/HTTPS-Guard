@@ -6,7 +6,7 @@ CONF_FILE="/etc/default/https-guard"
 
 SIMULATE="${HTTPS_GUARD_SIMULATE:-1}"
 INTERVAL="${HTTPS_GUARD_SIMULATE_INTERVAL:-15}"
-EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/redfish/https_guard_events.log}"
+EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
 
 mkdir -p "$(dirname "$EVENT_FILE")"
 [ -f "$EVENT_FILE" ] || touch "$EVENT_FILE"

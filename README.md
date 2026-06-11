@@ -22,7 +22,7 @@ HTTPS-Guard is a Network Security Observability Agent that implements a Detect -
 	- loads and attaches BPF programs.
 	- consumes ring buffer events.
 	- applies HTTP payload anomaly pattern checks.
-	- writes Redfish Event JSON lines to /var/log/redfish/https_guard_events.log.
+  - writes Redfish Event JSON lines to /var/log/https_guard_events.log.
 
 - Redfish assets:
 	- OEM message registry in config/security_message_registry/OemSecurityEvent.1.0.0.json.
@@ -46,16 +46,78 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
 
 ### Data Flow
 
-```mermaid
-flowchart TD
-    A[Intrusive HTTPS Request] --> B[eBPF XDP/uprobes]
-    B -->|XDP_DROP| C[Deny in kernel]
-    B -->|ring buffer metadata| D[C++ daemon]
-    D --> E[Redfish event JSON]
-    E --> F[/var/log/redfish/https_guard_events.log]
-    F --> G[Redfish EventService watcher]
-    G --> H[HTTPS push to subscribers]
 ```
+                                 +--------------------------------+
+                                 | A: Intrusive HTTPS request     |
+                                 +--------------------------------+
+                                  /                              \
+                                 /                                \
+                                v                                  v
++-----------------------------+                      +-------------------------------+
+| B: eBPF XDP program         |                      | C: eBPF SSL_write uprobe      |
++-----------------------------+                      +-------------------------------+
+   |              \                                          |
+   |               \                                         |
+   |                \                                        |
+   v                 v                                       v
++-------------+   +-------------------+   +-------------------+
+| D: XDP_DROP |   | E: C++ daemon     |<--+ ring buffer event |
+| in kernel   |   |  (translate +     |   +-------------------+
+| (TLS 1.0/   |   |   classify)       |
+|  1.1)       |   +-------------------+
++-------------+            |
+                           | Redfish event JSON lines
+                           v
+              +------------------------------+
+              | F: /var/log/                |
+              |     https_guard_events.log  |
+              +------------------------------+
+                           |
+                           v
+              +------------------------------+
+              | G: https-guard-event-bridge  |
+              +------------------------------+
+                /                              \
+               /                                \
+              v                                  v
++-------------------------+         +----------------------------+
+| H: /var/log/redfish     |         | I: OpenBMC logging         |
+|     (plain-text event   |         |  (optional DBus +          |
+|      log)               |         |   journald)                |
++-------------------------+         +----------------------------+
+              |
+              v
++------------------------------+
+| J: bmcweb                    |
+|     FilesystemLogWatcher     |
++------------------------------+
+              |
+              v
++------------------------------+
+| K: Redfish EventService      |
++------------------------------+
+              |
+              v
++------------------------------+
+| L: SSE and HTTPS push        |
+|     subscribers              |
++------------------------------+
+```
+
+Edge labels:
+
+- A -> B : TLS ClientHello on port 443
+- A -> C : OpenSSL SSL_write invocation
+- B -> D : TLS 1.0 or 1.1 ClientHello detected
+- B -> E : ring buffer event (allowed TLS)
+- C -> E : ring buffer event (payload observed / anomaly)
+- E -> F : Redfish event JSON lines appended
+- F -> G : tail /var/log/https_guard_events.log
+- G -> H : plain-text event log line
+- G -> I : optional DBus and journald emission
+- H -> J : bmcweb watches /var/log/redfish
+- J -> K : Redfish Log Entry created
+- K -> L : SSE and HTTPS push to subscribers
 
 ### Repository layout
 
@@ -122,7 +184,7 @@ sudo ./build/https_guardd <network_interface> <openssl_lib_path> <output_log_pat
 Example:
 
 ```bash
-sudo ./build/https_guardd eth0 /usr/lib/x86_64-linux-gnu/libssl.so.3 /var/log/redfish/https_guard_events.log
+sudo ./build/https_guardd eth0 /usr/lib/x86_64-linux-gnu/libssl.so.3 /var/log/https_guard_events.log
 ```
 
 The daemon writes one Redfish Event JSON record per line. This file path is intentionally chosen so an EventService log watcher can ingest and dispatch asynchronously to subscribers.
@@ -206,25 +268,168 @@ curl -k https://<bmc-ip>/redfish/v1/EventService
 curl -k https://<bmc-ip>/redfish/v1/EventService/Subscriptions
 ```
 
-Create a Redfish HTTPS push subscription:
+### Certificates in bmcweb
+
+bmcweb uses two PEM files inside the BMC to establish TLS connections, and
+relies on two more directories to decide which certificates/CA chains to
+trust. The four locations are summarised below:
+
+| Path | Role | Direction | Purpose |
+|------|------|-----------|---------|
+| `/etc/ssl/certs/https/server.pem` | Server certificate (Identity Store) | BMC -> client | Presented by bmcweb to your browser/HTTPS client when you open the Redfish web UI. This is the certificate (and matching private key embedded as a combined PEM) that the BMC "shows" to you during the TLS handshake on port 4433. |
+| `/etc/ssl/certs/https/client.pem` | Client certificate (Identity Store, optional) | BMC -> remote server | Used by bmcweb when it acts as a TLS **client**. This covers both ordinary outbound HTTPS calls from bmcweb and **mutual TLS (mTLS)** to a Redfish event subscriber — the BMC will present this certificate to the listener if the subscriber's destination is configured to request a client cert. |
+| `/etc/ssl/certs/https/` (folder) | Identity Store | BMC -> peer | The directory containing the PEM files above. Together they are what the BMC shows to *you* (as a server) and to *remote services* (as a client) during TLS handshakes. |
+| `/etc/ssl/certs/authority/` (folder) | Trust Store (Authority) | BMC <- remote server | The directory of CA / leaf certificates the BMC uses to decide whether a **remote** server (e.g. your event destination) is trusted. When the BMC POSTs an event to `https://<listener-ip>:8443/events`, it validates the listener's certificate chain against this directory. |
+
+Conceptually:
+
+- **Identity Store** (what the BMC shows to you): `/etc/ssl/certs/https/server.pem`
+  and `/etc/ssl/certs/https/client.pem`.
+- **Trust Store / Authority** (who the BMC trusts): `/etc/ssl/certs/authority/`.
+
+If a remote certificate is not in the Trust Store, the BMC will refuse the
+TLS connection unless the subscription is created with `VerifyCertificate:
+false`. The section below walks through both flows.
+
+### Subscribe to Redfish EventService (HTTPS push)
+
+The BMC delivers events by POSTing JSON payloads to a destination URL that
+you register through the Redfish `EventService/Subscriptions` endpoint. The
+full flow is: prepare a local HTTPS receiver, install its certificate into
+the BMC's Trust Store (optional but recommended), then create the
+subscription.
+
+#### Step 1 — Prepare an HTTPS receiver on the listener machine
+
+On the machine whose IP you will use as `Destination` (replace
+`192.168.11.76` with the actual IP that the BMC can reach), generate a
+self-signed certificate whose CN/SAN matches that IP:
 
 ```bash
-curl -k -X POST https://<bmc-ip>/redfish/v1/EventService/Subscriptions \
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout key.pem -out cert.pem -days 365 \
+  -subj "/CN=<bmc-ip>" \
+  -addext "subjectAltName = IP:192.168.11.76"
+```
+
+This produces two files: `cert.pem` (server certificate) and `key.pem`
+(matching private key).
+
+#### Step 2 — Run a minimal Python HTTPS listener
+
+Save the following as `~/MyListener/listener.py`:
+
+```python
+# save as ~/MyListener/listener.py
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import ssl
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        print(f"\n[EVENT RECEIVED] Path: {self.path}")
+        print(body.decode('utf-8'))
+        
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Success")
+
+# Configuration
+server_address = ('0.0.0.0', 8443)
+httpd = HTTPServer(server_address, Handler)
+
+# SSL Setup
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+# Since we generated separate files in Step 1:
+context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
+
+httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+
+print(f"Listener active on https://{server_address[0]}:{server_address[1]}/events")
+httpd.serve_forever()
+```
+
+Start the listener in another terminal:
+
+```bash
+cd ~/MyListener
+python3 listener.py
+```
+
+You should see `Listener active on https://0.0.0.0:8443/events`. The BMC
+will POST Redfish event payloads to `https://<listener-ip>:8443/events`.
+
+#### Step 3 — Add the listener's certificate to the BMC Trust Store
+
+Before subscribing with certificate verification enabled, the BMC must
+trust the listener's self-signed `cert.pem`. Upload it to
+`/redfish/v1/Managers/bmc/Truststore/Certificates/`. The `sed` command
+flattens the PEM file so that it can be passed inline as a JSON string:
+
+```bash
+curl -k -u root:0penBmc -X POST \
+  https://192.168.11.76:4433/redfish/v1/Managers/bmc/Truststore/Certificates/ \
+  -H "Content-Type: application/json" \
+  -d "{\"CertificateString\": \"$(sed ':a;N;$!ba;s/\n/\\n/g' cert.pem)\", \"CertificateType\": \"PEM\"}" -v
+```
+
+After this call, `cert.pem` is known to the BMC and the TLS handshake
+from the BMC to your listener will succeed even when `VerifyCertificate`
+is left at its default (`true`).
+
+#### Step 4 — Create the subscription
+
+With Trust Store entry in place (certificate verification enabled):
+
+```bash
+curl -k -X POST https://<bmc-ip>:4433/redfish/v1/EventService/Subscriptions \
 	-H "Content-Type: application/json" \
 	-d '{
-		"Destination": "https://<listener-ip>:8443/events",
+		"Destination": "https://<bmc-ip>:8443/events",
 		"Protocol": "Redfish",
 		"SubscriptionType": "RedfishEvent",
 		"Context": "https-guard-demo"
 	}'
 ```
 
-Listen to Redfish events over Server-Sent Events (SSE):
+Alternatively, if you do **not** want to install the listener certificate
+into the Trust Store (for example, while doing a quick local test), you
+can disable verification on a per-subscription basis by setting
+`VerifyCertificate` to `false`:
 
 ```bash
-curl -k -N \
-	-H "Accept: text/event-stream" \
-	https://<bmc-ip>/redfish/v1/EventService/SSE
+curl -k -X POST https://<bmc-ip>/redfish/v1/EventService/Subscriptions \
+	-H "Content-Type: application/json" \
+	-d '{
+		"Destination": "https://<listener-ip>:8443/events",
+		"VerifyCertificate": false,
+		"Protocol": "Redfish",
+		"SubscriptionType": "RedfishEvent",
+		"Context": "https-guard-demo"
+	}'
+```
+
+Notes:
+
+- `<bmc-ip>` is the BMC's address (default port `4433`).
+- `<listener-ip>` is the IP that the BMC can reach to deliver events
+  (the same IP you used as CN/SAN in Step 1).
+- `Context` is an opaque string echoed back in every event payload; it is
+  useful for filtering in your listener.
+- If BMC authentication is enabled, add `-u <user>:<password>` to the
+  `curl` commands above.
+- Use the HTTPS push subscription when you want the BMC to POST events to
+  another service. Use SSE when you want to watch the event stream
+  directly from a terminal without creating a subscription destination.
+
+Listen to Redfish events over Server-Sent Events (SSE):
+- HTTP/2 incompatibility: The connection negotiated h2 via ALPN (confirmed in the log: ALPN selected protocol "h2"). SseSocketRule::handleUpgrade in bmcweb only has overloads for plain TCP and TLS-over-TCP (HTTP/1.1). There is no HTTP/2 overload — so even with the correct path, SSE would fail. SSE requires HTTP/1.1.
+- Missing trailing slash: The route is registered as /redfish/v1/EventService/SSE/ (with /) but the curl request was /redfish/v1/EventService/SSE (without /). That's why the catch-all /redfish/<path> matched and returned 404.
+
+```bash
+curl --http1.1 -k -N -u root:0penBmc -H "Accept: text/event-stream" \
+  "https://<bmc-ip>:4433/redfish/v1/EventService/SSE/"
 ```
 
 If BMC authentication is enabled, add `-u <user>:<password>` to the `curl` commands above. Use the HTTPS push subscription when you want the BMC to POST events to another service. Use SSE when you want to watch the event stream directly from a terminal without creating a subscription destination.

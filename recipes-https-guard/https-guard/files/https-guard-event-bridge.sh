@@ -4,11 +4,24 @@ set -eu
 CONF_FILE="/etc/default/https-guard"
 [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 
-EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/redfish/https_guard_events.log}"
+EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
 MODE="${HTTPS_GUARD_EVENT_MODE:-both}"
+REDFISH_LOG="${HTTPS_GUARD_REDFISH_LOG:-/var/log/redfish}"
 
 mkdir -p "$(dirname "$EVENT_FILE")"
 [ -f "$EVENT_FILE" ] || touch "$EVENT_FILE"
+
+# Ensure REDFISH_LOG is a plain file that bmcweb can inotify-watch.
+# If it is currently a directory (old image layout), Redfish EventService
+# dispatch is skipped until the image is rebuilt with the corrected paths.
+REDFISH_LOG_ENABLED=1
+if [ -d "$REDFISH_LOG" ]; then
+    echo "https-guard-event-bridge: WARNING: $REDFISH_LOG is a directory." \
+         "Redfish EventService dispatch disabled. Rebuild image to fix." >&2
+    REDFISH_LOG_ENABLED=0
+else
+    touch "$REDFISH_LOG"
+fi
 
 emit_dbus_log() {
     msg_id="$1"
@@ -33,6 +46,20 @@ emit_dbus_log() {
       "REDFISH_MESSAGE_ID" "$msg_id" >/dev/null 2>&1 || true
 }
 
+# Write one bmcweb-compatible plain-text line to /var/log/redfish so that
+# bmcweb's FilesystemLogWatcher picks it up and dispatches it to all
+# EventService subscribers (SSE and push/RedfishEvent).
+# Format: "<RFC3339-timestamp> <MessageId>,<MessageArg>"
+# OpenBMC.0.5.GeneralFirmwareSecurityViolation takes one string arg.
+emit_redfish_log() {
+    ts="$1"
+    desc="$2"
+    # Commas are field delimiters in bmcweb log format; strip them.
+    desc_clean="$(printf '%s' "$desc" | tr ',' ' ')"
+    printf '%s OpenBMC.0.5.GeneralFirmwareSecurityViolation,%s\n' \
+        "$ts" "$desc_clean" >> "$REDFISH_LOG"
+}
+
 extract_field() {
     line="$1"
     key="$2"
@@ -45,10 +72,12 @@ tail -n 0 -F "$EVENT_FILE" | while IFS= read -r line; do
     msg_id="$(extract_field "$line" "MessageId")"
     sev="$(extract_field "$line" "Severity")"
     msg="$(extract_field "$line" "Message")"
+    ts="$(extract_field "$line" "EventTimestamp")"
 
     [ -n "$msg_id" ] || msg_id="OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected"
     [ -n "$sev" ] || sev="Warning"
     [ -n "$msg" ] || msg="HTTPS-Guard observed security anomaly"
+    [ -n "$ts" ] || ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     case "$MODE" in
         dbus)
@@ -62,4 +91,8 @@ tail -n 0 -F "$EVENT_FILE" | while IFS= read -r line; do
             echo "$line" | systemd-cat -t https-guard-event -p warning
             ;;
     esac
+
+    if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
+        emit_redfish_log "$ts" "$msg"
+    fi
 done

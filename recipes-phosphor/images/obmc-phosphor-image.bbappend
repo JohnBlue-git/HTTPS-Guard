@@ -5,6 +5,7 @@
 do_generate_static_tar[depends] += "${@'linux-yocto-fitimage:do_deploy' if d.getVar('INITRAMFS_IMAGE') else ''}"
 
 # Additional packages for johnblue QEMU development image.
-# We add our recipe https-guard-openbmc here
 IMAGE_INSTALL:append = " https-guard-openbmc"
+# Install systemd and curl
+IMAGE_INSTALL:append = " curl"
 DISTRO_FEATURES:append = " systemd"
