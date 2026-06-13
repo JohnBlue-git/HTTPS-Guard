@@ -104,6 +104,9 @@ int main(int argc, char** argv)
 	if (argc > 3) {
 		cfg.output_path = argv[3];
 	}
+	if (argc > 4) {
+		cfg.bpf_object_path = argv[4];
+	}
 
 	std::signal(SIGINT, on_signal);
 	std::signal(SIGTERM, on_signal);
@@ -186,6 +189,7 @@ int main(int argc, char** argv)
 	std::cout << "HTTPS-Guard daemon started\n"
 			  << "  interface: " << cfg.iface << "\n"
 			  << "  ssl lib:   " << cfg.openssl_lib_path << "\n"
+			  << "  bpf obj:   " << cfg.bpf_object_path << "\n"
 			  << "  output:    " << cfg.output_path << "\n";
 
 	while (!g_stop) {

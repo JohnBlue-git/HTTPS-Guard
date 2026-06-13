@@ -1,0 +1,15 @@
+[Unit]
+Description=HTTPS-Guard eBPF Daemon (real-time network security monitoring)
+Documentation=https://github.com/JohnBlue-git/HTTPS-Guard
+After=network.target
+Before=https-guard-event-bridge.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/https-guard
+ExecStart=/usr/sbin/https-guard-daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

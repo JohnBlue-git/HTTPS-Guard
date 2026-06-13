@@ -1,20 +1,19 @@
 #!/bin/sh
+# HTTPS-Guard simulated event generator.
+# Writes synthetic security events to the event log at a regular interval.
+#
+# This service is auto-enabled at build-time via PACKAGECONFIG=simulation/both
+# in the bitbake recipe. If it's running, the generator should be active.
 set -eu
 
 CONF_FILE="/etc/default/https-guard"
 [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 
-SIMULATE="${HTTPS_GUARD_SIMULATE:-1}"
 INTERVAL="${HTTPS_GUARD_SIMULATE_INTERVAL:-15}"
 EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
 
 mkdir -p "$(dirname "$EVENT_FILE")"
 [ -f "$EVENT_FILE" ] || touch "$EVENT_FILE"
-
-if [ "$SIMULATE" != "1" ]; then
-    echo "https-guard-event-generator disabled (HTTPS_GUARD_SIMULATE=$SIMULATE)"
-    tail -f /dev/null
-fi
 
 echo "https-guard-event-generator started, writing to $EVENT_FILE"
 

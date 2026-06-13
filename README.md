@@ -82,27 +82,31 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
               v                                  v
 +-------------------------+         +----------------------------+
 | H: /var/log/redfish     |         | I: OpenBMC logging         |
-|     (plain-text event   |         |  (optional DBus +          |
-|      log)               |         |   journald)                |
+|     (plain-text event   |         |  (DBus + journald)         |
+|      log)               |         |                            |
 +-------------------------+         +----------------------------+
-              |
-              v
-+------------------------------+
-| J: bmcweb                    |
-|     FilesystemLogWatcher     |
-+------------------------------+
-              |
-              v
-+------------------------------+
-| K: Redfish EventService      |
-+------------------------------+
-              |
-              v
-+------------------------------+
-| L: SSE and HTTPS push        |
-|     subscribers              |
-+------------------------------+
+              |                               |
+              v                               v
++------------------------------+   +-------------------------------+
+| J: bmcweb                    |   | K: bmcweb D-Bus monitor       |
+|     FilesystemLogWatcher     |   |    (Logging.Entry)            |
++------------------------------+   +-------------------------------+
+              |                               |
+              +---------------+---------------+
+                              |
+                              v
+              +-------------------------------+
+              | L: Redfish EventService        |
+              +-------------------------------+
+                              |
+                              v
+              +-------------------------------+
+              | M: SSE and HTTPS push          |
+              |     subscribers                |
+              +-------------------------------+
 ```
+
+**Double-delivery prevention:** When the bridge uses D-Bus path (modes `dbus` or `both`), bmcweb's D-Bus monitor already dispatches to EventService subscribers. The filesystem log (`/var/log/redfish`) is **not** written in these modes to avoid duplicate delivery. The filesystem log is only written in `journal` mode, where FilesystemLogWatcher handles delivery.
 
 Edge labels:
 
@@ -113,19 +117,22 @@ Edge labels:
 - C -> E : ring buffer event (payload observed / anomaly)
 - E -> F : Redfish event JSON lines appended
 - F -> G : tail /var/log/https_guard_events.log
-- G -> H : plain-text event log line
-- G -> I : optional DBus and journald emission
+- G -> H : plain-text event log line (journal-only mode)
+- G -> I : DBus + journald emission (dbus / both mode)
 - H -> J : bmcweb watches /var/log/redfish
-- J -> K : Redfish Log Entry created
-- K -> L : SSE and HTTPS push to subscribers
+- I -> K : bmcweb monitors D-Bus Logging.Entry
+- J, K -> L : Redfish Log Entry created
+- L -> M : SSE and HTTPS push to subscribers
 
 ### Repository layout
 
 - `conf/`: Yocto layer configuration for HTTPS-Guard.
 - `manifest/`: repo manifest for syncing OpenBMC and HTTPS-Guard.
 - `recipes-https-guard/https-guard/`: HTTPS-Guard OpenBMC recipe and deployment files.
+- `recipes-kernel/linux/`: Kernel config fragment for eBPF/XDP support.
 - `recipes-bmcweb/bmcweb/`: bmcweb package append for OpenBMC integration.
 - `recipes-phosphor/images/`: image append to install HTTPS-Guard into `obmc-phosphor-image`.
+- `scripts/`: Helper scripts (QEMU TAP setup, etc.).
 - `docs/architecture.md`: Design and data flow details.
 
 ### Recipe recipes-https-guard Components
@@ -139,11 +146,12 @@ Edge labels:
   - Loads BPF object and reads ring buffer events.
   - Applies user-space anomaly rules for HTTP payloads.
   - Formats Redfish-compatible JSON and appends to output log path.
+  - Accepts 4 CLI arguments: interface, ssl_lib_path, output_path, bpf_object_path.
 
 - config/security_message_registry/OemSecurityEvent.1.0.0.json
   - OEM registry with strongly typed message IDs and argument schema.
 
-## Build
+## Build (native / standalone)
 
 Prerequisites
 
@@ -173,13 +181,15 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-## Run
+## Run (native)
 
 Usage:
 
 ```bash
-sudo ./build/https_guardd <network_interface> <openssl_lib_path> <output_log_path>
+sudo ./build/https_guardd <network_interface> <openssl_lib_path> <output_log_path> [bpf_object_path]
 ```
+
+The 4th argument (bpf_object_path) is optional. Defaults to `./build/https_guard.bpf.o`.
 
 Example:
 
@@ -188,14 +198,6 @@ sudo ./build/https_guardd eth0 /usr/lib/x86_64-linux-gnu/libssl.so.3 /var/log/ht
 ```
 
 The daemon writes one Redfish Event JSON record per line. This file path is intentionally chosen so an EventService log watcher can ingest and dispatch asynchronously to subscribers.
-
-## Notes on production hardening
-
-- Replace static signatures with configurable rule packs.
-- Add JA3/JA4 fingerprint generation in user space.
-- Integrate with journald and OpenBMC dbus log pipelines.
-- Add unit tests for detector and payload formatter.
-- Add integration tests with replayed PCAP and synthetic SSL_write traffic.
 
 ## OpenBMC Build
 
@@ -242,19 +244,165 @@ repo start master --all
 6. Build the image:
 
 ```bash
-# build image
 bitbake obmc-phosphor-image
+```
 
-# run qemu
+### PACKAGECONFIG options
+
+The recipe `recipes-https-guard/https-guard/https-guard-openbmc.bb` supports two categories of PACKAGECONFIG flags, combined freely:
+
+#### Service selection (which systemd units are auto-enabled)
+
+| PACKAGECONFIG | Enables | Disables | Use case |
+|---|---|---|---|
+| `simulation` (default) | event-generator + event-bridge | daemon | QEMU with slirp, no real eBPF |
+| `daemon` | daemon + event-bridge | event-generator | Real eBPF with TAP/bridge network |
+| `both` | daemon + event-generator + event-bridge | — | Debugging, comparing real vs simulated |
+
+#### Event sink mode (how events reach Redfish EventService subscribers)
+
+| PACKAGECONFIG | Config value | D-Bus | systemd-cat | /var/log/redfish | EventService delivery path |
+|---|---|---|---|---|---|
+| `event-both` (default) | `both` | ✓ | ✓ | ✗ | bmcweb D-Bus Logging.Entry monitor |
+| `dbus-only` | `dbus` | ✓ | ✗ | ✗ | bmcweb D-Bus Logging.Entry monitor |
+| `journal-only` | `journal` | ✗ | ✓ | ✓ | bmcweb FilesystemLogWatcher |
+
+**Double-delivery prevention:** When D-Bus is used (`dbus` or `both` mode), bmcweb's D-Bus monitor already dispatches to all EventService subscribers. The filesystem log is **not** written to avoid duplicate delivery. The filesystem log is only written in `journal` mode.
+
+#### Usage
+
+Set PACKAGECONFIG in `conf/local.conf`:
+
+```bash
+# Simulation mode with journal-only sink (no D-Bus):
+PACKAGECONFIG:pn-https-guard-openbmc = "simulation journal-only"
+
+# Real daemon mode with D-Bus sink:
+PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"
+
+# Both daemon and simulation (for debugging), with both sinks:
+PACKAGECONFIG:pn-https-guard-openbmc = "both event-both"
+```
+
+Or override on the bitbake command line:
+
+```bash
+bitbake obmc-phosphor-image --extra-config 'PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"'
+```
+
+## QEMU Setup
+
+HTTPS-Guard supports two QEMU networking modes:
+
+| Mode | XDP support | Networking | Use case |
+|---|---|---|---|
+| **SLIRP** (default) | No | user-mode (NAT) | Simulation-only testing |
+| **TAP/bridge** | Yes (generic XDP) | Real virtio-net device | Real eBPF daemon |
+
+### Mode A: SLIRP (simulation, no eBPF required)
+
+This is the default. No special setup needed.
+
+```bash
+# Default PACKAGECONFIG is "simulation event-both"
+bitbake obmc-phosphor-image
 runqemu johnblue slirp nographic
+```
+
+Inside the guest, verify synthetic events are flowing:
+
+```bash
+systemctl status https-guard-event-generator
+journalctl -u https-guard-event-generator -f
+
+systemctl status https-guard-event-bridge
+journalctl -u https-guard-event-bridge -f
+```
+
+### Mode B: TAP/bridge (real eBPF daemon)
+
+Use this when you need the real `https-guardd` daemon with XDP and uprobes working inside the QEMU guest. This requires:
+
+- A kernel with eBPF/XDP support (enabled by the config fragment).
+- A TAP device and bridge on the host.
+- A virtio-net NIC in the guest (supports generic XDP).
+
+#### Step 1 — Host: create the TAP/bridge network
+
+```bash
+sudo ./scripts/qemu-setup-tap.sh create
+```
+
+This creates bridge `br-httpsguard` and TAP `tap-httpsguard` with MAC `52:54:00:12:34:56`.
+
+#### Step 2 — Build the image with daemon mode
+
+```bash
+echo 'PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"' >> conf/local.conf
+bitbake obmc-phosphor-image
+```
+
+#### Step 3 — Launch QEMU with TAP networking
+
+```bash
+QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
+runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
+```
+
+#### Step 4 — Inside the guest: verify and monitor
+
+```bash
+# Verify kernel BPF support is enabled
+zcat /proc/config.gz | grep -E "CONFIG_BPF|CONFIG_XDP|CONFIG_UPROBE"
+
+# Check daemon status
+systemctl status https-guard-daemon
+journalctl -u https-guard-daemon -f
+
+# Verify bridge service is processing events
+systemctl status https-guard-event-bridge
+journalctl -u https-guard-event-bridge -f
+
+# Check the event log
+cat /var/log/https_guard_events.log
+```
+
+### Kernel eBPF/XDP configuration
+
+The kernel recipe `linux-aspeed` is extended by `recipes-kernel/linux/linux-aspeed_%.bbappend`, which includes the config fragment `recipes-kernel/linux/bpf-kernel-config.cfg`. This enables all required kernel features:
+
+- `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`
+- `CONFIG_NET_XDP`, `CONFIG_NET_XDP_XMIT` (generic XDP fallback for virtio)
+- `CONFIG_UPROBE_EVENTS`, `CONFIG_UPROBES`, `CONFIG_KPROBES`
+- `CONFIG_DEBUG_INFO_BTF` (BTF required by CO-RE eBPF)
+- `CONFIG_BPF_EVENTS`, `CONFIG_FPROBE`
+- And more (see the config fragment for the full list)
+
+After building, verify the kernel includes these features:
+
+```bash
+bitbake virtual/kernel -c menuconfig
+# Search for CONFIG_BPF, CONFIG_XDP, CONFIG_UPROBE
+```
+
+Or check the generated config:
+
+```bash
+grep -E "CONFIG_BPF|CONFIG_XDP|CONFIG_UPROBE" tmp/work/johnblue-poky-linux/linux-aspeed/*/build/.config
 ```
 
 ### Verify services (QEMU or real hardware)
 
 ```bash
+# In simulation mode:
 systemctl status https-guard-event-generator.service
 journalctl -u https-guard-event-generator -f
 
+# In daemon mode:
+systemctl status https-guard-daemon.service
+journalctl -u https-guard-daemon -f
+
+# Always running:
 systemctl status https-guard-event-bridge.service
 journalctl -u https-guard-event-bridge -f
 ```
@@ -267,6 +415,14 @@ busctl tree xyz.openbmc_project.Logging
 curl -k https://<bmc-ip>/redfish/v1/EventService
 curl -k https://<bmc-ip>/redfish/v1/EventService/Subscriptions
 ```
+
+## Notes on production hardening
+
+- Replace static signatures with configurable rule packs.
+- Add JA3/JA4 fingerprint generation in user space.
+- Integrate with journald and OpenBMC dbus log pipelines.
+- Add unit tests for detector and payload formatter.
+- Add integration tests with replayed PCAP and synthetic SSL_write traffic.
 
 ### Certificates in bmcweb
 

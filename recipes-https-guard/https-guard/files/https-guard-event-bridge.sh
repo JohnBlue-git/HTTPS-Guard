@@ -81,18 +81,24 @@ tail -n 0 -F "$EVENT_FILE" | while IFS= read -r line; do
 
     case "$MODE" in
         dbus)
+            # D-Bus path: bmcweb monitors xyz.openbmc_project.Logging.Entry
+            # and dispatches to EventService subscribers.  The filesystem
+            # redfish log is NOT written to avoid duplicate delivery.
             emit_dbus_log "$msg_id" "$msg" "$sev"
             ;;
         journal)
+            # Journal-only path: no D-Bus, so write the filesystem log
+            # for bmcweb's FilesystemLogWatcher to pick up.
             echo "$line" | systemd-cat -t https-guard-event -p warning
+            if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
+                emit_redfish_log "$ts" "$msg"
+            fi
             ;;
         both|*)
+            # D-Bus delivers to EventService.  Filesystem log is NOT
+            # written because it would trigger duplicate delivery.
             emit_dbus_log "$msg_id" "$msg" "$sev"
             echo "$line" | systemd-cat -t https-guard-event -p warning
             ;;
     esac
-
-    if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
-        emit_redfish_log "$ts" "$msg"
-    fi
 done
