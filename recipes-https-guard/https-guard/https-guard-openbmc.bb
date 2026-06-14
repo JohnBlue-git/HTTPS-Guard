@@ -60,7 +60,13 @@ SRC_URI = " \
     file://https_guard/redfish_formatter.hpp \
     file://https_guard/pattern_detector.hpp \
     file://https_guard/string_utils.hpp \
-    file://ebpf/https_guard.bpf.c \
+    file://https_guard/https_guard.bpf.c \
+    file://ebpf/bpf_program.hpp \
+    file://ebpf/bpf_program.cpp \
+    file://actions/ActionLoop.hpp \
+    file://actions/ActionLoop.cpp \
+    file://actions/LogAction.hpp \
+    file://actions/LogAction.cpp \
 "
 
 S = "${UNPACKDIR}"
@@ -107,7 +113,7 @@ SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 do_compile:append() {
     # try to build eBPF object with clang (clang-native is a DEPENDS)
     if command -v clang >/dev/null 2>&1; then
-        clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -I${S}/https_guard -I/usr/include -c ${S}/ebpf/https_guard.bpf.c -o ${B}/https_guard.bpf.o || true
+        clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -I${S}/https_guard -I/usr/include -c ${S}/https_guard/https_guard.bpf.c -o ${B}/https_guard.bpf.o || true
     fi
 }
 

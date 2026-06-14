@@ -9,7 +9,7 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 ## Table of Contents
 
 - [Directory Layout](#directory-layout)
-- [eBPF Programs (`ebpf/https_guard.bpf.c`)](#ebpf-programs-ebphttps_guardbpfc)
+- [eBPF Programs (`https_guard/https_guard.bpf.c`)](#ebpf-programs-https_guardhttps_guardbpfc)
   - [XDP Hook: Wire-Level TLS Inspection](#xdp-hook-wire-level-tls-inspection)
   - [Uprobe Hook: Plaintext Payload Capture](#uprobe-hook-plaintext-payload-capture)
 - [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
@@ -37,18 +37,25 @@ files/
 ├── simulated-event-generator.service                 # systemd unit for synthetic event generator
 ├── simulated-event-generator.sh                      # Shell script that emits simulated events
 ├── ebpf/
-│   └── https_guard.bpf.c                             # eBPF programs (XDP + uprobe)
+│   ├── bpf_program.hpp                                # BPF program attachment wrapper
+│   └── bpf_program.cpp                                # BPF program wrapper implementation
 ├── https_guard/
 │   ├── events.h                                      # Shared event struct & enums (BPF + C++)
+│   ├── https_guard.bpf.c                              # eBPF programs (XDP + uprobe)
 │   ├── main.cpp                                      # C++ daemon entry point
 │   ├── pattern_detector.hpp                          # User-space HTTP anomaly rules (inline)
 │   ├── redfish_formatter.hpp                         # Redfish Event JSON serialization (inline)
 │   └── string_utils.hpp                              # TLS version helpers (inline)
+├── actions/
+│   ├── ActionLoop.hpp                                # Event dispatcher interface
+│   ├── ActionLoop.cpp                                # Event dispatcher implementation
+│   ├── LogAction.hpp                                 # Event logging action interface
+│   └── LogAction.cpp                                 # Event logging action implementation
 ```
 
 ---
 
-## eBPF Programs (`ebpf/https_guard.bpf.c`)
+## eBPF Programs (`https_guard/https_guard.bpf.c`)
 
 The single BPF C file compiles to one BPF object that contains **two independent hook sections**, both writing to the same shared `events` ring buffer map:
 

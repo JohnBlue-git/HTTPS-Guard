@@ -139,13 +139,13 @@ Edge labels:
 
 ### Recipe recipes-https-guard Components
 
-- ebpf/https_guard.bpf.c
+- https_guard/https_guard.bpf.c
   - XDP path: inspects TLS 1.0/1.1 ClientHello on port 443 and emits events (observes, does not currently drop).
   - XDP path: extracts SNI from TLS extensions, detects plaintext HTTP on port 443 as anomaly.
   - Uprobe path: hooks SSL_write to capture plaintext snippets before encryption for user-space analysis.
   - Emits normalized hg_event records to ring buffer map events.
 
-- src/main.cpp
+- https_guard/main.cpp
   - Loads BPF object and reads ring buffer events.
   - Applies user-space anomaly rules for HTTP payloads.
   - Formats Redfish-compatible JSON and appends to output log path.

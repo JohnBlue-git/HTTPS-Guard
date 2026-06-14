@@ -6,9 +6,25 @@
 
 namespace https_guard {
 
-inline bool is_http_payload_suspicious(const std::string& payload, std::string& matched_rule)
-{
-    static const std::array<const char*, 8> kRules = {
+class PatternDetector {
+public:
+    bool isSuspicious(const std::string& payload, std::string& matched_rule) const
+    {
+        std::string lowered(payload);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
+
+        for (const auto* rule : kRules) {
+            if (lowered.find(rule) != std::string::npos) {
+                matched_rule = rule;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+private:
+    inline static const std::array<const char*, 8> kRules = {
         "../..",
         "union select",
         "or 1=1",
@@ -18,18 +34,6 @@ inline bool is_http_payload_suspicious(const std::string& payload, std::string& 
         "cmd.exe",
         "wget http"
     };
-
-    std::string lowered(payload);
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-
-    for (const auto* r : kRules) {
-        if (lowered.find(r) != std::string::npos) {
-            matched_rule = r;
-            return true;
-        }
-    }
-
-    return false;
-}
+};
 
 }  // namespace https_guard

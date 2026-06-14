@@ -115,10 +115,10 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 
 | Location | Evidence |
 |----------|----------|
-| `ebpf/https_guard.bpf.c:377` | `return XDP_PASS;  /* Do not drop – only observe & report. */` |
-| `ebpf/https_guard.bpf.c:405` | `return XDP_PASS;` — even HTTP anomalies are not dropped at the XDP layer |
-| `ebpf/https_guard.bpf.c:337-376` | TLS ClientHello inspection: event is `bpf_ringbuf_submit()`'d, then `XDP_PASS` |
-| `ebpf/https_guard.bpf.c:429-448` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
+| `https_guard/https_guard.bpf.c:377` | `return XDP_PASS;  /* Do not drop – only observe & report. */` |
+| `https_guard/https_guard.bpf.c:405` | `return XDP_PASS;` — even HTTP anomalies are not dropped at the XDP layer |
+| `https_guard/https_guard.bpf.c:337-376` | TLS ClientHello inspection: event is `bpf_ringbuf_submit()`'d, then `XDP_PASS` |
+| `https_guard/https_guard.bpf.c:429-448` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
 | `https_guard/main.cpp:196-201` | `ring_buffer__poll()` loop — the daemon consumes events **after** the kernel has already returned |
 | `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
 | `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |

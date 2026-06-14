@@ -11,11 +11,16 @@ find_package(nlohmann_json REQUIRED)
 
 add_executable(https_guardd
     https_guard/main.cpp
+    actions/ActionLoop.cpp
+    actions/LogAction.cpp
+    ebpf/bpf_program.cpp
 )
 
 target_include_directories(https_guardd
     PRIVATE
     https_guard
+    actions
+    ebpf
     ${LIBBPF_INCLUDE_DIRS}
     ${nlohmann_json_INCLUDE_DIRS}
 )
