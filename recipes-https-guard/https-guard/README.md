@@ -19,6 +19,7 @@ This directory contains the complete source code of the **HTTPS-Guard** agent â€
 - [String Utilities (`include/https_guard/string_utils.hpp`)](#string-utilities-includehttps_guardstring_utilshpp)
 - [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
 - [Configuration (`https-guard.conf`)](#configuration-https-guardconf)
+- [Security Strategy](SECURITY_STRATEGY.md)
 - [OpenBMC Recipe (`https-guard-openbmc.bb`)](#openbmc-recipe-https-guard-openbmcbb)
 
 ---
