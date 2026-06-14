@@ -34,8 +34,8 @@ files/
 ├── https-guard-daemon.sh                             # Shell wrapper that launches https-guardd
 ├── https-guard-event-bridge.service                  # systemd unit for the event bridge
 ├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
-├── https-guard-event-generator.service               # systemd unit for synthetic event generator
-├── https-guard-event-generator.sh                    # Shell script that emits simulated events
+├── simulated-event-generator.service               # systemd unit for synthetic event generator
+├── simulated-event-generator.sh                    # Shell script that emits simulated events
 ├── ebpf/
 │   └── https_guard.bpf.c                             # eBPF programs (XDP + uprobe)
 ├── include/
@@ -367,7 +367,7 @@ Each systemd unit file (`*.service`) invokes a shell wrapper script installed on
 |----------------------------|---------------------------|---------------|-----------------|------|
 | `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging |
 | `https-guard-event-bridge.service` | `/usr/sbin/https-guard-event-bridge` | `https-guard-event-bridge.sh` | — (pure shell) | Tails the event log, dispatches events to D-Bus / journal / Redfish log |
-| `https-guard-event-generator.service` | `/usr/sbin/https-guard-event-generator` | `https-guard-event-generator.sh` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
+| `simulated-event-generator.service` | `/usr/sbin/simulated-event-generator` | `simulated-event-generator.sh` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
 
 **Important:** The shell scripts are installed **without** the `.sh` extension. For example, the source file `https-guard-event-bridge.sh` is installed as `/usr/sbin/https-guard-event-bridge` on the target image — the `.sh` suffix is stripped by the recipe's `do_install` step (see `install -m 0755 ${S}/https-guard-event-bridge.sh ${D}${sbindir}/https-guard-event-bridge`).
 

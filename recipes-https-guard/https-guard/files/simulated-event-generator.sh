@@ -15,7 +15,7 @@ EVENT_FILE="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
 mkdir -p "$(dirname "$EVENT_FILE")"
 [ -f "$EVENT_FILE" ] || touch "$EVENT_FILE"
 
-echo "https-guard-event-generator started, writing to $EVENT_FILE"
+echo "simulated-event-generator started, writing to $EVENT_FILE"
 
 while true; do
     TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

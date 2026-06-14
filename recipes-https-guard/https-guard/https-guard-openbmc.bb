@@ -51,8 +51,8 @@ SRC_URI = " \
     file://https-guard-event-bridge.service \
     file://https-guard-daemon.sh \
     file://https-guard-daemon.service \
-    file://https-guard-event-generator.service \
-    file://https-guard-event-generator.sh \
+    file://simulated-event-generator.service \
+    file://simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
     file://src/main.cpp \
@@ -85,7 +85,7 @@ python() {
     # If simulation is set (or both), enable the generator.
     # Note: "daemon" alone disables the generator.
     if 'simulation' in pkgconfig or 'both' in pkgconfig:
-        enabled_services.append('https-guard-event-generator.service')
+        enabled_services.append('simulated-event-generator.service')
     else:
         bb.note('HTTPS-Guard: simulation disabled by PACKAGECONFIG choice')
 
@@ -113,7 +113,7 @@ do_compile:append() {
 do_install() {
     install -d ${D}${sbindir}
     install -m 0755 ${S}/https-guard-event-bridge.sh   ${D}${sbindir}/https-guard-event-bridge
-    install -m 0755 ${S}/https-guard-event-generator.sh ${D}${sbindir}/https-guard-event-generator
+    install -m 0755 ${S}/simulated-event-generator.sh ${D}${sbindir}/simulated-event-generator
     install -m 0755 ${S}/https-guard-daemon.sh          ${D}${sbindir}/https-guard-daemon
 
     # install compiled daemon if present
@@ -129,7 +129,7 @@ do_install() {
 
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${S}/https-guard-event-bridge.service   ${D}${systemd_system_unitdir}/
-    install -m 0644 ${S}/https-guard-event-generator.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/simulated-event-generator.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${S}/https-guard-daemon.service          ${D}${systemd_system_unitdir}/
 
     # -----------------------------------------------------------------------
@@ -145,11 +145,11 @@ do_install() {
 FILES:${PN} += " \
     ${sbindir}/https-guardd \
     ${sbindir}/https-guard-event-bridge \
-    ${sbindir}/https-guard-event-generator \
+    ${sbindir}/simulated-event-generator \
     ${sbindir}/https-guard-daemon \
     ${datadir}/https-guard/https_guard.bpf.o \
     ${systemd_system_unitdir}/https-guard-event-bridge.service \
-    ${systemd_system_unitdir}/https-guard-event-generator.service \
+    ${systemd_system_unitdir}/simulated-event-generator.service \
     ${systemd_system_unitdir}/https-guard-daemon.service \
     ${sysconfdir}/default/https-guard \
 "

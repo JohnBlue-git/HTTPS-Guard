@@ -315,8 +315,8 @@ runqemu johnblue slirp nographic
 Inside the guest, verify synthetic events are flowing:
 
 ```bash
-systemctl status https-guard-event-generator
-journalctl -u https-guard-event-generator -f
+systemctl status simulated-event-generator
+journalctl -u simulated-event-generator -f
 
 systemctl status https-guard-event-bridge
 journalctl -u https-guard-event-bridge -f
@@ -398,8 +398,8 @@ grep -E "CONFIG_BPF|CONFIG_XDP|CONFIG_UPROBE" tmp/work/johnblue-poky-linux/linux
 
 ```bash
 # In simulation mode:
-systemctl status https-guard-event-generator.service
-journalctl -u https-guard-event-generator -f
+systemctl status simulated-event-generator.service
+journalctl -u simulated-event-generator -f
 
 # In daemon mode:
 systemctl status https-guard-daemon.service

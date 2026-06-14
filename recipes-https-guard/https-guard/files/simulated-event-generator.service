@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/https-guard
-ExecStart=/usr/sbin/https-guard-event-generator
+ExecStart=/usr/sbin/simulated-event-generator
 Restart=always
 RestartSec=2
 
