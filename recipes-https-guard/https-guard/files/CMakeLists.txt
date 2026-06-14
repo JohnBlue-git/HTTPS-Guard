@@ -32,6 +32,7 @@ endif()
 
 add_executable(https_guardd
     https_guard/main.cpp
+    https_guard/https_guard_program.cpp
     actions/ActionLoop.cpp
     actions/LogAction.cpp
     ebpf/bpf_program.cpp

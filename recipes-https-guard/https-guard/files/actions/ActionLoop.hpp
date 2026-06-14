@@ -31,6 +31,9 @@ public:
               const std::string& message_id,
               const std::string& message,
               const std::string& severity);
+
+    void spawn(boost::asio::awaitable<void> awaitable);
+
     void run();
     void stop();
 

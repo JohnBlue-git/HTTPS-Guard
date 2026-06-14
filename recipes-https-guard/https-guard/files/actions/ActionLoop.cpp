@@ -40,6 +40,11 @@ void ActionLoop::run()
     });
 }
 
+void ActionLoop::spawn(boost::asio::awaitable<void> awaitable)
+{
+    boost::asio::co_spawn(io_context_, std::move(awaitable), boost::asio::detached);
+}
+
 void ActionLoop::stop()
 {
     work_guard_.reset();
