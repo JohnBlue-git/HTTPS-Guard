@@ -10,12 +10,12 @@ pkg_check_modules(LIBBPF REQUIRED libbpf)
 find_package(nlohmann_json REQUIRED)
 
 add_executable(https_guardd
-    src/main.cpp
+    https_guard/main.cpp
 )
 
 target_include_directories(https_guardd
     PRIVATE
-    include
+    https_guard
     ${LIBBPF_INCLUDE_DIRS}
     ${nlohmann_json_INCLUDE_DIRS}
 )

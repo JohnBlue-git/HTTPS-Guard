@@ -27,7 +27,7 @@ typedef _Bool bool;
 #define false 0
 #endif
 
-#include "../include/https_guard/events.h"
+#include "../https_guard/events.h"
 
 char LICENSE[] SEC("license") = "GPL";
 

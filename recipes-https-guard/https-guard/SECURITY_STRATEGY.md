@@ -119,8 +119,8 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 | `ebpf/https_guard.bpf.c:405` | `return XDP_PASS;` — even HTTP anomalies are not dropped at the XDP layer |
 | `ebpf/https_guard.bpf.c:337-376` | TLS ClientHello inspection: event is `bpf_ringbuf_submit()`'d, then `XDP_PASS` |
 | `ebpf/https_guard.bpf.c:429-448` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
-| `src/main.cpp:196-201` | `ring_buffer__poll()` loop — the daemon consumes events **after** the kernel has already returned |
-| `src/pattern_detector.cpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
+| `https_guard/main.cpp:196-201` | `ring_buffer__poll()` loop — the daemon consumes events **after** the kernel has already returned |
+| `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
 | `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |
 
 ### The pipeline is purely observational
@@ -132,7 +132,7 @@ HTTPS-Guard's eBPF programs **never** block, drop, or modify packets. Every hook
 3. Submits the event via `bpf_ringbuf_submit()`
 4. Returns `XDP_PASS` (XDP) or `0` (uprobe)
 
-All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → `pattern_detector.cpp` → `redfish_formatter.cpp`). Even the dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
+All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → inline headers `pattern_detector.hpp` and `redfish_formatter.hpp`). Even the dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
 
 ### Future hybrid extension
 

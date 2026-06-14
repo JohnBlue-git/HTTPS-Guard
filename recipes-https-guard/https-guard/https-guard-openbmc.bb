@@ -55,10 +55,11 @@ SRC_URI = " \
     file://simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
-    file://src/main.cpp \
-    file://include/https_guard/events.h \
-    file://include/https_guard/redfish_formatter.hpp \
-    file://include/https_guard/pattern_detector.hpp \
+    file://https_guard/main.cpp \
+    file://https_guard/events.h \
+    file://https_guard/redfish_formatter.hpp \
+    file://https_guard/pattern_detector.hpp \
+    file://https_guard/string_utils.hpp \
     file://ebpf/https_guard.bpf.c \
 "
 
@@ -106,7 +107,7 @@ SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 do_compile:append() {
     # try to build eBPF object with clang (clang-native is a DEPENDS)
     if command -v clang >/dev/null 2>&1; then
-        clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -I${S}/include -I/usr/include -c ${S}/ebpf/https_guard.bpf.c -o ${B}/https_guard.bpf.o || true
+        clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -I${S}/https_guard -I/usr/include -c ${S}/ebpf/https_guard.bpf.c -o ${B}/https_guard.bpf.o || true
     fi
 }
 

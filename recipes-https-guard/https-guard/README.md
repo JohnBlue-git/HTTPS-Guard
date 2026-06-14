@@ -12,11 +12,11 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 - [eBPF Programs (`ebpf/https_guard.bpf.c`)](#ebpf-programs-ebphttps_guardbpfc)
   - [XDP Hook: Wire-Level TLS Inspection](#xdp-hook-wire-level-tls-inspection)
   - [Uprobe Hook: Plaintext Payload Capture](#uprobe-hook-plaintext-payload-capture)
-- [Event Data Model (`include/https_guard/events.h`)](#event-data-model-includehttps_guardeventsh)
-- [C++ Daemon (`src/main.cpp`)](#c-daemon-srcmaincpp)
-- [Pattern Detector (`src/pattern_detector.cpp`)](#pattern-detector-srcpattern_detectorcpp)
-- [Redfish Formatter (`src/redfish_formatter.cpp`)](#redfish-formatter-srcredfish_formattercpp)
-- [String Utilities (`include/https_guard/string_utils.hpp`)](#string-utilities-includehttps_guardstring_utilshpp)
+- [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
+- [C++ Daemon (`https_guard/main.cpp`)](#c-daemon-https_guardmaincpp)
+- [Pattern Detector (`https_guard/pattern_detector.hpp`)](#pattern-detector-https_guardpattern_detectorhpp)
+- [Redfish Formatter (`https_guard/redfish_formatter.hpp`)](#redfish-formatter-https_guardredfish_formatterhpp)
+- [String Utilities (`https_guard/string_utils.hpp`)](#string-utilities-https_guardstring_utilshpp)
 - [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
 - [Configuration (`https-guard.conf`)](#configuration-https-guardconf)
 - [Security Strategy](SECURITY_STRATEGY.md)
@@ -34,20 +34,16 @@ files/
 ├── https-guard-daemon.sh                             # Shell wrapper that launches https-guardd
 ├── https-guard-event-bridge.service                  # systemd unit for the event bridge
 ├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
-├── simulated-event-generator.service               # systemd unit for synthetic event generator
-├── simulated-event-generator.sh                    # Shell script that emits simulated events
+├── simulated-event-generator.service                 # systemd unit for synthetic event generator
+├── simulated-event-generator.sh                      # Shell script that emits simulated events
 ├── ebpf/
 │   └── https_guard.bpf.c                             # eBPF programs (XDP + uprobe)
-├── include/
-│   └── https_guard/
-│       ├── events.h                                  # Shared event struct & enums (BPF + C++)
-│       └── string_utils.hpp                          # TLS version helpers
-└── src/
-    ├── main.cpp                                      # C++ daemon entry point
-    ├── pattern_detector.cpp                          # User-space HTTP anomaly rules
-    ├── pattern_detector.hpp
-    ├── redfish_formatter.cpp                         # Redfish Event JSON serialization
-    └── redfish_formatter.hpp
+├── https_guard/
+│   ├── events.h                                      # Shared event struct & enums (BPF + C++)
+│   ├── main.cpp                                      # C++ daemon entry point
+│   ├── pattern_detector.hpp                          # User-space HTTP anomaly rules (inline)
+│   ├── redfish_formatter.hpp                         # Redfish Event JSON serialization (inline)
+│   └── string_utils.hpp                              # TLS version helpers (inline)
 ```
 
 ---
@@ -119,7 +115,7 @@ and classifies events by their `event_type` field.
 
 ---
 
-## Event Data Model (`include/https_guard/events.h`)
+## Event Data Model (`https_guard/events.h`)
 
 The header is dual-purposed: it is included both by the BPF C program (compiled with `clang -target bpf`) and by the C++ daemon. When compiled for BPF, it provides its own minimal integer types; when compiled for C++, it uses `<stdint.h>`.
 
@@ -163,7 +159,7 @@ payload_snippet (char[128]) — Plaintext snippet from uprobe or HTTP anomaly
 
 ---
 
-## C++ Daemon (`src/main.cpp`)
+## C++ Daemon (`https_guard/main.cpp`)
 
 The daemon's `main()` function orchestrates the full eBPF lifecycle:
 
@@ -213,9 +209,9 @@ On signal, the poll loop exits, the ring buffer is freed, BPF links are destroye
 
 ---
 
-## Pattern Detector (`src/pattern_detector.cpp`)
+## Pattern Detector (`https_guard/pattern_detector.hpp`)
 
-The user-space anomaly detection engine applies a set of **static signature rules** to plaintext payload snippets.
+The user-space anomaly detection engine applies a set of **static signature rules** to plaintext payload snippets. The implementation is **inline** in the header, so no separate `.cpp` file is needed.
 
 ### Rule Set
 
@@ -245,9 +241,9 @@ The user-space anomaly detection engine applies a set of **static signature rule
 
 ---
 
-## Redfish Formatter (`src/redfish_formatter.cpp`)
+## Redfish Formatter (`https_guard/redfish_formatter.hpp`)
 
-Converts an `hg_event` + classification result into a Redfish Event JSON line using the [nlohmann/json](https://github.com/nlohmann/json) library for safe, standards-compliant serialization. The library handles all string escaping and UTF-8 encoding automatically.
+Converts an `hg_event` + classification result into a Redfish Event JSON line using the [nlohmann/json](https://github.com/nlohmann/json) library for safe, standards-compliant serialization. The library handles all string escaping and UTF-8 encoding automatically. The implementation is **inline** in the header, so no separate `.cpp` file is needed.
 
 ### Output Format
 
@@ -284,11 +280,11 @@ Converts an `hg_event` + classification result into a Redfish Event JSON line us
 
 ---
 
-## String Utilities (`include/https_guard/string_utils.hpp`)
+## String Utilities (`https_guard/string_utils.hpp`)
 
 ### `tls_version_to_string()`
 
-Maps TLS version codes to human-readable names:
+Maps TLS version codes to human-readable names (defined inline in the header):
 
 | Code | String |
 |------|--------|
@@ -304,8 +300,8 @@ Maps TLS version codes to human-readable names:
 
 - **C++ Standard**: C++20.
 - **Dependencies**: `libbpf` (found via pkg-config), `nlohmann_json` (found via `find_package`).
-- **Target**: `https_guardd` — links `main.cpp`, `pattern_detector.cpp`, and `redfish_formatter.cpp`.
-- **Include paths**: `include/` directory + libbpf headers + nlohmann_json headers.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp` only (all other logic is inline headers).
+- **Include paths**: `https_guard/` directory + libbpf headers + nlohmann_json headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
 
 ---
@@ -407,8 +403,8 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  ┌────────────────────────────────────────────────────┐  │
    │  │ ring_buffer__poll() loop (200ms interval)          │  │
    │  │   → on_event() callback                            │  │
-   │  │     → pattern_detector.cpp (anomaly rules)         │  │
-   │  │     → redfish_formatter.cpp (JSON via nlohmann)    │  │
+   │  │     → pattern_detector.hpp (inline anomaly rules)  │  │
+   │  │     → redfish_formatter.hpp (inline JSON)          │  │
    │  │     → append_line() to log file                    │  │
    │  └────────────────────────────────────────────────────┘  │
    └──────────────────────┬───────────────────────────────────┘
