@@ -1,12 +1,13 @@
 #include "redfish_formatter.hpp"
 
-#include "https_guard/string_utils.hpp"
-
 #include <chrono>
 #include <iomanip>
+#include <nlohmann/json.hpp>
 #include <sstream>
 
 namespace https_guard {
+
+using json = nlohmann::json;
 
 std::string now_utc_iso8601()
 {
@@ -27,21 +28,22 @@ std::string format_redfish_event(const hg_event& event,
 								 const std::string& message,
 								 const std::string& severity)
 {
-	std::ostringstream payload;
-	payload << "{";
-	payload << "\"@odata.type\":\"#Event.v1_7_0.Event\",";
-	payload << "\"Name\":\"Platform Security Anomaly Event\",";
-	payload << "\"Id\":\"" << event.timestamp_ns << "\",";
-	payload << "\"Events\":[{";
-	payload << "\"EventId\":\"" << event.timestamp_ns << "-" << event.pid << "\",";
-	payload << "\"Severity\":\"" << json_escape(severity) << "\",";
-	payload << "\"MessageId\":\"" << json_escape(message_id) << "\",";
-	payload << "\"Message\":\"" << json_escape(message) << "\",";
-	payload << "\"EventTimestamp\":\"" << now_utc_iso8601() << "\",";
-	payload << "\"OriginOfCondition\":{\"@odata.id\":\"/redfish/v1/Managers/BMC\"}";
-	payload << "}]}";
+	json payload;
+	payload["@odata.type"] = "#Event.v1_7_0.Event";
+	payload["Name"] = "Platform Security Anomaly Event";
+	payload["Id"] = std::to_string(event.timestamp_ns);
 
-	return payload.str();
+	json event_entry;
+	event_entry["EventId"] = std::to_string(event.timestamp_ns) + "-" + std::to_string(event.pid);
+	event_entry["Severity"] = severity;
+	event_entry["MessageId"] = message_id;
+	event_entry["Message"] = message;
+	event_entry["EventTimestamp"] = now_utc_iso8601();
+	event_entry["OriginOfCondition"] = {{"@odata.id", "/redfish/v1/Managers/BMC"}};
+
+	payload["Events"] = json::array({event_entry});
+
+	return payload.dump();
 }
 
 }  // namespace https_guard

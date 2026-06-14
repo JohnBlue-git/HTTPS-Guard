@@ -2,7 +2,7 @@
 
 HTTPS-Guard is a Network Security Observability Agent that implements a Detect -> Deny -> Dispatch security pipeline:
 
-- Detect and deny in kernel space with eBPF.
+- Detect (and eventually deny) in kernel space with eBPF.
 - Translate and classify in user space with a C++ daemon.
 - Dispatch as Redfish Event payloads for EventService subscribers.
 
@@ -10,18 +10,19 @@ HTTPS-Guard is a Network Security Observability Agent that implements a Detect -
 
 - eBPF XDP program:
 	- inspects TLS ClientHello on port 443.
-	- drops TLS 1.0 and TLS 1.1 attempts immediately with XDP_DROP.
-	- emits telemetry to a ring buffer map.
+	- observes TLS 1.0 and TLS 1.1 attempts and emits events to a ring buffer map (XDP_PASS, does not currently drop).
+	- emits TLS handshake metadata (SNI, version) for allowed TLS connections.
+	- detects plaintext HTTP verbs on port 443 (anomaly signal).
 
 - eBPF uprobe program:
 	- hooks OpenSSL SSL_write.
 	- captures plaintext snippets before encryption.
-	- emits payload-observed and anomaly-detected events.
+	- emits payload-observed events for user-space anomaly classification.
 
 - C++ daemon:
 	- loads and attaches BPF programs.
 	- consumes ring buffer events.
-	- applies HTTP payload anomaly pattern checks.
+	- applies HTTP payload anomaly pattern checks (SQLi, path traversal, etc.).
   - writes Redfish Event JSON lines to /var/log/https_guard_events.log.
 
 - Redfish assets:
@@ -47,63 +48,65 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
 ### Data Flow
 
 ```
-                                 +--------------------------------+
-                                 | A: Intrusive HTTPS request     |
-                                 +--------------------------------+
-                                  /                              \
-                                 /                                \
-                                v                                  v
-+-----------------------------+                      +-------------------------------+
-| B: eBPF XDP program         |                      | C: eBPF SSL_write uprobe      |
-+-----------------------------+                      +-------------------------------+
-   |              \                                          |
-   |               \                                         |
-   |                \                                        |
-   v                 v                                       v
-+-------------+   +-------------------+   +-------------------+
-| D: XDP_DROP |   | E: C++ daemon     |<--+ ring buffer event |
-| in kernel   |   |  (translate +     |   +-------------------+
-| (TLS 1.0/   |   |   classify)       |
-|  1.1)       |   +-------------------+
-+-------------+            |
-                           | Redfish event JSON lines
-                           v
-              +------------------------------+
-              | F: /var/log/                |
-              |     https_guard_events.log  |
-              +------------------------------+
-                           |
-                           v
-              +------------------------------+
-              | G: https-guard-event-bridge  |
-              +------------------------------+
-                /                              \
-               /                                \
-              v                                  v
-+-------------------------+         +----------------------------+
-| H: /var/log/redfish     |         | I: OpenBMC logging         |
-|     (plain-text event   |         |  (DBus + journald)         |
-|      log)               |         |                            |
-+-------------------------+         +----------------------------+
-              |                               |
-              v                               v
-+------------------------------+   +-------------------------------+
-| J: bmcweb                    |   | K: bmcweb D-Bus monitor       |
-|     FilesystemLogWatcher     |   |    (Logging.Entry)            |
-+------------------------------+   +-------------------------------+
-              |                               |
-              +---------------+---------------+
+                    +----------------------------+
+                    | A: Intrusive HTTPS request |
+                    +----------------------------+
+                   /                             \
+                  /                               \
+                 v                                 v
++-----------------------+                       +----------------------+
+| B: eBPF XDP hook      |                       | C: eBPF SSL_write    |
+|                       |                       |     uprobe           |
++-----------------------+                       +----------------------+
+| (TLS version, SNI,    |                       | (payload snippet)    |
+|  HTTP anomaly events) |                       |                      |
++-------+---------------+                       +---------+------------|
+          |        shared `events` ring buffer            |
+          +------------------------+----------------------+
+                                   |
+                                   v
+                        +-----------------------+
+                        | E: C++ daemon         |
+                        | (translate + classify)|
+                        +-----------------------+
+                                   |
+                                   | Redfish event JSON lines
+                                   v
+                   +--------------------------------+
+                   | F: /var/log/                   |
+                   |     https_guard_events.log     |
+                   +--------------------------------+
+                                   |
+                                   v
+                  +--------------------------------+
+                  | G: https-guard-event-bridge    |
+                  +--------------------------------+
+                   /                              \
+                  /                                \
+                 v                                  v
++-----------------------+                       +---------------------+
+| H: /var/log/redfish   |                       | I: OpenBMC logging  |
+| (plain-textevent log) |                       | (DBus + journald)   |
++-----------------------+                       +---------------------+
+          |                                               |
+          v                                               v
++-----------------------+                       +-------------------------------+
+| J: bmcweb             |                       | K: bmcweb                     |
+| FilesystemLog-Watcher |                       | D-Bus monitor (Logging.Entry) |
++-----------------------+                       +-------------------------------+
+          |                                               |
+          +-------------------+---------------------------+
                               |
                               v
-              +-------------------------------+
-              | L: Redfish EventService        |
-              +-------------------------------+
+                +----------------------------+
+                | L: Redfish EventService    |
+                +----------------------------+
                               |
                               v
-              +-------------------------------+
-              | M: SSE and HTTPS push          |
-              |     subscribers                |
-              +-------------------------------+
+                +----------------------------+
+                | M: SSE and HTTPS push      |
+                |     subscribers            |
+                +----------------------------+
 ```
 
 **Double-delivery prevention:** When the bridge uses D-Bus path (modes `dbus` or `both`), bmcweb's D-Bus monitor already dispatches to EventService subscribers. The filesystem log (`/var/log/redfish`) is **not** written in these modes to avoid duplicate delivery. The filesystem log is only written in `journal` mode, where FilesystemLogWatcher handles delivery.
@@ -112,9 +115,8 @@ Edge labels:
 
 - A -> B : TLS ClientHello on port 443
 - A -> C : OpenSSL SSL_write invocation
-- B -> D : TLS 1.0 or 1.1 ClientHello detected
-- B -> E : ring buffer event (allowed TLS)
-- C -> E : ring buffer event (payload observed / anomaly)
+- B -> E : ring buffer event (TLS version violation / handshake metadata / HTTP anomaly)
+- C -> E : ring buffer event (payload observed)
 - E -> F : Redfish event JSON lines appended
 - F -> G : tail /var/log/https_guard_events.log
 - G -> H : plain-text event log line (journal-only mode)
@@ -138,8 +140,9 @@ Edge labels:
 ### Recipe recipes-https-guard Components
 
 - ebpf/https_guard.bpf.c
-  - XDP path: drops TLS 1.0/1.1 ClientHello (hard deny).
-  - Uprobe path: inspects SSL_write plaintext snippets for suspicious patterns.
+  - XDP path: inspects TLS 1.0/1.1 ClientHello on port 443 and emits events (observes, does not currently drop).
+  - XDP path: extracts SNI from TLS extensions, detects plaintext HTTP on port 443 as anomaly.
+  - Uprobe path: hooks SSL_write to capture plaintext snippets before encryption for user-space analysis.
   - Emits normalized hg_event records to ring buffer map events.
 
 - src/main.cpp
