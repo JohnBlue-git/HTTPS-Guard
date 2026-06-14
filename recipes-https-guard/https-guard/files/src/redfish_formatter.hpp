@@ -1,10 +1,8 @@
 #pragma once
 #include <string>
-#include <stdint.h>
 #include "https_guard/events.h"
 
 namespace https_guard {
-std::string tls_version_to_string(uint16_t tls_version);
 std::string format_redfish_event(const hg_event& event,
                                  const std::string& message_id,
                                  const std::string& message,

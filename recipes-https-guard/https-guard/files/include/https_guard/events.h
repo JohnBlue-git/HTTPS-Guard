@@ -1,24 +1,35 @@
 #ifndef HTTPS_GUARD_EVENTS_H
 #define HTTPS_GUARD_EVENTS_H
 
+/*
+ * Use BPF-native integer types when compiled for the BPF target
+ * (clang -target bpf), and standard <stdint.h> types otherwise.
+ */
+#ifdef __BPF__
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long long uint64_t;
+#else
 #include <stdint.h>
+#endif
 
-#define HG_COMM_LEN 16
-#define HG_IP_STR_LEN 48
-#define HG_SNI_LEN 128
-#define HG_URI_LEN 256
-#define HG_PAYLOAD_SNIPPET_LEN 256
+#define HG_COMM_LEN            16
+#define HG_IP_STR_LEN          32
+#define HG_SNI_LEN             64
+#define HG_URI_LEN             128
+#define HG_PAYLOAD_SNIPPET_LEN 128
 
 enum hg_event_type {
-    HG_EVENT_TLS_VERSION_VIOLATION = 1,
+    HG_EVENT_TLS_VERSION_VIOLATION  = 1,
     HG_EVENT_TLS_HANDSHAKE_METADATA = 2,
-    HG_EVENT_HTTP_PAYLOAD_OBSERVED = 3,
-    HG_EVENT_HTTP_ANOMALY_DETECTED = 4
+    HG_EVENT_HTTP_PAYLOAD_OBSERVED  = 3,
+    HG_EVENT_HTTP_ANOMALY_DETECTED  = 4
 };
 
 enum hg_severity {
-    HG_SEV_INFO = 0,
-    HG_SEV_WARNING = 1,
+    HG_SEV_INFO     = 0,
+    HG_SEV_WARNING  = 1,
     HG_SEV_CRITICAL = 2
 };
 
@@ -45,4 +56,4 @@ struct hg_event {
     char payload_snippet[HG_PAYLOAD_SNIPPET_LEN];
 };
 
-#endif
+#endif /* HTTPS_GUARD_EVENTS_H */

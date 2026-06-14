@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "https_guard/events.h"
+#include "https_guard/string_utils.hpp"
 #include "pattern_detector.hpp"
 #include "redfish_formatter.hpp"
 

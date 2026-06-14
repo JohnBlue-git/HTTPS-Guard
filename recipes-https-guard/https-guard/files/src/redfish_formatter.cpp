@@ -1,26 +1,12 @@
 #include "redfish_formatter.hpp"
 
+#include "https_guard/string_utils.hpp"
+
 #include <chrono>
 #include <iomanip>
 #include <sstream>
 
 namespace https_guard {
-
-std::string tls_version_to_string(uint16_t tls_version)
-{
-	switch (tls_version) {
-		case 0x0301:
-			return "TLS 1.0";
-		case 0x0302:
-			return "TLS 1.1";
-		case 0x0303:
-			return "TLS 1.2";
-		case 0x0304:
-			return "TLS 1.3";
-		default:
-			return "Unknown";
-	}
-}
 
 std::string now_utc_iso8601()
 {
@@ -48,9 +34,9 @@ std::string format_redfish_event(const hg_event& event,
 	payload << "\"Id\":\"" << event.timestamp_ns << "\",";
 	payload << "\"Events\":[{";
 	payload << "\"EventId\":\"" << event.timestamp_ns << "-" << event.pid << "\",";
-	payload << "\"Severity\":\"" << severity << "\",";
-	payload << "\"MessageId\":\"" << message_id << "\",";
-	payload << "\"Message\":\"" << message << "\",";
+	payload << "\"Severity\":\"" << json_escape(severity) << "\",";
+	payload << "\"MessageId\":\"" << json_escape(message_id) << "\",";
+	payload << "\"Message\":\"" << json_escape(message) << "\",";
 	payload << "\"EventTimestamp\":\"" << now_utc_iso8601() << "\",";
 	payload << "\"OriginOfCondition\":{\"@odata.id\":\"/redfish/v1/Managers/BMC\"}";
 	payload << "}]}";
