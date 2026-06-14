@@ -1,6 +1,3 @@
-#include "LogAction.hpp"
-#include "../coroutine/async_mutex.hpp"
-
 #include <filesystem>
 #include <iostream>
 #include <utility>
@@ -10,23 +7,20 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 
-namespace asio = boost::asio;
+#include "../coroutine/async_mutex.hpp"
+#include "LogAction.hpp"
 
-namespace {
+namespace asio = boost::asio;
 
 AsyncFileStreamManager g_file_mgr;
 
-}  // namespace
 
 namespace https_guard {
 
-LogAction::LogAction(ActionLoop& action_loop, std::string output_path)
-    : output_path_(std::move(output_path))
-    , formatter_()
-    , action_loop_(action_loop)
-{
-    ensure_log_directory(output_path_);
-}
+LogAction::LogAction(std::string message, std::string path)
+    : message_(std::move(message))
+    , path_(std::move(path))
+{}
 
 bool LogAction::ensure_log_directory(const std::string& path) noexcept
 {
@@ -44,33 +38,29 @@ bool LogAction::ensure_log_directory(const std::string& path) noexcept
     return !ec;
 }
 
-void LogAction::execute(const hg_event& event,
-                        const std::string& message_id,
-                        const std::string& message,
-                        const std::string& severity)
+// The ActionLoop will handle the scheduling and execution of this task
+// , allowing it to run without blocking the main thread.
+asio::awaitable<void> LogAction::execute_async()
 {
-    const std::string payload = formatter_.format(event, message_id, message, severity);
-    action_loop_.spawn(execute_async(payload));
-    std::cout << "[HTTPS-Guard] " << message << "\n";
-}
-
-asio::awaitable<void> LogAction::execute_async(std::string payload)
-{
-    auto locked_stream = co_await g_file_mgr.acquire_stream(output_path_);
+    // We acquire a locked stream to the log file using the AsyncFileStreamManager.
+    auto locked_stream = co_await g_file_mgr.acquire_stream(path_);
     if (!locked_stream) {
         co_return;
     }
 
-    payload.push_back('\n');
+    // We use Boost.Asio's asynchronous write operation
+    //  to write the log message to the file without blocking the thread.
+    std::string payload = message_ + "\n";
     boost::system::error_code ec;
     co_await asio::async_write(
         locked_stream.stream(),
         asio::buffer(payload),
         asio::redirect_error(asio::use_awaitable, ec)
     );
-
+    // We use redirect_error to capture any errors that occur during the asynchronous write operation
+    //  and prevent them from throwing exceptions, which allows us to handle errors gracefully without crashing the ActionLoop.
     if (ec) {
-        std::cerr << "async_write failed for " << output_path_ << ": " << ec.message() << " (" << ec.value() << ")\n";
+        std::cerr << "async_write failed for " << path_ << ": " << ec.message() << " (" << ec.value() << ")\n";
     }
 }
 

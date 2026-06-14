@@ -132,7 +132,7 @@ HTTPS-Guard's eBPF programs **never** block, drop, or modify packets. Every hook
 3. Submits the event via `bpf_ringbuf_submit()`
 4. Returns `XDP_PASS` (XDP) or `0` (uprobe)
 
-All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → inline headers `pattern_detector.hpp` and `redfish_formatter.hpp`). Even the dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
+All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → inline headers `pattern_detector.hpp` and `redfish_event_message.hpp`). Even the dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
 
 ### Future hybrid extension
 

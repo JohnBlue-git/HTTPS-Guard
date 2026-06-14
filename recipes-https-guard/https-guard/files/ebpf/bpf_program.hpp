@@ -8,7 +8,7 @@
 #include "ActionLoop.hpp"
 #include "events.h"
 #include "pattern_detector.hpp"
-#include "string_utils.hpp"
+#include "tls_version.hpp"
 
 namespace https_guard {
 

@@ -57,9 +57,9 @@ SRC_URI = " \
     file://CMakeLists.txt \
     file://https_guard/main.cpp \
     file://https_guard/events.h \
-    file://https_guard/redfish_formatter.hpp \
+    file://https_guard/redfish_event_message.hpp \
     file://https_guard/pattern_detector.hpp \
-    file://https_guard/string_utils.hpp \
+    file://https_guard/tls_version.hpp \
     file://https_guard/https_guard.bpf.c \
     file://ebpf/bpf_program.hpp \
     file://ebpf/bpf_program.cpp \

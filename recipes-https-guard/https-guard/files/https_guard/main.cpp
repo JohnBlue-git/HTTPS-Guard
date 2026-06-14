@@ -56,9 +56,8 @@ int main(int argc, char** argv)
 
     std::filesystem::create_directories(std::filesystem::path(cfg.output_path).parent_path());
 
-    https_guard::ActionLoop action_loop;
-    action_loop.add_action(std::make_unique<https_guard::LogAction>(action_loop, cfg.output_path));
-    action_loop.run();
+    https_guard::ActionLoop& action_loop = https_guard::ActionLoop::getInstance();
+    action_loop.pushAction(std::make_unique<https_guard::LogAction>("HTTPS_GUARD_EVENT", cfg.output_path));
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 

@@ -1,4 +1,5 @@
 #include "https_guard_program.hpp"
+#include "LogAction.hpp"
 
 #include <utility>
 
@@ -85,7 +86,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         return 0;
     }
 
-    action_loop_.post(*evt, message_id, message, severity);
+    RedfishEventMessage event_msg(*evt, message_id, message, severity);
+    action_loop_.pushAction(std::make_unique<LogAction>(event_msg.format(), std::string("/var/log/https_guard.log")));
     return 0;
 }
 

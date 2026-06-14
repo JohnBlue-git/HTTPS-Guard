@@ -15,8 +15,8 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 - [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
 - [C++ Daemon (`https_guard/main.cpp`)](#c-daemon-https_guardmaincpp)
 - [Pattern Detector (`https_guard/pattern_detector.hpp`)](#pattern-detector-https_guardpattern_detectorhpp)
-- [Redfish Formatter (`https_guard/redfish_formatter.hpp`)](#redfish-formatter-https_guardredfish_formatterhpp)
-- [String Utilities (`https_guard/string_utils.hpp`)](#string-utilities-https_guardstring_utilshpp)
+- [Redfish Event Message (`https_guard/redfish_event_message.hpp`)](#redfish-event-message-https_guardredfish_event_messagehpp)
+- [TLS Version (`https_guard/tls_version.hpp`)](#tls-version-https_guardtls_versionhpp)
 - [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
 - [Configuration (`https-guard.conf`)](#configuration-https-guardconf)
 - [Security Strategy](SECURITY_STRATEGY.md)
@@ -46,8 +46,8 @@ files/
 │   ├── https_guard_program.cpp                        # BPF lifecycle implementation
 │   ├── main.cpp                                      # C++ daemon entry point
 │   ├── pattern_detector.hpp                          # User-space HTTP anomaly rules (inline)
-│   ├── redfish_formatter.hpp                         # Redfish Event JSON serialization (inline)
-│   └── string_utils.hpp                              # TLS version helpers (inline)
+│   ├── redfish_event_message.hpp                     # Redfish Event message with formatting (inline)
+│   └── tls_version.hpp                               # TLS version helpers (inline)
 ├── actions/
 │   ├── main.cpp                                      # ActionLoop smoke-test / demo entry point
 │   ├── ActionLoop.hpp                                # Boost.Asio-based event dispatcher interface
@@ -252,11 +252,32 @@ The user-space anomaly detection engine applies a set of **static signature rule
 
 ---
 
-## Redfish Formatter (`https_guard/redfish_formatter.hpp`)
+## Redfish Event Message (`https_guard/redfish_event_message.hpp`)
 
-Converts an `hg_event` + classification result into a Redfish Event JSON line using the [nlohmann/json](https://github.com/nlohmann/json) library for safe, standards-compliant serialization. The library handles all string escaping and UTF-8 encoding automatically. The implementation is **inline** in the header, so no separate `.cpp` file is needed.
+A data class that encapsulates event information (hg_event, message_id, message, severity) and provides JSON formatting for Redfish EventService. Replaces the previous `RedfishFormatter` class by combining data storage with formatting capability. The implementation is **inline** in the header, using the [nlohmann/json](https://github.com/nlohmann/json) library for safe, standards-compliant serialization.
+
+### Class Structure
+
+```cpp
+class RedfishEventMessage {
+public:
+    RedfishEventMessage(const hg_event& event,
+                        std::string message_id,
+                        std::string message,
+                        std::string severity);
+
+    std::string format() const;  // Returns JSON-formatted Redfish event
+
+    const hg_event& getEvent() const;
+    const std::string& getMessageId() const;
+    const std::string& getMessage() const;
+    const std::string& getSeverity() const;
+};
+```
 
 ### Output Format
+
+The `format()` method returns a Redfish Event JSON line following the [Redfish Event v1.7.0](https://redfish.dmtf.org/) specification:
 
 ```json
 {
@@ -284,18 +305,28 @@ Converts an `hg_event` + classification result into a Redfish Event JSON line us
 |-------|--------|
 | `Id` | `hg_event.timestamp_ns` (unique per event) |
 | `EventId` | `timestamp_ns` + `-` + `pid` (unique per process-event) |
-| `Severity` | `"OK"`, `"Warning"`, or `"Critical"` (mapped from hg_severity) |
+| `Severity` | `"OK"`, `"Warning"`, or `"Critical"` (passed to constructor) |
 | `MessageId` | `OemSecurityEvent.1.0.0.HttpsTlsVersionViolation` or `OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected` |
 | `Message` | Human-readable string containing process, PID, TLS version, or matched rule |
 | `EventTimestamp` | Current UTC time in ISO 8601 format (`YYYY-MM-DDTHH:MM:SSZ`) |
 
 ---
 
-## String Utilities (`https_guard/string_utils.hpp`)
+## TLS Version (`https_guard/tls_version.hpp`)
 
-### `tls_version_to_string()`
+A utility class that converts TLS version codes (as extracted from wire-level TLS ClientHello packets) into human-readable strings. The implementation is **inline** in the header.
 
-Maps TLS version codes to human-readable names (defined inline in the header):
+### `TlsVersion` Class
+
+```cpp
+class TlsVersion {
+public:
+    explicit TlsVersion(uint16_t value);
+    std::string toString() const;  // Returns human-readable version string
+};
+```
+
+### Supported Versions
 
 | Code | String |
 |------|--------|
@@ -417,7 +448,7 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │ ring_buffer__poll() loop (200ms interval)          │  │
    │  │   → on_event() callback                            │  │
    │  │     → pattern_detector.hpp (inline anomaly rules)  │  │
-   │  │     → redfish_formatter.hpp (inline JSON)          │  │
+   │  │     → redfish_event_message.hpp (inline JSON)      │  │
    │  │     → append_line() to log file                    │  │
    │  └────────────────────────────────────────────────────┘  │
    └──────────────────────┬───────────────────────────────────┘

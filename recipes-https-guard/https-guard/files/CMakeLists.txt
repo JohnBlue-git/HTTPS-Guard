@@ -26,7 +26,6 @@ else()
     )
     FetchContent_MakeAvailable(boost_headers)
     set(BOOST_INCLUDE_DIR ${boost_headers_SOURCE_DIR})
-    add_compile_definitions(BOOST_ERROR_CODE_HEADER_ONLY)
     message(STATUS "Using fetched Boost headers: ${BOOST_INCLUDE_DIR}")
 endif()
 

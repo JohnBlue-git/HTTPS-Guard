@@ -4,7 +4,10 @@
 
 #include "ActionLoop.hpp"
 #include "bpf_program.hpp"
+#include "events.h"
+#include "redfish_event_message.hpp"
 #include "pattern_detector.hpp"
+#include "tls_version.hpp"
 
 namespace https_guard {
 
