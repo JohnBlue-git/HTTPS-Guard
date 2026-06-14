@@ -1,6 +1,6 @@
 # Source Code Reference: recipes-https-guard/https-guard/files/
 
-This directory contains the complete source code of the **HTTPS-Guard** agent — an eBPF-based network security observability tool for OpenBMC. It implements a **Detect → Deny → Dispatch** pipeline using kernel-space XDP/uprobe programs, a user-space C++ daemon, and Redfish EventService integration.
+This directory contains the complete source code of the **HTTPS-Guard** agent — an eBPF-based network security observability tool for OpenBMC. It implements a **Detect → Translate → Dispatch** pipeline using kernel-space XDP/uprobe programs, a user-space C++ daemon, a shell-based event bridge, and Redfish EventService integration.
 
 > For a top-level project overview, build instructions, and deployment guidance, see the root [`README.md`](../../README.md).
 
@@ -42,11 +42,14 @@ files/
 ├── https_guard/
 │   ├── events.h                                      # Shared event struct & enums (BPF + C++)
 │   ├── https_guard.bpf.c                              # eBPF programs (XDP + uprobe)
+│   ├── https_guard_program.hpp                        # BPF object loader / ring-buffer adapter
+│   ├── https_guard_program.cpp                        # BPF lifecycle implementation
 │   ├── main.cpp                                      # C++ daemon entry point
 │   ├── pattern_detector.hpp                          # User-space HTTP anomaly rules (inline)
 │   ├── redfish_formatter.hpp                         # Redfish Event JSON serialization (inline)
 │   └── string_utils.hpp                              # TLS version helpers (inline)
 ├── actions/
+│   ├── main.cpp                                      # ActionLoop smoke-test / demo entry point
 │   ├── ActionLoop.hpp                                # Boost.Asio-based event dispatcher interface
 │   ├── ActionLoop.cpp                                # Boost.Asio-based event dispatcher implementation
 │   ├── LogAction.hpp                                 # Event logging action interface
@@ -185,6 +188,7 @@ The daemon's `main()` function orchestrates the full eBPF lifecycle:
 3. **Attach programs**:
    - XDP program `https_guard_xdp` → `bpf_program__attach_xdp()` on the specified interface.
    - Uprobe program `https_guard_ssl_write` → `bpf_program__attach_uprobe()` on `SSL_write` from the specified OpenSSL shared library.
+  - `HttpGuardProgram` owns the loaded BPF object and forwards ring-buffer events into `ActionLoop`.
 
 4. **Open ring buffer consumer** — `ring_buffer__new()` maps the `events` BPF map and registers the `on_event` callback.
 
@@ -308,7 +312,8 @@ Maps TLS version codes to human-readable names (defined inline in the header):
 - **C++ Standard**: C++20.
 - **Dependencies**: `libbpf` (found via pkg-config), `nlohmann_json` (found via `find_package`), and Boost.Asio headers.
 - **Boost handling**: Uses system Boost headers when available; otherwise fetches Boost 1.86 headers via CMake `FetchContent` and compiles Asio in header-only mode.
-- **Target**: `https_guardd` — compiles `https_guard/main.cpp` plus `actions/ActionLoop.cpp`, `actions/LogAction.cpp`, and `ebpf/bpf_program.cpp`.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/LogAction.cpp`, and `ebpf/bpf_program.cpp`.
+- **Secondary target**: `action_runner` — compiles `actions/main.cpp` plus `actions/ActionLoop.cpp` for exercising the dispatcher loop in isolation.
 - **Include paths**: `https_guard/`, `actions/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
 

@@ -1,10 +1,10 @@
 # HTTPS-Guard
 
-HTTPS-Guard is a Network Security Observability Agent that implements a Detect -> Deny -> Dispatch security pipeline:
+HTTPS-Guard is a Network Security Observability Agent that implements a Detect -> Translate -> Dispatch security pipeline:
 
-- Detect (and eventually deny) in kernel space with eBPF.
+- Detect in kernel space with eBPF.
 - Translate and classify in user space with a C++ daemon.
-- Dispatch as Redfish Event payloads for EventService subscribers.
+- Dispatch through the event bridge as Redfish Event payloads for EventService subscribers.
 
 ## What is implemented in this repository
 
@@ -24,6 +24,13 @@ HTTPS-Guard is a Network Security Observability Agent that implements a Detect -
 	- consumes ring buffer events.
 	- applies HTTP payload anomaly pattern checks (SQLi, path traversal, etc.).
   - writes Redfish Event JSON lines to /var/log/https_guard_events.log.
+
+- Event bridge:
+  - tails the daemon output log.
+  - forwards events to D-Bus, journald, or /var/log/redfish depending on PACKAGECONFIG.
+
+- Simulation service:
+  - emits synthetic events for QEMU and slirp-based testing.
 
 - Redfish assets:
 	- OEM message registry in config/security_message_registry/OemSecurityEvent.1.0.0.json.
