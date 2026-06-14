@@ -29,10 +29,12 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 files/
 ├── CMakeLists.txt                                    # CMake build definition
 ├── https-guard.conf                                  # EnvironmentFile for systemd units
-├── config/
-│   ├── redfish_event_example.json                    # Example Redfish event payload
-│   └── security_message_registry/
-│       └── OemSecurityEvent.1.0.0.json               # OEM message registry definitions
+├── https-guard-daemon.service                        # systemd unit for the eBPF daemon
+├── https-guard-daemon.sh                             # Shell wrapper that launches https-guardd
+├── https-guard-event-bridge.service                  # systemd unit for the event bridge
+├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
+├── https-guard-event-generator.service               # systemd unit for synthetic event generator
+├── https-guard-event-generator.sh                    # Shell script that emits simulated events
 ├── ebpf/
 │   └── https_guard.bpf.c                             # eBPF programs (XDP + uprobe)
 ├── include/
@@ -356,26 +358,124 @@ See the top-level [README.md](../../README.md) for detailed usage. Key points:
 
 ## Event Flow Summary
 
+### Service / Shell-Script / Binary Mapping
+
+Each systemd unit file (`*.service`) invokes a shell wrapper script installed on the target image. The wrapper in turn may invoke the compiled C++ binary. The table below shows the complete mapping from recipe sources to the installed image paths:
+
+| Recipe source (`.service`) | Install path (executable) | Source script | Binary launched | Role |
+|----------------------------|---------------------------|---------------|-----------------|------|
+| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging |
+| `https-guard-event-bridge.service` | `/usr/sbin/https-guard-event-bridge` | `https-guard-event-bridge.sh` | — (pure shell) | Tails the event log, dispatches events to D-Bus / journal / Redfish log |
+| `https-guard-event-generator.service` | `/usr/sbin/https-guard-event-generator` | `https-guard-event-generator.sh` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
+
+**Important:** The shell scripts are installed **without** the `.sh` extension. For example, the source file `https-guard-event-bridge.sh` is installed as `/usr/sbin/https-guard-event-bridge` on the target image — the `.sh` suffix is stripped by the recipe's `do_install` step (see `install -m 0755 ${S}/https-guard-event-bridge.sh ${D}${sbindir}/https-guard-event-bridge`).
+
+### Why is the bridge a shell script and not direct C++ code?
+
+The `https-guard-event-bridge.sh` script exists as a separate process **decoupled** from the C++ daemon for several reasons:
+
+1. **Avoid direct D-Bus / sd_journal / filesystem calls from the hot path** — The C++ daemon's `on_event()` callback runs inside the `ring_buffer__poll()` loop. Calling D-Bus (`busctl`/`sd_bus`), `sd_journal_send()`, or appending to `/var/log/redfish` directly from the daemon's event callback would block the ring buffer consumer, risking dropped eBPF events under load. Instead, the daemon writes a single JSON line to a log file (a fast, non-blocking `fstream::operator<<`), and the bridge script tails that file as a **separate process**.
+
+2. **Race-condition-free dispatch** — Because the bridge is a separate `tail -F` consumer, multiple event lines are processed one-at-a-time in a single-threaded `while read` loop. This eliminates any need for locks, mutexes, or synchronisation primitives that would be necessary if the C++ daemon dispatched events directly to three different sinks (D-Bus, journal, filesystem) from multiple threads or callback invocations. The shell pipeline acts as a **natural serialisation barrier**: `tail -F` guarantees line-by-line delivery, and the `while read` loop processes each line synchronously.
+
+3. **Fail-fast isolation** — If the D-Bus call (`busctl`) fails (e.g. `xyz.openbmc_project.Logging` is not yet up), it does **not** crash or stall the daemon. The bridge script handles the failure with `|| true` and continues tailing the next line. The daemon's event-capture pipeline is never impacted by downstream dispatch failures.
+
+4. **Flexible sink selection without recompilation** — The event sink mode (`dbus`, `journal`, or `both`) is configured at build time via `PACKAGECONFIG` and stamped into `/etc/default/https-guard`. The bridge script reads this at runtime. Changing the dispatch strategy requires only a recipe rebuild, not C++ code changes. This also makes it easy to add new sinks (e.g. Kafka, syslog) by modifying only the shell script.
+
+### Complete Event Pipeline
+
 ```
-Wire:  TLS ClientHello on TCP/443          Process: SSL_write(buf, num)
+                              Kernel space                              User space
+                              ===========                              ==========
+
+Wire: TLS ClientHello on TCP/443          Process: SSL_write(buf, num)
   │                                               │
   ▼                                               ▼
 eBPF XDP hook                              eBPF Uprobe hook
   │  (TLS version, SNI, HTTP anomaly)             │  (payload snippet)
   │                                               │
   └─────────────┬───────────────────────────────┘
-                │  shared `events` ring buffer
+                │  shared `events` ring buffer (BPF_MAP_TYPE_RINGBUF)
                 ▼
-         C++ daemon (main.cpp)
-          │
-          ├─ ring_buffer__poll() — single consumer loop
-          ├─ pattern_detector.cpp (anomaly rules)
-          └─ redfish_formatter.cpp (JSON line)
-                │
-                ▼
-               /var/log/https_guard_events.log
-                │
-                ▼
-               https-guard-event-bridge
-                  ├── D-Bus → bmcweb → EventService → SSE/HTTPS push
-                  └── journald → FilesystemLogWatcher → EventService
+   ┌──────────────────────────────────────────────────────────┐
+   │  C++ daemon: https-guardd                                │
+   │  Invoked by: https-guard-daemon.service                  │
+   │  Shell wrapper: /usr/sbin/https-guard-daemon             │
+   │  Source: https-guard-daemon.sh                           │
+   │                                                          │
+   │  ┌────────────────────────────────────────────────────┐  │
+   │  │ ring_buffer__poll() loop (200ms interval)          │  │
+   │  │   → on_event() callback                            │  │
+   │  │     → pattern_detector.cpp (anomaly rules)         │  │
+   │  │     → redfish_formatter.cpp (JSON via nlohmann)    │  │
+   │  │     → append_line() to log file                    │  │
+   │  └────────────────────────────────────────────────────┘  │
+   └──────────────────────┬───────────────────────────────────┘
+                          │  writes JSON lines
+                          ▼
+                 /var/log/https_guard_events.log
+                          │
+                          │  tail -n 0 -F (follow)
+                          ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │  Bridge: https-guard-event-bridge                        │
+   │  Invoked by: https-guard-event-bridge.service            │
+   │  Shell wrapper: /usr/sbin/https-guard-event-bridge       │
+   │  Source: https-guard-event-bridge.sh                     │
+   │                                                          │
+   │  ┌────────────────────────────────────────────────────┐  │
+   │  │ while read line; do                                │  │
+   │  │   extract_field "MessageId" "$line"                │  │
+   │  │   extract_field "Severity"  "$line"                │  │
+   │  │   extract_field "Message"   "$line"                │  │
+   │  │   extract_field "EventTimestamp" "$line"           │  │
+   │  │                                                    │  │
+   │  │   case "$MODE" in                                  │  │
+   │  │     dbus)                                          │  │
+   │  │       busctl call ... Create ...            ───┐   │  │
+   │  │     journal)                                     │   │  │
+   │  │       systemd-cat -t https-guard-event ...       │   │  │
+   │  │       emit_redfish_log "$ts" "$msg"       ───────┤   │  │
+   │  │     both)                                         │   │  │
+   │  │       busctl call ... Create ...            ─────┤   │  │
+   │  │       systemd-cat -t https-guard-event ...       │   │  │
+   │  │   esac                                            │   │  │
+   │  │ done                                              │   │  │
+   │  └────────────────────────────────────────────────────┘  │
+   └──────────────────────┬───────────────────────────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         ▼                ▼                ▼
+   ┌──────────┐   ┌──────────────┐   ┌──────────────┐
+   │  D-Bus   │   │  journald    │   │ /var/log/    │
+   │  Call    │   │  (systemd-   │   │ redfish      │
+   │  (busctl)│   │   cat)       │   │ (plain-text  │
+   │          │   │              │   │  log)        │
+   └────┬─────┘   └──────┬───────┘   └──────┬───────┘
+        │                │                  │
+        ▼                │                  ▼
+   ┌──────────────┐      │   ┌─────────────────────────────┐
+   │ bmcweb       │      │   │ bmcweb                       │
+   │ D-Bus        │      │   │ FilesystemLogWatcher         │
+   │ monitor      │      │   │ (inotify on /var/log/redfish)│
+   └──────┬───────┘      │   └──────────────┬──────────────┘
+          │              │                  │
+          └──────────────┼──────────────────┘
+                         ▼
+           ┌─────────────────────────┐
+           │  Redfish EventService   │
+           │  (SSE / HTTPS push)     │
+           └─────────────────────────┘
+```
+
+### Dispatch modes at a glance
+
+| Mode | D-Bus (`busctl`) | `systemd-cat` | `/var/log/redfish` | EventService Delivery |
+|------|:----------------:|:-------------:|:------------------:|:---------------------:|
+| `dbus` | ✓ | ✗ | ✗ | D-Bus monitor (bmcweb) |
+| `journal` | ✗ | ✓ | ✓ | FilesystemLogWatcher (bmcweb) |
+| `both` (default) | ✓ | ✓ | ✗ | D-Bus monitor (bmcweb) |
+
+Notes:
+- In `dbus` and `both` modes, the filesystem Redfish log (`/var/log/redfish`) is **not** written to prevent duplicate EventService delivery (bmcweb would pick it up via both D-Bus and inotify).
+- In `journal` mode, D-Bus is skipped entirely; delivery relies on bmcweb's `FilesystemLogWatcher` tailing the plain-text log at `/var/log/redfish`.
