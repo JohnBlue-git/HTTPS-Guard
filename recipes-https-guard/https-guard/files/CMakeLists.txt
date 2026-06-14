@@ -11,8 +11,6 @@ find_package(nlohmann_json REQUIRED)
 
 add_executable(https_guardd
     src/main.cpp
-    src/pattern_detector.cpp
-    src/redfish_formatter.cpp
 )
 
 target_include_directories(https_guardd

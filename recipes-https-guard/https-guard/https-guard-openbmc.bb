@@ -56,11 +56,9 @@ SRC_URI = " \
     file://https-guard.conf \
     file://CMakeLists.txt \
     file://src/main.cpp \
-    file://src/pattern_detector.cpp \
-    file://src/redfish_formatter.cpp \
-    file://src/pattern_detector.hpp \
-    file://src/redfish_formatter.hpp \
     file://include/https_guard/events.h \
+    file://include/https_guard/redfish_formatter.hpp \
+    file://include/https_guard/pattern_detector.hpp \
     file://ebpf/https_guard.bpf.c \
 "
 

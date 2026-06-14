@@ -12,8 +12,8 @@
 
 #include "https_guard/events.h"
 #include "https_guard/string_utils.hpp"
-#include "pattern_detector.hpp"
-#include "redfish_formatter.hpp"
+#include "https_guard/pattern_detector.hpp"
+#include "https_guard/redfish_formatter.hpp"
 
 namespace {
 
