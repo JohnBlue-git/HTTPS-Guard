@@ -2,15 +2,60 @@
 
 namespace https_guard {
 
+ActionLoop& ActionLoop::getInstance()
+{
+    static ActionLoop instance;
+    return instance;
+}
+
+ActionLoop::ActionLoop()
+    : work_guard_(boost::asio::make_work_guard(io_context_))
+{
+}
+
+ActionLoop::~ActionLoop()
+{
+    stop();
+}
+
 void ActionLoop::add_action(std::unique_ptr<Action> action)
 {
     actions_.push_back(std::move(action));
 }
 
-void ActionLoop::handle(const hg_event& event)
+void ActionLoop::post(const hg_event& event,
+                      const std::string& message_id,
+                      const std::string& message,
+                      const std::string& severity)
+{
+    io_context_.post([this, event, message_id, message, severity]() {
+        handle(event, message_id, message, severity);
+    });
+}
+
+void ActionLoop::run()
+{
+    thread_ = std::thread([this]() {
+        io_context_.run();
+    });
+}
+
+void ActionLoop::stop()
+{
+    work_guard_.reset();
+    io_context_.stop();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
+void ActionLoop::handle(const hg_event& event,
+                        const std::string& message_id,
+                        const std::string& message,
+                        const std::string& severity)
 {
     for (const auto& action : actions_) {
-        action->execute(event);
+        action->execute(event, message_id, message, severity);
     }
 }
 

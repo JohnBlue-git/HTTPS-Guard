@@ -47,8 +47,8 @@ files/
 │   ├── redfish_formatter.hpp                         # Redfish Event JSON serialization (inline)
 │   └── string_utils.hpp                              # TLS version helpers (inline)
 ├── actions/
-│   ├── ActionLoop.hpp                                # Event dispatcher interface
-│   ├── ActionLoop.cpp                                # Event dispatcher implementation
+│   ├── ActionLoop.hpp                                # Boost.Asio-based event dispatcher interface
+│   ├── ActionLoop.cpp                                # Boost.Asio-based event dispatcher implementation
 │   ├── LogAction.hpp                                 # Event logging action interface
 │   └── LogAction.cpp                                 # Event logging action implementation
 ```
@@ -306,9 +306,10 @@ Maps TLS version codes to human-readable names (defined inline in the header):
 ## CMake Build (`CMakeLists.txt`)
 
 - **C++ Standard**: C++20.
-- **Dependencies**: `libbpf` (found via pkg-config), `nlohmann_json` (found via `find_package`).
-- **Target**: `https_guardd` — compiles `https_guard/main.cpp` only (all other logic is inline headers).
-- **Include paths**: `https_guard/` directory + libbpf headers + nlohmann_json headers.
+- **Dependencies**: `libbpf` (found via pkg-config), `nlohmann_json` (found via `find_package`), and Boost.Asio headers.
+- **Boost handling**: Uses system Boost headers when available; otherwise fetches Boost 1.86 headers via CMake `FetchContent` and compiles Asio in header-only mode.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp` plus `actions/ActionLoop.cpp`, `actions/LogAction.cpp`, and `ebpf/bpf_program.cpp`.
+- **Include paths**: `https_guard/`, `actions/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
 
 ---

@@ -34,6 +34,16 @@ fi
 # Ensure the output directory exists
 mkdir -p "$(dirname "$OUTPUT")"
 
+ACTION_RUNNER="/usr/sbin/action_runner"
+
+if [ ! -x "$ACTION_RUNNER" ]; then
+    echo "https-guard-daemon: ERROR: $ACTION_RUNNER not found or not executable" >&2
+    exit 1
+fi
+
+echo "https-guard-daemon: starting action runner..."
+"$ACTION_RUNNER" &
+
 echo "https-guard-daemon: starting daemon..."
 echo "    binary:    $DAEMON"
 echo "    bpf_obj:   $BPF_OBJ"

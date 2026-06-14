@@ -3,48 +3,68 @@
 #include <bpf/libbpf.h>
 #include <optional>
 #include <string>
-#include <sys/types.h>
+#include <vector>
+
+#include "ActionLoop.hpp"
+#include "events.h"
+#include "pattern_detector.hpp"
+#include "string_utils.hpp"
 
 namespace https_guard {
 
 class BpfProgram {
 public:
-    explicit BpfProgram(bpf_program* program) noexcept;
+    explicit BpfProgram(std::string object_path) noexcept;
     BpfProgram(const BpfProgram&) = delete;
     BpfProgram& operator=(const BpfProgram&) = delete;
     BpfProgram(BpfProgram&& other) noexcept;
     BpfProgram& operator=(BpfProgram&& other) noexcept;
-    ~BpfProgram();
+    virtual ~BpfProgram() noexcept;
 
-    bool attachXdp(unsigned int ifindex);
-    bool attachUprobe(bool retprobe, pid_t pid, const std::string& binary_path, unsigned long offset);
-    void detach();
-    bool isAttached() const noexcept;
+    bool loadFilter() noexcept;
+    void detachFilter() noexcept;
+    bool isLoaded() const noexcept;
 
-private:
-    bpf_program* program_;
-    bpf_link* link_ = nullptr;
+    bool openObject() noexcept;
+    void closeObject() noexcept;
+    int pollEvents(int timeout_ms) noexcept;
+    int getProgramFd(const std::string& prog_name) const noexcept;
+    int getMapFd(const std::string& map_name) const noexcept;
+
+protected:
+    virtual bool attachProgram() noexcept = 0;
+    virtual ring_buffer_sample_fn getRingBufferHandler() noexcept = 0;
+
+    bool registerEventHandler() noexcept;
+    void releaseRingBuffer() noexcept;
+    void detachProgram() noexcept;
+
+    std::string object_path_;
+    bpf_object* object_ = nullptr;
+    bool loaded_ = false;
+    ring_buffer* ring_buffer_ = nullptr;
+    std::vector<bpf_link*> links_;
 };
 
-class BpfObject {
+class HttpGuardProgram final : public BpfProgram {
 public:
-    BpfObject(const BpfObject&) = delete;
-    BpfObject& operator=(const BpfObject&) = delete;
-    BpfObject(BpfObject&& other) noexcept;
-    BpfObject& operator=(BpfObject&& other) noexcept;
-    ~BpfObject();
+    HttpGuardProgram(std::string object_path,
+                     ActionLoop& action_loop,
+                     std::string openssl_lib_path,
+                     unsigned int ifindex) noexcept;
 
-    static std::optional<BpfObject> openFile(const std::string& path);
-    bool load();
-    std::optional<BpfProgram> findProgramByName(const std::string& name) const;
-    bpf_map* findMapByName(const std::string& name) const;
-    bpf_object* get() const noexcept;
+protected:
+    bool attachProgram() noexcept override;
+    ring_buffer_sample_fn getRingBufferHandler() noexcept override;
 
 private:
-    explicit BpfObject(bpf_object* object) noexcept;
-    void close();
+    int ringBufferHandler(void* data, size_t size) noexcept;
+    static int ringBufferCallback(void* ctx, void* data, size_t size) noexcept;
 
-    bpf_object* object_ = nullptr;
+    ActionLoop& action_loop_;
+    std::string openssl_lib_path_;
+    unsigned int ifindex_;
+    PatternDetector detector_;
 };
 
 }  // namespace https_guard
