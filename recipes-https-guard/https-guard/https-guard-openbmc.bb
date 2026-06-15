@@ -60,6 +60,8 @@ SRC_URI = " \
     file://https_guard/redfish_event_message.hpp \
     file://https_guard/pattern_detector.hpp \
     file://https_guard/tls_version.hpp \
+    file://https_guard/https_guard_program.hpp \
+    file://https_guard/https_guard_program.cpp \
     file://https_guard/https_guard.bpf.c \
     file://ebpf/bpf_program.hpp \
     file://ebpf/bpf_program.cpp \
@@ -67,6 +69,8 @@ SRC_URI = " \
     file://actions/ActionLoop.cpp \
     file://actions/LogAction.hpp \
     file://actions/LogAction.cpp \
+    file://actions/main.cpp \
+    file://coroutine/async_mutex.hpp \
 "
 
 S = "${UNPACKDIR}"

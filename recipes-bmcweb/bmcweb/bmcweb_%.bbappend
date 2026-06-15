@@ -15,8 +15,7 @@ SRC_URI:append = " \
 # so bmcweb can serve it via /redfish/v1/Registries/.
 do_install:append() {
     install -d ${D}${datadir}/www/redfish/v1/Registries/OemSecurityEvent.1.0.0/
-    install -m 0644 ${S}/OemSecurityEvent.1.0.0.json \
-        ${D}${datadir}/www/redfish/v1/Registries/OemSecurityEvent.1.0.0/
+    install -m 0644 ${WORKDIR}/sources/OemSecurityEvent.1.0.0.json ${D}${datadir}/www/redfish/v1/Registries/OemSecurityEvent.1.0.0/
 }
 
 FILES:${PN}:append = " \
