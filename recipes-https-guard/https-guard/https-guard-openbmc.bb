@@ -4,7 +4,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
 
-DEPENDS += "libbpf pkgconfig clang-native nlohmann-json boost"
+DEPENDS += "libbpf pkgconfig clang-native bpftool-native nlohmann-json boost"
 inherit systemd
 inherit cmake
 inherit pkgconfig
@@ -77,6 +77,44 @@ S = "${UNPACKDIR}"
 
 RDEPENDS:${PN} += "bash systemd"
 
+EXTRA_OECMAKE += " \
+    -DHTTPS_GUARD_BUILD_BPF=${HTTPS_GUARD_BUILD_BPF} \
+    -DHTTPS_GUARD_BPF_CLANG_EXECUTABLE=${STAGING_BINDIR_NATIVE}/clang \
+    -DHTTPS_GUARD_BPFTOOL_EXECUTABLE=${STAGING_SBINDIR_NATIVE}/bpftool \
+    -DHTTPS_GUARD_TARGET_VMLINUX=${WORKDIR}/target-kernel-vmlinux \
+    -DHTTPS_GUARD_BPF_SYSROOT_INCLUDE=${RECIPE_SYSROOT}/usr/include \
+    -DHTTPS_GUARD_BPF_SOURCE_PREFIX_MAP=${S}=/usr/src/debug/${PN}/${PV} \
+    -DHTTPS_GUARD_BPF_BINARY_PREFIX_MAP=${B}=/usr/src/debug/${PN}/${PV} \
+    -DHTTPS_GUARD_BPF_SYSROOT_PREFIX_MAP=${RECIPE_SYSROOT}= \
+    -DHTTPS_GUARD_BPF_SYSROOT_NATIVE_PREFIX_MAP=${RECIPE_SYSROOT_NATIVE}= \
+"
+
+do_configure[depends] += "virtual/kernel:do_compile"
+
+do_configure:prepend() {
+    if [ "${HTTPS_GUARD_BUILD_BPF}" != "ON" ]; then
+        return 0
+    fi
+
+    target_vmlinux=""
+
+    if [ -f "${STAGING_KERNEL_BUILDDIR}/vmlinux" ]; then
+        target_vmlinux="${STAGING_KERNEL_BUILDDIR}/vmlinux"
+    else
+        target_vmlinux=$(find ${TMPDIR}/work -path '*/linux-*/*/linux-*-build/vmlinux' | head -n 1)
+
+        if [ -z "${target_vmlinux}" ]; then
+            target_vmlinux=$(find ${TMPDIR}/work -path '*/linux-*/*/image/boot/vmlinux-*' | head -n 1)
+        fi
+    fi
+
+    if [ -z "${target_vmlinux}" ] || [ ! -f "${target_vmlinux}" ]; then
+        bbfatal "Unable to locate target kernel vmlinux for CO-RE generation"
+    fi
+
+    ln -sf "${target_vmlinux}" "${WORKDIR}/target-kernel-vmlinux"
+}
+
 # ---------------------------------------------------------------------------
 # Determine which services to enable based on PACKAGECONFIG
 # ---------------------------------------------------------------------------
@@ -90,8 +128,10 @@ python() {
 
     if 'daemon' in pkgconfig or 'both' in pkgconfig:
         enabled_services.append('https-guard-daemon.service')
+        d.setVar('HTTPS_GUARD_BUILD_BPF', 'ON')
     else:
         bb.note('HTTPS-Guard: daemon disabled by PACKAGECONFIG choice')
+        d.setVar('HTTPS_GUARD_BUILD_BPF', 'OFF')
 
     # If simulation is set (or both), enable the generator.
     # Note: "daemon" alone disables the generator.
@@ -114,13 +154,6 @@ python() {
 
 SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
-do_compile:append() {
-    # try to build eBPF object with clang (clang-native is a DEPENDS)
-    if command -v clang >/dev/null 2>&1; then
-        clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -I${S}/https_guard -I/usr/include -c ${S}/https_guard/https_guard.bpf.c -o ${B}/https_guard.bpf.o || true
-    fi
-}
-
 do_install() {
     install -d ${D}${sbindir}
     install -m 0755 ${S}/https-guard-event-bridge.sh   ${D}${sbindir}/https-guard-event-bridge
@@ -130,6 +163,10 @@ do_install() {
     # install compiled daemon if present
     if [ -x "${B}/https_guardd" ]; then
         install -m 0755 ${B}/https_guardd ${D}${sbindir}/https-guardd
+    fi
+
+    if [ -x "${B}/action_runner" ]; then
+        install -m 0755 ${B}/action_runner ${D}${sbindir}/action_runner
     fi
 
     # install BPF object if built
@@ -154,6 +191,7 @@ do_install() {
 }
 
 FILES:${PN} += " \
+    ${sbindir}/action_runner \
     ${sbindir}/https-guardd \
     ${sbindir}/https-guard-event-bridge \
     ${sbindir}/simulated-event-generator \

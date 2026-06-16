@@ -13,6 +13,8 @@
 
 FILESEXTRAPATHS:prepend := "${THISDIR}:"
 
+KERNEL_DEBUG = "True"
+
 SRC_URI += " \
     file://bpf-kernel-config.cfg \
 "

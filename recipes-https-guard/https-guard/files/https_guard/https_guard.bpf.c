@@ -7,16 +7,15 @@
  */
 
 /* Tell bpf_tracing.h which architecture we are targeting. */
+#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm) && \
+    !defined(__TARGET_ARCH_arm64) && !defined(__TARGET_ARCH_powerpc) && \
+    !defined(__TARGET_ARCH_riscv)
 #define __TARGET_ARCH_x86
+#endif
 
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/ipv6.h>
-#include <linux/tcp.h>
-#include <linux/in.h>
-#include <asm/ptrace.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
@@ -27,7 +26,55 @@ typedef _Bool bool;
 #define false 0
 #endif
 
-#include "../https_guard/events.h"
+#define HG_COMM_LEN            16
+#define HG_IP_STR_LEN          32
+#define HG_SNI_LEN             64
+#define HG_URI_LEN             128
+#define HG_PAYLOAD_SNIPPET_LEN 128
+
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
+
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+
+enum hg_event_type {
+    HG_EVENT_TLS_VERSION_VIOLATION  = 1,
+    HG_EVENT_TLS_HANDSHAKE_METADATA = 2,
+    HG_EVENT_HTTP_PAYLOAD_OBSERVED  = 3,
+    HG_EVENT_HTTP_ANOMALY_DETECTED  = 4
+};
+
+enum hg_severity {
+    HG_SEV_INFO     = 0,
+    HG_SEV_WARNING  = 1,
+    HG_SEV_CRITICAL = 2
+};
+
+struct hg_event {
+    __u64 timestamp_ns;
+    __u32 event_type;
+    __u32 severity;
+
+    __u32 pid;
+    __u32 tgid;
+
+    __u32 src_ip_v4;
+    __u32 dst_ip_v4;
+    __u16 src_port;
+    __u16 dst_port;
+
+    __u16 tls_version;
+    __u16 tls_record_type;
+
+    char process[HG_COMM_LEN];
+    char source_ip[HG_IP_STR_LEN];
+    char sni[HG_SNI_LEN];
+    char uri[HG_URI_LEN];
+    char payload_snippet[HG_PAYLOAD_SNIPPET_LEN];
+};
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -87,52 +134,29 @@ safe_strlcpy(char *dst, const void *src, int dst_sz, void *data_end)
  * "GET ", "POST ", "PUT " etc.).
  */
 static __always_inline bool
-looks_like_http(const char *payload, int len, void *data_end)
+looks_like_http(const char *payload, int len)
 {
-    const char *prefixes[] = { "GET ", "POST ", "PUT ", "DELE", "PATC",
-                               "HEAD", "HTTP", "OPTIO", "CONNE", "TRACE" };
-    int i;
-
     if (len < 4)
         return false;
 
-    for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        bool match = true;
-        int j;
+    if (payload[0] == 'G' && payload[1] == 'E' &&
+        payload[2] == 'T' && payload[3] == ' ')
+        return true;
 
-        for (j = 0; j < 4; j++) {
-            const char *p = &prefixes[i][j];
-            if (p >= (const char *)data_end) {
-                match = false;
-                break;
-            }
-        }
-        if (!match)
-            continue;
+    if (payload[0] == 'P' && payload[1] == 'O' &&
+        payload[2] == 'S' && payload[3] == 'T')
+        return true;
 
-        /* Use a volatile trick to avoid unrolled-loop verifier limit. */
-        switch (i) {
-        case 0:  /* "GET " */
-            if (payload[0] == 'G' && payload[1] == 'E' &&
-                payload[2] == 'T'  && payload[3] == ' ')  return true;
-            break;
-        case 1:  /* "POST " */
-            if (payload[0] == 'P' && payload[1] == 'O' &&
-                payload[2] == 'S' && payload[3] == 'T')  return true;
-            break;
-        case 2:  /* "PUT "  */
-            if (payload[0] == 'P' && payload[1] == 'U' &&
-                payload[2] == 'T' && payload[3] == ' ')  return true;
-            break;
-        case 3:  /* "DELE" (DELETE) */
-            if (payload[0] == 'D' && payload[1] == 'E' &&
-                payload[2] == 'L' && payload[3] == 'E')  return true;
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
+    if (payload[0] == 'P' && payload[1] == 'U' &&
+        payload[2] == 'T' && payload[3] == ' ')
+        return true;
+
+    if (payload[0] == 'D' && payload[1] == 'E' &&
+        payload[2] == 'L' && payload[3] == 'E')
+        return true;
+
+    return payload[0] == 'H' && payload[1] == 'T' &&
+           payload[2] == 'T' && payload[3] == 'P';
 }
 
 /*
@@ -147,114 +171,116 @@ looks_like_http(const char *payload, int len, void *data_end)
  */
 static __always_inline void
 parse_tls_clienthello(struct hg_event *evt,
-                      const char *tcp_payload, int payload_len,
-                      void *data_end)
+                      const unsigned char *tcp_payload,
+                      const unsigned char *payload_end)
 {
-    int offset = 0;
+    const unsigned char *cursor = tcp_payload + 5;
+    const unsigned char *ext_end;
     int i;
 
-    /* --- TLS Record header (5 bytes) --- */
-    /* ContentType = tcp_payload[0]; we already checked it is 0x16 */
-    /* ProtocolVersion = tcp_payload[1] << 8 | tcp_payload[2]; (not the
-     * negotiated version – we use ClientHello.version later) */
-    /* Length = (tcp_payload[3] << 8) | tcp_payload[4]; */
-    offset = 5;
-
     /* --- Handshake protocol --- */
-    if (offset + 4 > payload_len)
+    if (cursor + 4 > payload_end)
         return;
     /* HandshakeType = tcp_payload[offset];  0x01 = ClientHello */
     /* Handshake length (3 bytes, big-endian) */
-    __u32 hs_len = ((__u32)tcp_payload[offset + 1] << 16) |
-                   ((__u32)tcp_payload[offset + 2] << 8)  |
-                   ((__u32)tcp_payload[offset + 3]);
+    __u32 hs_len = ((__u32)cursor[1] << 16) |
+                   ((__u32)cursor[2] << 8)  |
+                   ((__u32)cursor[3]);
     (void)hs_len; /* length check not critical for our fields */
-    offset += 4;
+    cursor += 4;
 
     /* --- ClientHello fixed fields --- */
-    if (offset + 2 > payload_len)
+    if (cursor + 2 > payload_end)
         return;
-    evt->tls_version = ((__u16)tcp_payload[offset] << 8) |
-                        (__u16)tcp_payload[offset + 1];
+    evt->tls_version = ((__u16)cursor[0] << 8) |
+                        (__u16)cursor[1];
     if (evt->tls_version < 0x0303) {
         evt->event_type = HG_EVENT_TLS_VERSION_VIOLATION;
         evt->severity = HG_SEV_CRITICAL;
     } else {
         evt->event_type = HG_EVENT_TLS_HANDSHAKE_METADATA;
     }
-    offset += 2;     /* skip version */
+    cursor += 2;     /* skip version */
 
-    offset += 32;    /* random (32 bytes) */
+    if (cursor + 32 > payload_end)
+        return;
+    cursor += 32;    /* random (32 bytes) */
 
     /* --- Session ID --- */
-    if (offset + 1 > payload_len)
+    if (cursor + 1 > payload_end)
         return;
-    int sid_len = tcp_payload[offset];
-    offset += 1 + sid_len;
-    if (offset > payload_len)
+    int sid_len = cursor[0];
+    cursor += 1;
+    if (cursor + sid_len > payload_end)
         return;
+    cursor += sid_len;
 
     /* --- Cipher Suites --- */
-    if (offset + 2 > payload_len)
+    if (cursor + 2 > payload_end)
         return;
-    int cs_len = ((int)tcp_payload[offset] << 8) | tcp_payload[offset + 1];
-    offset += 2 + cs_len;
-    if (offset > payload_len)
+    int cs_len = ((int)cursor[0] << 8) | cursor[1];
+    cursor += 2;
+    if (cursor + cs_len > payload_end)
         return;
+    cursor += cs_len;
 
     /* --- Compression Methods --- */
-    if (offset + 1 > payload_len)
+    if (cursor + 1 > payload_end)
         return;
-    int cm_len = tcp_payload[offset];
-    offset += 1 + cm_len;
-    if (offset > payload_len)
+    int cm_len = cursor[0];
+    cursor += 1;
+    if (cursor + cm_len > payload_end)
         return;
+    cursor += cm_len;
 
     /* --- Extensions --- */
-    if (offset + 2 > payload_len)
+    if (cursor + 2 > payload_end)
         return;
-    int ext_total_len = ((int)tcp_payload[offset] << 8) | tcp_payload[offset + 1];
-    offset += 2;
-    if (offset + ext_total_len > payload_len)
+    int ext_total_len = ((int)cursor[0] << 8) | cursor[1];
+    cursor += 2;
+    if (cursor + ext_total_len > payload_end)
         return;
 
     /*
      * Walk extensions.  We are interested in:
      *   0x0000  –  Server Name Indication (SNI)
      */
-    int ext_end = offset + ext_total_len;
+    ext_end = cursor + ext_total_len;
     int sni_len = 0;
 
-    while (offset + 4 <= ext_end) {
-        __u16 ext_type = ((__u16)tcp_payload[offset] << 8) |
-                          (__u16)tcp_payload[offset + 1];
-        __u16 ext_len  = ((__u16)tcp_payload[offset + 2] << 8) |
-                          (__u16)tcp_payload[offset + 3];
-        offset += 4;
+    while (cursor + 4 <= ext_end) {
+        __u16 ext_type = ((__u16)cursor[0] << 8) |
+                          (__u16)cursor[1];
+        __u16 ext_len  = ((__u16)cursor[2] << 8) |
+                          (__u16)cursor[3];
+        cursor += 4;
+
+        if (cursor + ext_len > ext_end)
+            return;
 
         if (ext_type == 0x0000 && ext_len > 0) {
             /* SNI list entry: ServerNameList length (2 bytes) */
-            if (offset + 2 > ext_end)
+            if (cursor + 2 > ext_end)
                 return;
-            int sni_list_len = ((int)tcp_payload[offset] << 8) |
-                                tcp_payload[offset + 1];
+            int sni_list_len = ((int)cursor[0] << 8) |
+                                cursor[1];
             if (sni_list_len < 3 || sni_list_len > ext_len)
                 return;
-            offset += 2;
+            cursor += 2;
 
             /* First (and usually only) entry:
              *   - NameType (1 byte, 0 = host_name)
              *   - NameLength (2 bytes)
              *   - Name (variable) */
-            if (offset + 3 > ext_end)
+            if (cursor + 3 > ext_end)
                 return;
-            __u8 name_type = tcp_payload[offset];
-            int name_len = ((int)tcp_payload[offset + 1] << 8) |
-                            tcp_payload[offset + 2];
-            offset += 3;
+            __u8 name_type = cursor[0];
+            int name_len = ((int)cursor[1] << 8) |
+                            cursor[2];
+            cursor += 3;
 
             if (name_type == 0 && name_len > 0) {
-                if (offset + name_len > ext_end)
+                if (cursor + name_len > ext_end)
                     return;
                 int copy_sz = name_len < (int)sizeof(evt->sni) - 1
                                   ? name_len
@@ -262,14 +288,14 @@ parse_tls_clienthello(struct hg_event *evt,
                 for (i = 0; i < (int)sizeof(evt->sni) - 1; i++) {
                     if (i >= copy_sz)
                         break;
-                    evt->sni[i] = tcp_payload[offset + i];
+                    evt->sni[i] = cursor[i];
                 }
                 evt->sni[copy_sz] = '\0';
                 sni_len = copy_sz;
             }
             break;
         }
-        offset += ext_len;
+        cursor += ext_len;
     }
     (void)sni_len;
 }
@@ -277,6 +303,8 @@ parse_tls_clienthello(struct hg_event *evt,
 SEC("xdp")
 int https_guard_xdp(struct xdp_md *ctx)
 {
+    /* Packet headers are parsed from packet bytes, not kernel structs, so
+     * direct accesses remain correct here even in a CO-RE-enabled build. */
     void *data_end = (void *)(unsigned long)ctx->data_end;
     void *data     = (void *)(unsigned long)ctx->data;
     struct ethhdr *eth = (struct ethhdr *)data;
@@ -320,14 +348,23 @@ int https_guard_xdp(struct xdp_md *ctx)
     /* Only inspect the first packet of a connection (SYN flag set) to
      * catch the TLS ClientHello.  We still look at non-SYN packets for
      * HTTP anomaly detection. */
-    int payload_offset = ip_hdr_len + tcp_hdr_len;
-    int payload_len    = tot_len - payload_offset;
-
-    if (payload_len < 5)
+    if ((void *)tcp + tcp_hdr_len > data_end)
         return XDP_PASS;
 
-    const char *tcp_payload = (const char *)ip + payload_offset;
-    if ((const void *)(tcp_payload + payload_len) > data_end)
+    int payload_offset = ip_hdr_len + tcp_hdr_len;
+
+    if (payload_offset > tot_len)
+        return XDP_PASS;
+
+    const unsigned char *tcp_payload = (const unsigned char *)tcp + tcp_hdr_len;
+    const unsigned char *payload_end = (const unsigned char *)data_end;
+
+    if (tcp_payload + 5 > payload_end)
+        return XDP_PASS;
+
+    int payload_len = tot_len - payload_offset;
+
+    if (payload_len < 5)
         return XDP_PASS;
 
     /* Check for TLS ClientHello: ContentType = 0x16 */
@@ -371,7 +408,7 @@ int https_guard_xdp(struct xdp_md *ctx)
             evt->source_ip[p] = '\0';
         }
 
-        parse_tls_clienthello(evt, tcp_payload, payload_len, data_end);
+        parse_tls_clienthello(evt, tcp_payload, payload_end);
 
         bpf_ringbuf_submit(evt, 0);
         return XDP_PASS;  /* Do not drop – only observe & report. */
@@ -380,7 +417,7 @@ int https_guard_xdp(struct xdp_md *ctx)
     /* Plaintext HTTP detection on port 443 is unusual after TLS handshake
      * (should be encrypted).  If we see HTTP verbs on 443, flag as anomaly. */
     if ((tcp_payload[0] == 'G' || tcp_payload[0] == 'P') &&
-        looks_like_http(tcp_payload, payload_len, data_end)) {
+        looks_like_http(tcp_payload, payload_len)) {
         struct hg_event *evt;
 
         evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
