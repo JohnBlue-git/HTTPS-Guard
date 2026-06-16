@@ -7,11 +7,12 @@
 # mode. Run this before launching QEMU with TAP networking.
 #
 # Usage:
-#   sudo ./scripts/qemu-setup-tap.sh [create|destroy]
+#   ./scripts/qemu-setup-tap.sh [create|destroy]
 #
 # After creating the bridge, build and run the QEMU image with:
-#   bitbake obmc-phosphor-image -R <(echo 'QB_NETWORK_OPTION = "-netdev tap,id=net0,ifname=tap0,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56"')
-#   runqemu johnblue nographic
+#   bitbake obmc-phosphor-image
+#   QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
+#   QB_NET=none runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
 #
 # Inside the guest, verify XDP works:
 #   ip link set eth0 xdp obj /usr/share/https-guard/https_guard.bpf.o sec xdp
@@ -22,6 +23,7 @@ set -euo pipefail
 BRIDGE="br-httpsguard"
 TAP="tap-httpsguard"
 MAC="52:54:00:12:34:56"
+TAP_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 
 action="${1:-create}"
 
@@ -30,8 +32,8 @@ case "$action" in
         echo "[+] Creating bridge $BRIDGE ..."
         sudo ip link add name "$BRIDGE" type bridge 2>/dev/null || echo "    (bridge $BRIDGE already exists)"
 
-        echo "[+] Creating TAP device $TAP ..."
-        sudo ip tuntap add dev "$TAP" mode tap user "$(whoami)" 2>/dev/null || echo "    (tap $TAP already exists)"
+        echo "[+] Creating TAP device $TAP for user $TAP_USER ..."
+        sudo ip tuntap add dev "$TAP" mode tap user "$TAP_USER" 2>/dev/null || echo "    (tap $TAP already exists)"
 
         echo "[+] Attaching $TAP to $BRIDGE ..."
         sudo ip link set "$TAP" master "$BRIDGE"
@@ -44,7 +46,7 @@ case "$action" in
         echo ""
         echo "    Build and run QEMU with:"
         echo "      QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=$TAP,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=$MAC'"
-        echo "      runqemu johnblue nographic"
+        echo "      QB_NET=none runqemu johnblue nographic qemuparams=\"\$QB_NETWORK_OPTION\""
         echo ""
         echo "    Inside the guest (after login):"
         echo "      # Set HTTPS_GUARD_DAEMON_ENABLE=1 in /etc/default/https-guard"

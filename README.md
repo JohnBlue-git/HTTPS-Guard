@@ -340,10 +340,14 @@ Use this when you need the real `https-guardd` daemon with XDP and uprobes worki
 #### Step 1 — Host: create the TAP/bridge network
 
 ```bash
-sudo ./scripts/qemu-setup-tap.sh create
+./scripts/qemu-setup-tap.sh destroy
+./scripts/qemu-setup-tap.sh create
 ```
 
 This creates bridge `br-httpsguard` and TAP `tap-httpsguard` with MAC `52:54:00:12:34:56`.
+The script uses `sudo` internally for the network operations; do not run the whole
+script with `sudo`, or the TAP device will be owned by `root` and QEMU will fail
+to attach to it as your user.
 
 #### Step 2 — Build the image with daemon mode
 
@@ -356,8 +360,12 @@ bitbake obmc-phosphor-image
 
 ```bash
 QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
-runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
+QB_NET=none runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
 ```
+
+`QB_NET=none` is required here because `runqemu` otherwise adds its own default
+network backend first, which would duplicate `net0` when the custom TAP device is
+passed through `qemuparams`.
 
 #### Step 4 — Inside the guest: verify and monitor
 
