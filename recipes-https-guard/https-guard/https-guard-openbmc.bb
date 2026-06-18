@@ -67,8 +67,13 @@ SRC_URI = " \
     file://ebpf/bpf_program.cpp \
     file://actions/ActionLoop.hpp \
     file://actions/ActionLoop.cpp \
+    file://actions/Blocklist.hpp \
+    file://actions/Blocklist.cpp \
+    file://actions/blocklist.bpf.h \
     file://actions/LogAction.hpp \
     file://actions/LogAction.cpp \
+    file://actions/BlocklistAction.hpp \
+    file://actions/BlocklistAction.cpp \
     file://actions/main.cpp \
     file://coroutine/async_mutex.hpp \
 "

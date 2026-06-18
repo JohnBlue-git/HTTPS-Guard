@@ -115,48 +115,99 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 
 | Location | Evidence |
 |----------|----------|
-| `https_guard/https_guard.bpf.c:377` | `return XDP_PASS;  /* Do not drop – only observe & report. */` |
-| `https_guard/https_guard.bpf.c:405` | `return XDP_PASS;` — even HTTP anomalies are not dropped at the XDP layer |
-| `https_guard/https_guard.bpf.c:337-376` | TLS ClientHello inspection: event is `bpf_ringbuf_submit()`'d, then `XDP_PASS` |
-| `https_guard/https_guard.bpf.c:429-448` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
-| `https_guard/main.cpp:196-201` | `ring_buffer__poll()` loop — the daemon consumes events **after** the kernel has already returned |
+| `https_guard/https_guard.bpf.c:334-335` | `blocklist_check(ip->saddr)` — hybrid enforcement: active blocklist entries trigger `XDP_DROP` before any inspection |
+| `https_guard/https_guard.bpf.c:428` | `return XDP_PASS;  /* Do not drop – only observe & report. */` — applied only after blocklist check passes |
+| `https_guard/https_guard.bpf.c:452-456` | Plaintext HTTP anomaly detection: `bpf_ringbuf_submit()` then `XDP_PASS` — detection without dropping |
+| `https_guard/https_guard.bpf.c:386-427` | TLS ClientHello inspection: event is `bpf_ringbuf_submit()`'d, then `XDP_PASS` — detection without dropping |
+| `https_guard/https_guard.bpf.c:469-500` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
+| `actions/blocklist.bpf.h:22-36` | `blocklist_check()` inline function — performs `XDP_DROP` for active blocklist entries; prunes expired entries via `bpf_map_delete_elem()` |
+| `https_guard/https_guard_program.cpp:48-55` | `Blocklist::instance().adopt()` — daemon adopts the blocklist BPF map fd during program attachment |
+| `https_guard/https_guard_program.cpp:114-119` | `pushAction(BlocklistAddAction)` — actionable events write the source IP into the blocklist map |
+| `https_guard/main.cpp:71` | `kDefaultBlocklistTtl = 5 minutes` — configurable blocklist TTL |
+| `actions/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry and writes via `bpf_map_update_elem()` into the kernel BPF map |
 | `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
 | `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |
 
-### The pipeline is purely observational
+### The pipeline is hybrid — asynchronous detection with synchronous enforcement
 
-HTTPS-Guard's eBPF programs **never** block, drop, or modify packets. Every hook:
+HTTPS-Guard's eBPF programs implement a **two-tier** strategy:
 
-1. Reserves a ring buffer entry
-2. Fills in event data (TLS version, SNI, process info, payload snippet)
-3. Submits the event via `bpf_ringbuf_submit()`
-4. Returns `XDP_PASS` (XDP) or `0` (uprobe)
+**Tier 1 — Synchronous enforcement (Strategy 1):** Before any packet inspection, the XDP hook calls `blocklist_check(ip->saddr)` which queries the shared BPF blocklist map. If the source IP has a non-expired entry, the packet is immediately dropped (`XDP_DROP`) with zero userspace round-trip. Expired entries are deleted opportunistically within the same BPF helper.
 
-All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → inline headers `pattern_detector.hpp` and `redfish_event_message.hpp`). Even the dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
+**Tier 2 — Asynchronous detection (Strategy 2):** If the packet is not blocklisted, the XDP program proceeds with TLS ClientHello and HTTP anomaly inspection. Events are submitted via `bpf_ringbuf_submit()` and the hook returns `XDP_PASS`. The uprobe hook on `SSL_write` always returns `0` (pass).
 
-### Future hybrid extension
+```
+Packet arrives on port 443
+       │
+       ▼
+  ┌────────────────────────────────┐
+  │ Tier 1: blocklist_check()      │  ← Synchronous enforcement
+  │  ├── IP active  → XDP_DROP     │
+  │  ├── IP expired → delete, PASS │
+  │  └── IP absent  → XDP_PASS     │
+  └──────────┬─────────────────────┘
+             │ (if PASS)
+             ▼
+  ┌────────────────────────────────┐
+  │ Tier 2: TLS / HTTP inspection  │  ← Asynchronous detection
+  │  ├── ClientHello → ring buffer │
+  │  ├── HTTP anomaly → ring buf   │
+  │  └── XDP_PASS (always)         │
+  └──────────┬─────────────────────┘
+             │
+             ▼
+  ┌────────────────────────────────┐
+  │ Userspace daemon               │
+  │  → classify event              │
+  │  → if actionable:              │
+  │    → BlocklistAddAction(src_ip)│
+  │    → writes expiry into BPF map│  ← Feeds Tier 1
+  └────────────────────────────────┘
+```
 
-The architecture **supports** a hybrid extension without structural changes:
+All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → `https_guard_program.cpp` → inline headers `pattern_detector.hpp` and `redfish_event_message.hpp`). The dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
+
+### Hybrid Extension — Implemented
+
+The architecture now implements a **fully operational** hybrid extension:
 
 ```
   ┌──────────────────────────────────┐
-  │  Daemon detects repeated attacks │
+  │  Daemon detects attack           │
+  │  (TLS version violation or       │
+  │   confirmed attack signature)    │
   │  from IP 10.0.0.5                │
   │                                  │
-  │  → writes IP 10.0.0.5 to         │
-  │    eBPF "blocklist" map          │
+  │  → BlocklistAddAction(10.0.0.5,  │
+  │      5min, reason)               │
+  │  → Blocklist::add() writes       │
+  │    expiry into BPF map           │
   └──────────────┬───────────────────┘
                  │
                  ▼
   ┌──────────────────────────────────┐
   │  Next packet from 10.0.0.5       │
   │                                  │
-  │  XDP hook queries blocklist map  │
-  │  → match → XDP_DROP              │
+  │  XDP hook calls                  │
+  │  blocklist_check(10.0.0.5)       │
+  │  → active entry found            │
+  │  → XDP_DROP (zero round-trip)    │
   └──────────────────────────────────┘
 ```
 
-The initial detection remains asynchronous (Strategy 2), but the follow-up enforcement becomes synchronous (Strategy 1). The eBPF map serves as the bridge between the two strategies. This pattern is commonly referred to as **"detect in userspace, enforce in kernel"** and is widely used in production systems like Cilium and Falco.
+The initial detection is asynchronous (Strategy 2), but the follow-up enforcement is synchronous (Strategy 1). The eBPF map (`src_blocklist`, a `BPF_MAP_TYPE_HASH`) serves as the bridge between the two strategies. This pattern — **"detect in userspace, enforce in kernel"** — is widely used in production systems like Cilium and Falco.
+
+**Key implementation details:**
+
+| Component | File | Role |
+|-----------|------|------|
+| BPF blocklist map | `actions/blocklist.bpf.h` | `BPF_MAP_TYPE_HASH` storing `src_ip → expiry_ns`; max 1024 entries |
+| BPF `blocklist_check()` | `actions/blocklist.bpf.h:22-36` | Inline helper returning `XDP_DROP` for active entries, pruning expired ones |
+| XDP hook integration | `https_guard/https_guard.bpf.c:334-335` | Calls `blocklist_check(ip->saddr)` as first processing step |
+| Userspace Blocklist singleton | `actions/Blocklist.hpp`, `actions/Blocklist.cpp` | Wraps BPF map fd; provides `add()`, `contains()`, `adopt()`, `formatIp()` |
+| Countermeasure action | `actions/BlocklistAction.hpp`, `actions/BlocklistAction.cpp` | `IAction` implementation that calls `Blocklist::add()` |
+| Action dispatch | `https_guard/https_guard_program.cpp:64-121` | `ringBufferHandler()` classifies events as actionable and pushes `BlocklistAddAction` |
+| Default TTL | `https_guard/main.cpp:18` | `kDefaultBlocklistTtl = 5 minutes` |
 
 ### Summary
 
@@ -165,9 +216,9 @@ The initial detection remains asynchronous (Strategy 2), but the follow-up enfor
 | **Decision location** | eBPF kernel hook | Userspace daemon |
 | **Latency to action** | Microseconds | Milliseconds |
 | **Policy complexity** | Limited (verifier) | Unlimited (C++/Python/Go) |
-| **HTTPS-Guard choice** | ❌ | ✅ |
-| **Future extension** | Could add eBPF blocklist maps for repeat offenders | Primary detection pipeline |
+| **HTTPS-Guard choice** | ✅ (blocklist enforcement) | ✅ (primary detection pipeline) |
+| **Extension** | Blocklist map populated by daemon after event classification | Main detection + classification + dispatch |
 
 ---
 
-*HTTPS-Guard is designed as a pure observational security agent. It detects and reports anomalies but does not currently enforce any inline blocking. The `XDP_DROP` path, eBPF blocklist maps, and automated countermeasures are reserved for a future iteration.*
+*HTTPS-Guard implements a hybrid security model: asynchronous anomaly detection with synchronous blocklist enforcement. The eBPF programs observe and report TLS handshake metadata and HTTP anomalies (returning `XDP_PASS`), but also enforce active blocklist entries by dropping packets at the XDP layer (`XDP_DROP`). The userspace daemon classifies events, and for actionable threats (TLS version violations, confirmed attack signatures), writes the source IP into the BPF blocklist map with a configurable TTL (default: 5 minutes). This creates a closed-loop detection-to-enforcement pipeline without requiring any structural changes to the architecture.*

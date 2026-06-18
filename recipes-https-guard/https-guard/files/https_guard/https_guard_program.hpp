@@ -1,13 +1,16 @@
 #pragma once
 
+#include <chrono>
 #include <string>
 
-#include "ActionLoop.hpp"
 #include "bpf_program.hpp"
 #include "events.h"
-#include "redfish_event_message.hpp"
-#include "pattern_detector.hpp"
 #include "tls_version.hpp"
+#include "pattern_detector.hpp"
+#include "redfish_event_message.hpp"
+#include "ActionLoop.hpp"
+#include "Blocklist.hpp"
+#include "BlocklistAction.hpp"
 
 namespace https_guard {
 
@@ -16,7 +19,8 @@ public:
     HttpGuardProgram(std::string object_path,
                      ActionLoop& action_loop,
                      std::string openssl_lib_path,
-                     unsigned int ifindex) noexcept;
+                     unsigned int ifindex,
+                     std::chrono::seconds blocklist_ttl) noexcept;
 
 protected:
     bool attachProgram() noexcept override;
@@ -30,6 +34,7 @@ private:
     std::string openssl_lib_path_;
     unsigned int ifindex_;
     PatternDetector detector_;
+    std::chrono::seconds blocklist_ttl_;
 };
 
 }  // namespace https_guard

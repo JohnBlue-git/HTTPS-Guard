@@ -19,6 +19,11 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
+/* Hybrid enforcement: see actions/blocklist.bpf.h. The early-return XDP_DROP
+ * check lives entirely in this header so the .bpf.c detection logic
+ * stays uncluttered. */
+#include "../actions/blocklist.bpf.h"
+
 /* BPF C is C99 without a standard library; provide bool ourselves. */
 #ifndef bool
 typedef _Bool bool;
@@ -320,6 +325,15 @@ int https_guard_xdp(struct xdp_md *ctx)
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
+
+    /* Hybrid enforcement: if the source IP is in the blocklist, drop the
+     * packet synchronously.  This is the only place in the XDP path
+     * where a non-PASS verdict is returned.  The blocklist is populated
+     * by the userspace daemon (ringBufferHandler) after classifying an
+     * event as actionable. */
+    if (blocklist_check(ip->saddr) == XDP_DROP)
+        return XDP_DROP;
+
 
     __u16 tot_len = bpf_ntohs(ip->tot_len);
     if (tot_len < sizeof(*ip))

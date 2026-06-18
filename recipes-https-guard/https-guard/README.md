@@ -11,10 +11,17 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 - [Directory Layout](#directory-layout)
 - [eBPF Programs (`https_guard/https_guard.bpf.c`)](#ebpf-programs-https_guardhttps_guardbpfc)
   - [XDP Hook: Wire-Level TLS Inspection](#xdp-hook-wire-level-tls-inspection)
+  - [Hybrid Enforcement — XDP Blocklist (XDP_DROP)](#hybrid-enforcement--xdp-blocklist-xdp_drop)
   - [Uprobe Hook: Plaintext Payload Capture](#uprobe-hook-plaintext-payload-capture)
 - [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
 - [C++ Daemon (`https_guard/main.cpp`)](#c-daemon-https_guardmaincpp)
 - [Pattern Detector (`https_guard/pattern_detector.hpp`)](#pattern-detector-https_guardpattern_detectorhpp)
+- [ActionLoop — Async Event Dispatcher (`actions/ActionLoop.hpp`)](#actionloop--async-event-dispatcher-actionsactionloophpp)
+- [LogAction — Async File Writer (`actions/LogAction.hpp`)](#logaction--async-file-writer-actionslogactionhpp)
+- [Blocklist — Source IP Blocklist Manager (`actions/Blocklist.hpp`)](#blocklist--source-ip-blocklist-manager-actionsblocklisthpp)
+- [BlocklistAddAction — Countermeasure Action (`actions/BlocklistAction.hpp`)](#blocklistaddaction--countermeasure-action-actionsblocklistactionhpp)
+- [Blocklist BPF Header (`actions/blocklist.bpf.h`)](#blocklist-bpf-header-actionsblocklistbpfh)
+- [AsyncFileStreamManager — Coroutine-Safe File Writer (`coroutine/async_mutex.hpp`)](#asyncfilestreammanager--coroutine-safe-file-writer-coroutineasync_mutexhpp)
 - [Redfish Event Message (`https_guard/redfish_event_message.hpp`)](#redfish-event-message-https_guardredfish_event_messagehpp)
 - [TLS Version (`https_guard/tls_version.hpp`)](#tls-version-https_guardtls_versionhpp)
 - [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
@@ -36,6 +43,8 @@ files/
 ├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
 ├── simulated-event-generator.service                 # systemd unit for synthetic event generator
 ├── simulated-event-generator.sh                      # Shell script that emits simulated events
+├── coroutine/
+│   └── async_mutex.hpp                               # AsyncFileStreamManager (coroutine-safe file I/O)
 ├── ebpf/
 │   ├── bpf_program.hpp                                # BPF program attachment wrapper
 │   └── bpf_program.cpp                                # BPF program wrapper implementation
@@ -52,8 +61,13 @@ files/
 │   ├── main.cpp                                      # ActionLoop smoke-test / demo entry point
 │   ├── ActionLoop.hpp                                # Boost.Asio-based event dispatcher interface
 │   ├── ActionLoop.cpp                                # Boost.Asio-based event dispatcher implementation
-│   ├── LogAction.hpp                                 # Event logging action interface
-│   └── LogAction.cpp                                 # Event logging action implementation
+│   ├── LogAction.hpp                                 # Async file-logging action interface
+│   ├── LogAction.cpp                                 # Async file-logging action implementation
+│   ├── Blocklist.hpp                                 # Singleton blocklist manager (BPF map wrapper)
+│   ├── Blocklist.cpp                                 # Blocklist singleton implementation
+│   ├── BlocklistAction.hpp                           # Countermeasure action: add src IP to blocklist
+│   ├── BlocklistAction.cpp                           # BlocklistAddAction implementation
+│   └── blocklist.bpf.h                               # BPF-side blocklist header (XDP_DROP check)
 ```
 
 ---
@@ -64,7 +78,7 @@ The single BPF C file compiles to one BPF object that contains **two independent
 
 | Section | Type | Hook Point | Purpose |
 |---------|------|------------|---------|
-| `SEC("xdp")` — `https_guard_xdp` | XDP | Network driver (RX path) | Inspects TLS ClientHello on port 443; detects TLS version violations and plaintext HTTP on the HTTPS port |
+| `SEC("xdp")` — `https_guard_xdp` | XDP | Network driver (RX path) | Inspects TLS ClientHello on port 443; detects TLS version violations and plaintext HTTP on the HTTPS port; performs hybrid enforcement by dropping packets from blocklisted source IPs |
 | `SEC("uprobe/ssl_write")` — `https_guard_ssl_write` | Uprobe | Userspace function `SSL_write` in OpenSSL | Captures plaintext payload snippets just before encryption |
 
 ### XDP Hook: Wire-Level TLS Inspection
@@ -81,8 +95,30 @@ The single BPF C file compiles to one BPF object that contains **two independent
 
 **Filtering actions:**
 
-- The XDP program **observes and reports** (`XDP_PASS`) — it does **not** currently drop packets in production. The `XDP_DROP` action was considered during design but the current implementation uses `XDP_PASS` for all packets. Events are emitted to the ring buffer for the user-space daemon to decide on further action.
-- TLS version violations are flagged via events, but the actual blocking is intended to be enforced by the daemon or downstream (e.g., by terminating the connection or updating firewall rules).
+- The XDP program **observes and reports** (`XDP_PASS`) all TLS handshake and HTTP anomaly events — it does **not** drop packets based on protocol violations alone.
+- However, the XDP program **does** perform **hybrid enforcement**: before any inspection, it calls `blocklist_check(ip->saddr)` (see [`actions/blocklist.bpf.h`](#blocklist-bpf-header-actionsblocklistbpfh)). If the source IP is found in the shared blocklist BPF map with a non-expired entry, the packet is **immediately dropped** (`XDP_DROP`) before any further processing.
+- The blocklist map is populated by the userspace daemon after classifying an event as actionable (e.g., TLS version violation or confirmed attack signature). The daemon computes an expiry timestamp and writes it into the map via the `Blocklist` singleton.
+- Expired entries are pruned opportunistically by `blocklist_check()` when the current time exceeds the stored expiry.
+
+### Hybrid Enforcement — XDP Blocklist (XDP_DROP)
+
+The blocklist mechanism is the **only** path in the XDP program that returns a non-PASS verdict. It enables a dynamic enforcement loop:
+
+```
+Kernel:  XDP hook sees packet → blocklist_check(ip->saddr)
+          ├── IP not in blocklist → XDP_PASS (continue inspection)
+          ├── IP expired         → delete entry → XDP_PASS
+          └── IP active          → XDP_DROP     ← enforcement
+                 ▲
+Userspace: daemon classifies event → actionable?
+          ├── yes → BlocklistAddAction(src_ip, ttl)
+          │        → Blocklist::add() writes expiry into BPF map
+          └── no  → log only, no blocklist action
+```
+
+The blocklist map (`src_blocklist`) is a `BPF_MAP_TYPE_HASH` with a maximum of 1024 entries (see `HTTPS_GUARD_BLOCKLIST_MAX_ENTRIES`). Each entry maps a source IP (network byte order) to an absolute expiry timestamp in nanoseconds (using `bpf_ktime_get_ns()` clock).
+
+**Design rationale:** keeping expiry checking in BPF avoids the latency and complexity of a userspace timer. The daemon only writes new entries; the kernel handles both enforcement and garbage collection.
 
 ### Uprobe Hook: Plaintext Payload Capture
 
@@ -105,6 +141,9 @@ The single BPF C file compiles to one BPF object that contains **two independent
 
 ```
 Network traffic (port 443)
+       │
+       ├── blocklist_check(ip->saddr)  ← hybrid enforcement
+       │   └── active → XDP_DROP
        │
        ├── XDP hook reads TLS ClientHello
        │   ├── version < 1.2  → TLS_VERSION_VIOLATION event
@@ -171,7 +210,7 @@ payload_snippet (char[128]) — Plaintext snippet from uprobe or HTTP anomaly
 
 ## C++ Daemon (`https_guard/main.cpp`)
 
-The daemon's `main()` function orchestrates the full eBPF lifecycle:
+The daemon's `main()` function orchestrates the full eBPF lifecycle and event dispatch pipeline via the ActionLoop:
 
 ### Initialization Flow
 
@@ -181,20 +220,22 @@ The daemon's `main()` function orchestrates the full eBPF lifecycle:
    - `argv[3]` — Output log path (default: `/var/log/redfish/https_guard_events.log`).
    - `argv[4]` — BPF object file path (default: `./build/https_guard.bpf.o`).
 
-2. **Load and verify** the BPF object via `libbpf`:
+2. **Seed the ActionLoop** — obtains the singleton `ActionLoop::getInstance()` and pushes a `LogAction` that writes to the configured output path. The ActionLoop runs a background Boost.Asio `io_context` that processes actions asynchronously.
+
+3. **Load and verify** the BPF object via `libbpf`:
    - `bpf_object__open_file()` — parses the ELF BPF object.
    - `bpf_object__load()` — loads programs into the kernel and creates maps.
 
-3. **Attach programs**:
-   - XDP program `https_guard_xdp` → `bpf_program__attach_xdp()` on the specified interface.
-   - Uprobe program `https_guard_ssl_write` → `bpf_program__attach_uprobe()` on `SSL_write` from the specified OpenSSL shared library.
-  - `HttpGuardProgram` owns the loaded BPF object and forwards ring-buffer events into `ActionLoop`.
+4. **Create `HttpGuardProgram`** — passing the BPF object path, the `ActionLoop` reference, OpenSSL library path, network interface index, and a default blocklist TTL of 5 minutes. The program:
+   - Attaches the XDP program to the network interface.
+   - Attaches the uprobe to `SSL_write` in the specified OpenSSL shared library.
+   - **Adopts the blocklist BPF map** (`src_blocklist`) so the daemon can populate it with offending source IPs.
 
-4. **Open ring buffer consumer** — `ring_buffer__new()` maps the `events` BPF map and registers the `on_event` callback.
+5. **Open ring buffer consumer** — `ring_buffer__new()` maps the `events` BPF map and registers the `on_event` callback.
 
-5. **Poll loop** — `ring_buffer__poll()` is called in a 200ms interval loop until SIGINT or SIGTERM is received.
+6. **Poll loop** — `ring_buffer__poll()` is called in a 200ms interval loop until SIGINT or SIGTERM is received.
 
-### Event Processing (`on_event` callback)
+### Event Processing (`on_event` callback via `ringBufferHandler`)
 
 The callback classifies incoming ring buffer events:
 
@@ -204,19 +245,22 @@ The callback classifies incoming ring buffer events:
      - Sets severity to `"Critical"`.
      - Uses message ID `OemSecurityEvent.1.0.0.HttpsTlsVersionViolation`.
      - Composes a human-readable message including process name, PID, and TLS version string.
+     - Marks the event as **actionable** (triggers blocklist insertion).
    - `HG_EVENT_HTTP_PAYLOAD_OBSERVED` or `HG_EVENT_HTTP_ANOMALY_DETECTED` →
-     - Runs user-space anomaly detection via `is_http_payload_suspicious()`.
+     - Runs user-space anomaly detection via `detector_.isSuspicious()`.
      - If the payload matches a rule (or was already flagged by the kernel as an anomaly), the event is promoted to `"Warning"`.
      - Uses message ID `OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected`.
      - Includes the matched rule name in the message.
+     - If suspicious, marks the event as **actionable** (triggers blocklist insertion).
    - All other event types are silently dropped.
 
-3. **Formatter** — calls `format_redfish_event()` to produce a JSON line.
-4. **Log** — appends the JSON line to the output path and prints to stdout.
+3. **Dispatch actions via ActionLoop**:
+   - **LogAction** — always pushed for every actionable event. Formats the event via `RedfishEventMessage::format()` and writes it asynchronously to `/var/log/https_guard.log` using the `AsyncFileStreamManager`.
+   - **BlocklistAddAction** — pushed for actionable events with a non-zero `src_ip_v4`. Creates a blocklist entry with the configured TTL (default: 5 minutes). This causes the XDP program to drop subsequent packets from that source IP.
 
 ### Cleanup
 
-On signal, the poll loop exits, the ring buffer is freed, BPF links are destroyed, and the BPF object is closed.
+On signal, the poll loop exits, the ring buffer is freed, BPF links are destroyed, and the BPF object is closed. The ActionLoop's destructor stops its `io_context` and joins the background thread.
 
 ---
 
@@ -249,6 +293,144 @@ The user-space anomaly detection engine applies a set of **static signature rule
 - The rule set is **static** and compiled into the binary. Future versions should load rules from a configuration file.
 - Substring matching generates false positives on benign payloads containing rule substrings (e.g., a legit path `/etc/passwd` in an error message). This is a known limitation of signature-based detection.
 - The detector runs **after** the eBPF layer has already forwarded the event, so it acts as a secondary classification filter.
+
+---
+
+## ActionLoop — Async Event Dispatcher (`actions/ActionLoop.hpp`)
+
+The `ActionLoop` is a singleton that decouples eBPF event callback processing from downstream I/O (logging, D-Bus, blocklist updates). It wraps a Boost.Asio `io_context` running on a dedicated background thread:
+
+### Architecture
+
+```
+main thread (ring_buffer__poll)
+  │
+  └── on_event() callback
+       ├── pushAction(LogAction)         → ActionLoop queue
+       └── pushAction(BlocklistAddAction) → ActionLoop queue
+              │
+              ▼
+       Background thread (io_context::run)
+              │
+              ├── co_spawn LogAction::execute_async()
+              │    └── AsyncFileStreamManager::acquire_stream()
+              │         └── async_write() to log file
+              │
+              └── co_spawn BlocklistAddAction::execute_async()
+                   └── Blocklist::instance().add(src_ip, ttl)
+                        └── bpf_map_update_elem() on blocklist BPF map
+```
+
+### Key Design Decisions
+
+- **Non-blocking callbacks** — `pushAction()` enqueues the action and returns immediately. The `on_event()` callback never blocks on file I/O or BPF map updates.
+- **Background execution** — `ActionLoop` spawns a single background thread that runs `io_context.run()`. All action execution happens on this thread.
+- **Exception safety** — exceptions thrown by `execute_async()` are caught and logged; they never propagate to the main thread.
+- **Lifetime** — the `ActionLoop` is a process-level singleton (`getInstance()`). Its destructor joins the background thread to ensure orderly shutdown.
+
+### `IAction` Interface
+
+All actions implement `boost::asio::awaitable<void> execute_async()`, enabling coroutine-based async execution.
+
+---
+
+## LogAction — Async File Writer (`actions/LogAction.hpp`)
+
+`LogAction` writes a JSON event line to a log file asynchronously, cooperating with the `ActionLoop` and `AsyncFileStreamManager`.
+
+### Behavior
+
+1. **Acquire** a locked stream to the target file via `AsyncFileStreamManager::acquire_stream()`.
+2. **Write** the payload (JSON line + newline) using `boost::asio::async_write()`.
+3. **Handle errors** — if `async_write()` fails, the error is logged to stderr but does **not** crash the ActionLoop.
+
+### Why async writes?
+
+Writing to the filesystem directly from the eBPF ring-buffer callback would block the poll loop, risking dropped events. By delegating the write to the ActionLoop's background thread and using `co_await async_write()`, the callback returns instantly and the kernel can continue delivering events.
+
+---
+
+## Blocklist — Source IP Blocklist Manager (`actions/Blocklist.hpp`)
+
+`Blocklist` is a singleton that wraps the shared BPF map (`src_blocklist`, a `BPF_MAP_TYPE_HASH`) that stores source IP → expiry timestamp mappings. It is the userspace interface for **hybrid enforcement**.
+
+### API
+
+| Method | Description |
+|--------|-------------|
+| `adopt(int map_fd)` | Adopts an existing BPF map file descriptor. Called once during daemon startup after the BPF object is loaded. |
+| `contains(uint32_t src_ip_v4)` | Checks if a source IP has a non-expired blocklist entry (reads from the BPF map). |
+| `add(uint32_t src_ip_v4, seconds ttl)` | Inserts or refreshes a blocklist entry with an absolute expiry. Returns 0 on success, negative errno on failure. |
+| `formatIp(uint32_t src_ip_v4)` | Converts a network-byte-order IPv4 address to a dotted-decimal string. |
+
+### Design Notes
+
+- The BPF map stores values as `uint64_t` absolute expiry timestamps (nanoseconds since boot, matching `bpf_ktime_get_ns()` in kernel space).
+- `add()` computes `now_ns + ttl_ns` and writes the result to the BPF map using `bpf_map_update_elem()` with `BPF_ANY`.
+- `contains()` reads the map value and compares against the current time. Expired entries are **not** deleted from userspace — that responsibility is left to the BPF `blocklist_check()` function for efficiency.
+- The singleton is thread-safe via its internal design (single background thread writes, main thread only reads during shutdown).
+
+---
+
+## BlocklistAddAction — Countermeasure Action (`actions/BlocklistAction.hpp`)
+
+`BlocklistAddAction` is an `IAction` that adds a single source IP address to the blocklist with a configurable TTL. It is pushed by `ringBufferHandler` when an event is classified as **actionable** (TLS version violation or confirmed attack signature).
+
+```cpp
+class BlocklistAddAction final : public IAction {
+    // src_ip_v4:  IP to block (network byte order)
+    // ttl:        How long to block (default: 5 minutes)
+    // reason:     Human-readable reason (included in stderr log)
+    BlocklistAddAction(uint32_t src_ip_v4,
+                       std::chrono::seconds ttl,
+                       std::string reason);
+    boost::asio::awaitable<void> execute_async() override;
+};
+```
+
+On execution, it calls `Blocklist::instance().add(src_ip_v4_, ttl_)`. Success/failure is logged to stderr.
+
+---
+
+## Blocklist BPF Header (`actions/blocklist.bpf.h`)
+
+This header is shared between the BPF C code and the C++ userspace. It defines:
+
+- **Map name constant**: `HTTPS_GUARD_BLOCKLIST_MAP_NAME` → `"src_blocklist"`
+- **Max entries constant**: `HTTPS_GUARD_BLOCKLIST_MAX_ENTRIES` → `1024`
+- **BPF map definition** (compiled only in `__cplusplus`-false context): a `BPF_MAP_TYPE_HASH` named `src_blocklist` with `__u32` keys and `__u64` values.
+- **`blocklist_check(__u32 src_ip_v4)`** — inline function that:
+  1. Looks up the source IP in the blocklist map.
+  2. If not found → returns `XDP_PASS`.
+  3. If expired (now >= expiry) → deletes the entry → returns `XDP_PASS`.
+  4. If active → returns `XDP_DROP` (packet is dropped before any inspection).
+
+The XDP program in `https_guard.bpf.c` includes this header via `#include "../actions/blocklist.bpf.h"` and calls `blocklist_check(ip->saddr)` as its first packet-processing step.
+
+---
+
+## AsyncFileStreamManager — Coroutine-Safe File Writer (`coroutine/async_mutex.hpp`)
+
+The `AsyncFileStreamManager` provides coroutine-safe, asynchronous file writing for the `ActionLoop` framework. It solves the problem of multiple concurrent coroutines needing to write to the same log file without blocking or interleaving lines.
+
+### Key Features
+
+- **Coroutine-based locking** — each coroutine requests a `LockedStream` via `acquire_stream(filename)`. If another coroutine is currently writing to the same file, the requesting coroutine is suspended until the lock is released.
+- **Stream caching** — open file descriptors are cached in `stream_cache_`. Once a file is opened, future `acquire_stream()` calls reuse the same `asio::posix::stream_descriptor`.
+- **RAII unlock** — when the `LockedStream` goes out of scope (or is destroyed), the destructor calls `unlock()`, which either resumes the next waiting coroutine or removes the file state entry.
+
+### Usage in LogAction
+
+```cpp
+asio::awaitable<void> LogAction::execute_async()
+{
+    auto locked_stream = co_await g_file_mgr.acquire_stream(path_);
+    if (!locked_stream) co_return;
+    co_await asio::async_write(locked_stream.stream(),
+                               asio::buffer(payload), ...);
+    // locked_stream destructor releases the lock
+}
+```
 
 ---
 
@@ -343,10 +525,14 @@ public:
 - **C++ Standard**: C++20.
 - **Dependencies**: `libbpf` (found via pkg-config), `nlohmann_json` (found via `find_package`), and Boost.Asio headers.
 - **Boost handling**: Uses system Boost headers when available; otherwise fetches Boost 1.86 headers via CMake `FetchContent` and compiles Asio in header-only mode.
-- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/LogAction.cpp`, and `ebpf/bpf_program.cpp`.
+- **BPF object build** (optional via `HTTPS_GUARD_BUILD_BPF`):
+  - Generates a target-kernel `vmlinux.h` using `bpftool btf dump`.
+  - Compiles `https_guard/https_guard.bpf.c` with `clang -target bpf` and CO-RE flags.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/Blocklist.cpp`, `actions/LogAction.cpp`, `actions/BlocklistAction.cpp`, and `ebpf/bpf_program.cpp`.
 - **Secondary target**: `action_runner` — compiles `actions/main.cpp` plus `actions/ActionLoop.cpp` for exercising the dispatcher loop in isolation.
-- **Include paths**: `https_guard/`, `actions/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
+- **Include paths**: `https_guard/`, `actions/`, `coroutine/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
+- **Compile definitions**: `BOOST_ERROR_CODE_HEADER_ONLY` for all targets.
 
 ---
 
@@ -374,8 +560,10 @@ See the top-level [README.md](../../README.md) for detailed usage. Key points:
 
 ### Build Steps
 
-1. `do_compile:append` — attempts to cross-compile `https_guard.bpf.c` using clang (from `clang-native`).
-2. `do_install` — installs shell wrappers, the compiled daemon binary, the BPF object, systemd unit files, and the processed config file.
+1. `do_configure[depends]` — adds a dependency on `virtual/kernel:do_compile` to ensure the kernel vmlinux is available for CO-RE header generation.
+2. `do_configure:prepend` — locates the target kernel `vmlinux` (from `STAGING_KERNEL_BUILDDIR`, or via `find` in tmpdir) and symlinks it into the work directory as `target-kernel-vmlinux`. Used by the CMake `HTTPS_GUARD_TARGET_VMLINUX` variable.
+3. `do_compile:append` — the CMake build handles BPF compilation via `add_custom_target(https_guard_bpf)`, triggered by `HTTPS_GUARD_BUILD_BPF=ON`.
+4. `do_install` — installs shell wrappers (stripping `.sh` extension), the compiled daemon binary (`https-guardd`), the `action_runner` demo binary, the BPF object file, systemd unit files, and the processed config file with the event mode stamped in.
 
 ### PACKAGECONFIG Flags
 
@@ -395,6 +583,15 @@ See the top-level [README.md](../../README.md) for detailed usage. Key points:
 | `dbus-only` | `dbus` | ✓ | ✗ | ✗ | D-Bus monitor (bmcweb) |
 | `journal-only` | `journal` | ✗ | ✓ | ✓ | FilesystemLogWatcher (bmcweb) |
 
+### SRC_URI
+
+The recipe sources include all source files under `files/`:
+- Shell wrappers (`https-guard-daemon.sh`, `https-guard-event-bridge.sh`, `simulated-event-generator.sh`)
+- systemd unit files
+- Config file (`https-guard.conf`)
+- CMake build definition (`CMakeLists.txt`)
+- All C++ source and header files under `https_guard/`, `actions/`, `ebpf/`, and `coroutine/`
+
 ---
 
 ## Event Flow Summary
@@ -405,7 +602,7 @@ Each systemd unit file (`*.service`) invokes a shell wrapper script installed on
 
 | Recipe source (`.service`) | Install path (executable) | Source script | Binary launched | Role |
 |----------------------------|---------------------------|---------------|-----------------|------|
-| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging |
+| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging, hybrid enforcement (blocklist) |
 | `https-guard-event-bridge.service` | `/usr/sbin/https-guard-event-bridge` | `https-guard-event-bridge.sh` | — (pure shell) | Tails the event log, dispatches events to D-Bus / journal / Redfish log |
 | `simulated-event-generator.service` | `/usr/sbin/simulated-event-generator` | `simulated-event-generator.sh` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
 
@@ -415,7 +612,7 @@ Each systemd unit file (`*.service`) invokes a shell wrapper script installed on
 
 The `https-guard-event-bridge.sh` script exists as a separate process **decoupled** from the C++ daemon for several reasons:
 
-1. **Avoid direct D-Bus / sd_journal / filesystem calls from the hot path** — The C++ daemon's `on_event()` callback runs inside the `ring_buffer__poll()` loop. Calling D-Bus (`busctl`/`sd_bus`), `sd_journal_send()`, or appending to `/var/log/redfish` directly from the daemon's event callback would block the ring buffer consumer, risking dropped eBPF events under load. Instead, the daemon writes a single JSON line to a log file (a fast, non-blocking `fstream::operator<<`), and the bridge script tails that file as a **separate process**.
+1. **Avoid direct D-Bus / sd_journal / filesystem calls from the hot path** — The C++ daemon's `on_event()` callback runs inside the `ring_buffer__poll()` loop. Calling D-Bus (`busctl`/`sd_bus`), `sd_journal_send()`, or appending to `/var/log/redfish` directly from the daemon's event callback would block the ring buffer consumer, risking dropped eBPF events under load. Instead, the daemon dispatches actions to the `ActionLoop` (a background Boost.Asio thread), which writes a single JSON line to a log file asynchronously. The bridge script tails that file as a **separate process**.
 
 2. **Race-condition-free dispatch** — Because the bridge is a separate `tail -F` consumer, multiple event lines are processed one-at-a-time in a single-threaded `while read` loop. This eliminates any need for locks, mutexes, or synchronisation primitives that would be necessary if the C++ daemon dispatched events directly to three different sinks (D-Bus, journal, filesystem) from multiple threads or callback invocations. The shell pipeline acts as a **natural serialisation barrier**: `tail -F` guarantees line-by-line delivery, and the `while read` loop processes each line synchronously.
 
@@ -426,16 +623,17 @@ The `https-guard-event-bridge.sh` script exists as a separate process **decouple
 ### Complete Event Pipeline
 
 ```
-                              Kernel space                              User space
-                              ===========                              ==========
+         Kernel space                              User space
+         ===========                              ==========
 
 Wire: TLS ClientHello on TCP/443          Process: SSL_write(buf, num)
   │                                               │
   ▼                                               ▼
 eBPF XDP hook                              eBPF Uprobe hook
-  │  (TLS version, SNI, HTTP anomaly)             │  (payload snippet)
+  │  (blocklist_check → XDP_DROP?)                │  (payload snippet)
+  │  (TLS version, SNI, HTTP anomaly)             │
   │                                               │
-  └─────────────┬───────────────────────────────┘
+  └─────────────┬─────────────────────────────────┘
                 │  shared `events` ring buffer (BPF_MAP_TYPE_RINGBUF)
                 ▼
    ┌──────────────────────────────────────────────────────────┐
@@ -448,11 +646,28 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │ ring_buffer__poll() loop (200ms interval)          │  │
    │  │   → on_event() callback                            │  │
    │  │     → pattern_detector.hpp (inline anomaly rules)  │  │
-   │  │     → redfish_event_message.hpp (inline JSON)      │  │
-   │  │     → append_line() to log file                    │  │
+   │  │     → Classify event + mark actionable             │  │
+   │  │     └── pushAction(LogAction)                      │  │
+   │  │     └── pushAction(BlocklistAddAction)             │  │
+   │  └──────────────────────┬─────────────────────────────┘  │
+   │                         │ ActionLoop background thread   │
+   │  ┌──────────────────────▼─────────────────────────────┐  │
+   │  │ ActionLoop (Boost.Asio io_context)                 │  │
+   │  │                                                    │  │
+   │  │  ┌─────────────────────────────────────────────┐   │  │
+   │  │  │ LogAction::execute_async()                  │   │  │
+   │  │  │  → acquire_stream(log_file)                 │   │  │
+   │  │  │  → async_write(JSON line + "\n")            │   │  │
+   │  │  └─────────────────────────────────────────────┘   │  │
+   │  │                                                    │  │
+   │  │  ┌─────────────────────────────────────────────┐   │  │
+   │  │  │ BlocklistAddAction::execute_async()         │   │  │
+   │  │  │  → Blocklist::add(src_ip, ttl)              │   │  │
+   │  │  │  → bpf_map_update_elem(blocklist_fd, ...)   │   │  │
+   │  │  └─────────────────────────────────────────────┘   │  │
    │  └────────────────────────────────────────────────────┘  │
    └──────────────────────┬───────────────────────────────────┘
-                          │  writes JSON lines
+                          │  writes JSON lines (async)
                           ▼
                  /var/log/https_guard_events.log
                           │
@@ -473,15 +688,18 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │                                                    │  │
    │  │   case "$MODE" in                                  │  │
    │  │     dbus)                                          │  │
-   │  │       busctl call ... Create ...            ───┐   │  │
-   │  │     journal)                                     │   │  │
-   │  │       systemd-cat -t https-guard-event ...       │   │  │
-   │  │       emit_redfish_log "$ts" "$msg"       ───────┤   │  │
-   │  │     both)                                         │   │  │
-   │  │       busctl call ... Create ...            ─────┤   │  │
-   │  │       systemd-cat -t https-guard-event ...       │   │  │
-   │  │   esac                                            │   │  │
-   │  │ done                                              │   │  │
+   │  │       busctl call ... Create ...                   │  │
+   │  │       ;;                                           │  │
+   │  │     journal)                                       │  │
+   │  │       systemd-cat -t https-guard-event ...         │  │
+   │  │       emit_redfish_log "$ts" "$msg"                │  │
+   │  │       ;;                                           │  │
+   │  │     both)                                          │  │
+   │  │       busctl call ... Create ...                   │  │
+   │  │       systemd-cat -t https-guard-event ...         │  │
+   │  │       ;;                                           │  │
+   │  │   esac                                             │  │
+   │  │ done                                               │  │
    │  └────────────────────────────────────────────────────┘  │
    └──────────────────────┬───────────────────────────────────┘
                           │
@@ -495,11 +713,11 @@ eBPF XDP hook                              eBPF Uprobe hook
    └────┬─────┘   └──────┬───────┘   └──────┬───────┘
         │                │                  │
         ▼                │                  ▼
-   ┌──────────────┐      │   ┌─────────────────────────────┐
+   ┌──────────────┐      │   ┌──────────────────────────────┐
    │ bmcweb       │      │   │ bmcweb                       │
    │ D-Bus        │      │   │ FilesystemLogWatcher         │
    │ monitor      │      │   │ (inotify on /var/log/redfish)│
-   └──────┬───────┘      │   └──────────────┬──────────────┘
+   └──────┬───────┘      │   └──────────────┬───────────────┘
           │              │                  │
           └──────────────┼──────────────────┘
                          ▼

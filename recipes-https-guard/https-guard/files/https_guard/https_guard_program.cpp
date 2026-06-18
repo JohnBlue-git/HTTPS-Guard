@@ -1,18 +1,23 @@
-#include "https_guard_program.hpp"
-#include "LogAction.hpp"
-
+#include <iostream>
 #include <utility>
+
+#include "https_guard_program.hpp"
+#include "Blocklist.hpp"
+#include "LogAction.hpp"
+#include "BlocklistAction.hpp"
 
 namespace https_guard {
 
 HttpGuardProgram::HttpGuardProgram(std::string object_path,
                                    ActionLoop& action_loop,
                                    std::string openssl_lib_path,
-                                   unsigned int ifindex) noexcept
+                                   unsigned int ifindex,
+                                   std::chrono::seconds blocklist_ttl) noexcept
     : BpfProgram(std::move(object_path))
     , action_loop_(action_loop)
     , openssl_lib_path_(std::move(openssl_lib_path))
     , ifindex_(ifindex)
+    , blocklist_ttl_(blocklist_ttl)
 {
 }
 
@@ -39,6 +44,15 @@ bool HttpGuardProgram::attachProgram() noexcept
         return false;
     }
     links_.push_back(uprobe_link);
+
+    /* Adopt the blocklist map so ringBufferHandler can populate it after
+     * classifying an event.  This is the only "countermeasure" touch
+     * point in the attach path -- everything else stays observational. */
+    if (!Blocklist::instance().adopt(getMapFd(kBlocklistMapName))) {
+        std::cerr << "https_guard: failed to adopt blocklist map '"
+                  << kBlocklistMapName << "' (countermeasure disabled)\n";
+        /* Non-fatal: the daemon still works in pure observational mode. */
+    }
     return true;
 }
 
@@ -57,13 +71,16 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
     std::string severity;
     std::string message_id;
     std::string message;
+    bool         actionable = false;
 
     if (evt->event_type == HG_EVENT_TLS_VERSION_VIOLATION) {
-        severity = "Critical";
+        severity   = "Critical";
         message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
-        message = "Security violation: Process '" + std::string(evt->process) + "' (PID " +
-                  std::to_string(evt->pid) + ") attempted an HTTPS connection using an insecure TLS version (" +
-                  TlsVersion(evt->tls_version).toString() + "). Packet was blocked.";
+        message    = "Security violation: Process '" + std::string(evt->process) +
+                     "' (PID " + std::to_string(evt->pid) +
+                     ") attempted an HTTPS connection using an insecure TLS version (" +
+                     TlsVersion(evt->tls_version).toString() + "). Packet was blocked.";
+        actionable = true;
     } else if (evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED ||
                evt->event_type == HG_EVENT_HTTP_PAYLOAD_OBSERVED) {
         std::string matched_rule;
@@ -78,16 +95,28 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
             matched_rule = "kernel-signature";
         }
 
-        severity = "Warning";
+        severity   = "Warning";
         message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
-        message = "Attack signature detected from process '" + std::string(evt->process) + "' (PID " +
-                  std::to_string(evt->pid) + "), rule '" + matched_rule + "'. Connection should be terminated or quarantined.";
+        message    = "Attack signature detected from process '" + std::string(evt->process) +
+                     "' (PID " + std::to_string(evt->pid) +
+                     "), rule '" + matched_rule +
+                     "'. Source should be quarantined.";
+        actionable = true;
     } else {
         return 0;
     }
 
+    // LogAction
     RedfishEventMessage event_msg(*evt, message_id, message, severity);
-    action_loop_.pushAction(std::make_unique<LogAction>(event_msg.format(), std::string("/var/log/https_guard.log")));
+    action_loop_.pushAction(std::make_unique<LogAction>(
+        event_msg.format(), std::string("/var/log/https_guard.log")));
+
+    if (actionable && evt->src_ip_v4 != 0) {
+        // BlocklistAction
+        action_loop_.pushAction(
+            std::make_unique<BlocklistAddAction>(
+            evt->src_ip_v4, blocklist_ttl_, message));
+    }
     return 0;
 }
 

@@ -113,21 +113,25 @@ if(HTTPS_GUARD_BUILD_BPF)
         COMMENT "Compiling HTTPS-Guard BPF object"
     )
 
+
     add_custom_target(https_guard_bpf ALL DEPENDS ${HTTPS_GUARD_BPF_OBJECT})
 endif()
-
-add_executable(https_guardd
-    https_guard/main.cpp
-    https_guard/https_guard_program.cpp
-    actions/ActionLoop.cpp
-    actions/LogAction.cpp
-    ebpf/bpf_program.cpp
-)
 
 add_executable(action_runner
     actions/main.cpp
     actions/ActionLoop.cpp
 )
+
+add_executable(https_guardd
+    https_guard/main.cpp
+    https_guard/https_guard_program.cpp
+    actions/ActionLoop.cpp
+    actions/Blocklist.cpp
+    actions/LogAction.cpp
+    actions/BlocklistAction.cpp
+    ebpf/bpf_program.cpp
+)
+
 
 if(HTTPS_GUARD_BUILD_BPF)
     add_dependencies(https_guardd https_guard_bpf)

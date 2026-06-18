@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -14,6 +15,7 @@
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
+constexpr auto kDefaultBlocklistTtl = std::chrono::minutes(5);
 
 void on_signal(int)
 {
@@ -61,7 +63,12 @@ int main(int argc, char** argv)
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
-    https_guard::HttpGuardProgram program(cfg.bpf_object_path, action_loop, cfg.openssl_lib_path, if_nametoindex(cfg.iface.c_str()));
+    https_guard::HttpGuardProgram program(
+        cfg.bpf_object_path,
+        action_loop,
+        cfg.openssl_lib_path,
+        if_nametoindex(cfg.iface.c_str()),
+        std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl));
     if (!program.loadFilter()) {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;
