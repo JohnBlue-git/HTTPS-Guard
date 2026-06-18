@@ -1,13 +1,8 @@
-#include <chrono>
 #include <cstdint>
-#include <future>
-#include <memory>
 #include <string>
 #include <utility>
 
 #include <boost/asio/awaitable.hpp>
-#include <boost/asio/post.hpp>
-#include <boost/asio/use_awaitable.hpp>
 
 #include "BlockTcpAction.hpp"
 #include "TcpDestroyer.hpp"
@@ -28,30 +23,16 @@ BlockTcpAction::BlockTcpAction(std::uint32_t src_ip_v4,
 
 boost::asio::awaitable<void> BlockTcpAction::execute_async()
 {
-    auto destroyer = std::make_shared<TcpDestroyer>(
+    TcpDestroyer destroyer(
         src_ip_v4_, dst_ip_v4_,
         src_port_, dst_port_, reason_);
 
     /*
-     * Offload the blocking sendmsg / recvmsg to a C++ runtime-managed
-     * thread pool via std::async.  This keeps the ActionLoop's single
-     * io_context thread available for other coroutines.
-     *
-     * The shared_ptr keeps the RAII TcpDestroyer alive until the
-     * blocking call completes; its destructor then closes the fd.
+     * Truly async Netlink SOCK_DESTROY – the coroutine suspends
+     * while the Asio reactor (epoll) waits for the fd to become
+     * writable / readable.  No extra threads, no polling.
      */
-    std::future<bool> future = std::async(std::launch::async,
-        [destroyer]() noexcept { return destroyer->execute(); });
-
-    /*
-     * Poll the future in a spin-loop that yields back to the Asio
-     * event loop after each short wait, so other work on the
-     * ActionLoop is not starved.
-     */
-    while (future.wait_for(std::chrono::milliseconds(1))
-           != std::future_status::ready) {
-        co_await boost::asio::post(boost::asio::use_awaitable);
-    }
+    co_await destroyer.async_execute();
 
     co_return;
 }

@@ -8,6 +8,11 @@
 #include <arpa/inet.h>
 #include <cstddef>
 
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
+
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
 #include <linux/sock_diag.h>
@@ -38,6 +43,29 @@ std::string formatIp(std::uint32_t ip) noexcept
     return std::string{buf.data()};
 }
 
+/*
+ * Prepare the SOCK_DESTROY Netlink message into the caller-provided
+ * msghdr/iovec so that the calling coroutine can send it.
+ */
+void buildDestroyRequest(const struct diag_nl_msg& msg,
+                         struct msghdr& nl_hdr,
+                         struct iovec& iov,
+                         struct sockaddr_nl& nl_addr) noexcept
+{
+    std::memset(&nl_addr, 0, sizeof(nl_addr));
+    nl_addr.nl_family = AF_NETLINK;
+
+    std::memset(&iov, 0, sizeof(iov));
+    iov.iov_base = const_cast<diag_nl_msg*>(&msg);
+    iov.iov_len  = sizeof(msg);
+
+    std::memset(&nl_hdr, 0, sizeof(nl_hdr));
+    nl_hdr.msg_name    = &nl_addr;
+    nl_hdr.msg_namelen = sizeof(nl_addr);
+    nl_hdr.msg_iov     = &iov;
+    nl_hdr.msg_iovlen  = 1;
+}
+
 }  // anonymous namespace
 
 TcpDestroyer::TcpDestroyer(std::uint32_t src_ip_v4,
@@ -51,7 +79,11 @@ TcpDestroyer::TcpDestroyer(std::uint32_t src_ip_v4,
     , dst_port_(dst_port)
     , reason_(std::move(reason))
 {
-    nl_fd_ = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC,
+    /*
+     * Open with SOCK_NONBLOCK so the fd can be used with
+     * Boost.Asio's reactor (epoll) for true async I/O.
+     */
+    nl_fd_ = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
                     NETLINK_INET_DIAG);
     if (nl_fd_ < 0) {
         std::cerr << "BlockTcpAction: socket(NETLINK_INET_DIAG) failed: "
@@ -66,10 +98,10 @@ TcpDestroyer::~TcpDestroyer() noexcept
     }
 }
 
-bool TcpDestroyer::execute() noexcept
+boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
 {
     if (nl_fd_ < 0) {
-        return false;
+        co_return false;
     }
 
     /* Build the SOCK_DESTROY request for the exact TCP 4-tuple. */
@@ -99,57 +131,76 @@ bool TcpDestroyer::execute() noexcept
     msg.req.id.idiag_cookie[0] = ~0ULL;
     msg.req.id.idiag_cookie[1] = ~0ULL;
 
-    /* Send the destroy command. */
-    struct sockaddr_nl nl_addr{};
-    nl_addr.nl_family = AF_NETLINK;
+    /* ------------------------------------------------------------------
+     * Truly async Netlink I/O via Boost.Asio's reactor.
+     *
+     * We wrap the non-blocking fd in a posix::stream_descriptor and
+     * use async_wait() to be notified by epoll when the socket is
+     * ready for writing / reading.  The actual sendmsg/recvmsg calls
+     * are issued after readiness is confirmed, so they never block.
+     * No thread, no polling loop, no busy-wait.
+     * ------------------------------------------------------------------ */
 
+    boost::asio::posix::stream_descriptor desc(
+        co_await boost::asio::this_coro::executor);
+    desc.assign(nl_fd_);
+
+    /* ---- Send the destroy command ---- */
     struct iovec iov;
-    std::memset(&iov, 0, sizeof(iov));
-    iov.iov_base = &msg;
-    iov.iov_len  = sizeof(msg);
-
     struct msghdr nl_hdr;
-    std::memset(&nl_hdr, 0, sizeof(nl_hdr));
-    nl_hdr.msg_name    = &nl_addr;
-    nl_hdr.msg_namelen = sizeof(nl_addr);
-    nl_hdr.msg_iov     = &iov;
-    nl_hdr.msg_iovlen  = 1;
+    struct sockaddr_nl nl_addr;
+
+    buildDestroyRequest(msg, nl_hdr, iov, nl_addr);
+
+    co_await desc.async_wait(
+        boost::asio::posix::stream_descriptor::wait_write,
+        boost::asio::use_awaitable);
 
     const ssize_t sent = sendmsg(nl_fd_, &nl_hdr, 0);
     if (sent < 0) {
         std::cerr << "BlockTcpAction: SOCK_DESTROY sendmsg failed: "
                   << std::strerror(errno) << " (" << errno << ")\n";
-        return false;
+        desc.release();
+        co_return false;
     }
 
-    /* ------------------------------------------------------------------
-     * Read the kernel's reply.
-     * Even though SOCK_DESTROY is asynchronous from the kernel's
-     * perspective, Netlink will return an NLMSG_ERROR / NLMSG_DONE
-     * indicating whether the destroy request was *accepted* (not
-     * whether the socket has already been destroyed).
-     * ------------------------------------------------------------------ */
+    /* ---- Read the kernel's reply ---- */
     std::uint8_t reply_buf[8192];
 
-    iov.iov_base = reply_buf;
-    iov.iov_len  = sizeof(reply_buf);
+    struct iovec riov;
+    std::memset(&riov, 0, sizeof(riov));
+    riov.iov_base = reply_buf;
+    riov.iov_len  = sizeof(reply_buf);
 
     struct sockaddr_nl reply_addr{};
-    nl_hdr.msg_name    = &reply_addr;
-    nl_hdr.msg_namelen = sizeof(reply_addr);
 
-    const ssize_t recvd = recvmsg(nl_fd_, &nl_hdr, 0);
+    struct msghdr rcv_hdr;
+    std::memset(&rcv_hdr, 0, sizeof(rcv_hdr));
+    rcv_hdr.msg_name    = &reply_addr;
+    rcv_hdr.msg_namelen = sizeof(reply_addr);
+    rcv_hdr.msg_iov     = &riov;
+    rcv_hdr.msg_iovlen  = 1;
+
+    co_await desc.async_wait(
+        boost::asio::posix::stream_descriptor::wait_read,
+        boost::asio::use_awaitable);
+
+    const ssize_t recvd = recvmsg(nl_fd_, &rcv_hdr, 0);
     if (recvd < 0) {
         std::cerr << "BlockTcpAction: SOCK_DESTROY recvmsg failed: "
                   << std::strerror(errno) << " (" << errno << ")\n";
-        return false;
+        desc.release();
+        co_return false;
     }
+
+    /* Release ownership of the fd back to TcpDestroyer's destructor. */
+    desc.release();
 
     /* Parse the Netlink response header. */
     if (recvd < static_cast<ssize_t>(sizeof(struct nlmsghdr))) {
         std::cerr << "BlockTcpAction: short Netlink reply ("
                   << recvd << " bytes)\n";
-        return false;
+        co_return false;
     }
 
     const auto* nl_reply = reinterpret_cast<const struct nlmsghdr*>(reply_buf);
@@ -164,7 +215,7 @@ bool TcpDestroyer::execute() noexcept
                       << formatIp(src_ip_v4_) << ":" << ntohs(src_port_)
                       << " -> " << formatIp(dst_ip_v4_) << ":" << ntohs(dst_port_)
                       << " reason=" << reason_ << "\n";
-            return true;
+            co_return true;
         } else {
             std::cerr << "BlockTcpAction: SOCK_DESTROY failed for "
                       << formatIp(src_ip_v4_) << ":" << ntohs(src_port_)
@@ -172,12 +223,12 @@ bool TcpDestroyer::execute() noexcept
                       << " reason=" << reason_
                       << " netlink_error=" << nl_err
                       << " (" << std::strerror(-nl_err) << ")\n";
-            return false;
+            co_return false;
         }
     } else {
         std::cerr << "BlockTcpAction: unexpected Netlink reply type "
                   << nl_reply->nlmsg_type << '\n';
-        return false;
+        co_return false;
     }
 }
 
