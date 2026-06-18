@@ -20,7 +20,8 @@ public:
                      ActionLoop& action_loop,
                      std::string openssl_lib_path,
                      unsigned int ifindex,
-                     std::chrono::seconds blocklist_ttl) noexcept;
+                     std::chrono::seconds blocklist_ttl,
+                     std::string output_path) noexcept;
 
 protected:
     bool attachProgram() noexcept override;
@@ -35,6 +36,7 @@ private:
     unsigned int ifindex_;
     PatternDetector detector_;
     std::chrono::seconds blocklist_ttl_;
+    std::string output_path_;
 };
 
 }  // namespace https_guard

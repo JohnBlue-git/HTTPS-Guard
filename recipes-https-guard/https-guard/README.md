@@ -20,6 +20,7 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 - [LogAction — Async File Writer (`actions/LogAction.hpp`)](#logaction--async-file-writer-actionslogactionhpp)
 - [Blocklist — Source IP Blocklist Manager (`actions/Blocklist.hpp`)](#blocklist--source-ip-blocklist-manager-actionsblocklisthpp)
 - [BlocklistAddAction — Countermeasure Action (`actions/BlocklistAction.hpp`)](#blocklistaddaction--countermeasure-action-actionsblocklistactionhpp)
+- [BlockTcpAction — TCP Connection Teardown (`actions/BlockTcpAction.hpp`)](#blocktcpaaction--tcp-connection-teardown-actionsblocktcpaactionhpp)
 - [Blocklist BPF Header (`actions/blocklist.bpf.h`)](#blocklist-bpf-header-actionsblocklistbpfh)
 - [AsyncFileStreamManager — Coroutine-Safe File Writer (`coroutine/async_mutex.hpp`)](#asyncfilestreammanager--coroutine-safe-file-writer-coroutineasync_mutexhpp)
 - [Redfish Event Message (`https_guard/redfish_event_message.hpp`)](#redfish-event-message-https_guardredfish_event_messagehpp)
@@ -67,6 +68,8 @@ files/
 │   ├── Blocklist.cpp                                 # Blocklist singleton implementation
 │   ├── BlocklistAction.hpp                           # Countermeasure action: add src IP to blocklist
 │   ├── BlocklistAction.cpp                           # BlocklistAddAction implementation
+│   ├── BlockTcpAction.hpp                            # Countermeasure action: kill TCP 4-tuple via tcp_drop
+│   ├── BlockTcpAction.cpp                            # BlockTcpAction implementation
 │   └── blocklist.bpf.h                               # BPF-side blocklist header (XDP_DROP check)
 ```
 
@@ -226,7 +229,7 @@ The daemon's `main()` function orchestrates the full eBPF lifecycle and event di
    - `bpf_object__open_file()` — parses the ELF BPF object.
    - `bpf_object__load()` — loads programs into the kernel and creates maps.
 
-4. **Create `HttpGuardProgram`** — passing the BPF object path, the `ActionLoop` reference, OpenSSL library path, network interface index, and a default blocklist TTL of 5 minutes. The program:
+4. **Create `HttpGuardProgram`** — passing the BPF object path, the `ActionLoop` reference, OpenSSL library path, network interface index, a default blocklist TTL of 5 minutes, and the configured output path. The program:
    - Attaches the XDP program to the network interface.
    - Attaches the uprobe to `SSL_write` in the specified OpenSSL shared library.
    - **Adopts the blocklist BPF map** (`src_blocklist`) so the daemon can populate it with offending source IPs.
@@ -245,18 +248,19 @@ The callback classifies incoming ring buffer events:
      - Sets severity to `"Critical"`.
      - Uses message ID `OemSecurityEvent.1.0.0.HttpsTlsVersionViolation`.
      - Composes a human-readable message including process name, PID, and TLS version string.
-     - Marks the event as **actionable** (triggers blocklist insertion).
+     - Marks the event as **actionable** (triggers blocklist insertion and TCP teardown).
    - `HG_EVENT_HTTP_PAYLOAD_OBSERVED` or `HG_EVENT_HTTP_ANOMALY_DETECTED` →
      - Runs user-space anomaly detection via `detector_.isSuspicious()`.
      - If the payload matches a rule (or was already flagged by the kernel as an anomaly), the event is promoted to `"Warning"`.
      - Uses message ID `OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected`.
      - Includes the matched rule name in the message.
-     - If suspicious, marks the event as **actionable** (triggers blocklist insertion).
+     - If suspicious, marks the event as **actionable** (triggers blocklist insertion and TCP teardown).
    - All other event types are silently dropped.
 
 3. **Dispatch actions via ActionLoop**:
-   - **LogAction** — always pushed for every actionable event. Formats the event via `RedfishEventMessage::format()` and writes it asynchronously to `/var/log/https_guard.log` using the `AsyncFileStreamManager`.
+   - **LogAction** — always pushed for every actionable event. Formats the event via `RedfishEventMessage::format()` and writes it asynchronously to the configured output path (`output_path_`, from `cfg.output_path`) using the `AsyncFileStreamManager`.
    - **BlocklistAddAction** — pushed for actionable events with a non-zero `src_ip_v4`. Creates a blocklist entry with the configured TTL (default: 5 minutes). This causes the XDP program to drop subsequent packets from that source IP.
+   - **BlockTcpAction** — pushed for actionable events with a non-zero `src_ip_v4`. Kills the specific TCP connection 4-tuple (src/dst IP, src/dst port) via the kernel's `tcp_drop` facility (`SOCK_DESTROY` over `NETLINK_INET_DIAG`). This tears down the kernel socket without touching the owning process, causing the remote peer to receive RST/EPIPE on its next I/O operation.
 
 ### Cleanup
 
@@ -298,7 +302,7 @@ The user-space anomaly detection engine applies a set of **static signature rule
 
 ## ActionLoop — Async Event Dispatcher (`actions/ActionLoop.hpp`)
 
-The `ActionLoop` is a singleton that decouples eBPF event callback processing from downstream I/O (logging, D-Bus, blocklist updates). It wraps a Boost.Asio `io_context` running on a dedicated background thread:
+The `ActionLoop` is a singleton that decouples eBPF event callback processing from downstream I/O (logging, D-Bus, blocklist updates, TCP teardown). It wraps a Boost.Asio `io_context` running on a dedicated background thread:
 
 ### Architecture
 
@@ -306,8 +310,9 @@ The `ActionLoop` is a singleton that decouples eBPF event callback processing fr
 main thread (ring_buffer__poll)
   │
   └── on_event() callback
-       ├── pushAction(LogAction)         → ActionLoop queue
-       └── pushAction(BlocklistAddAction) → ActionLoop queue
+       ├── pushAction(LogAction)          → ActionLoop queue
+       ├── pushAction(BlocklistAddAction) → ActionLoop queue
+       └── pushAction(BlockTcpAction)     → ActionLoop queue
               │
               ▼
        Background thread (io_context::run)
@@ -316,14 +321,17 @@ main thread (ring_buffer__poll)
               │    └── AsyncFileStreamManager::acquire_stream()
               │         └── async_write() to log file
               │
-              └── co_spawn BlocklistAddAction::execute_async()
-                   └── Blocklist::instance().add(src_ip, ttl)
-                        └── bpf_map_update_elem() on blocklist BPF map
+              ├── co_spawn BlocklistAddAction::execute_async()
+              │    └── Blocklist::instance().add(src_ip, ttl)
+              │         └── bpf_map_update_elem() on blocklist BPF map
+              │
+              └── co_spawn BlockTcpAction::execute_async()
+                   └── SOCK_DESTROY via NETLINK_INET_DIAG
 ```
 
 ### Key Design Decisions
 
-- **Non-blocking callbacks** — `pushAction()` enqueues the action and returns immediately. The `on_event()` callback never blocks on file I/O or BPF map updates.
+- **Non-blocking callbacks** — `pushAction()` enqueues the action and returns immediately. The `on_event()` callback never blocks on file I/O, BPF map updates, or Netlink operations.
 - **Background execution** — `ActionLoop` spawns a single background thread that runs `io_context.run()`. All action execution happens on this thread.
 - **Exception safety** — exceptions thrown by `execute_async()` are caught and logged; they never propagate to the main thread.
 - **Lifetime** — the `ActionLoop` is a process-level singleton (`getInstance()`). Its destructor joins the background thread to ensure orderly shutdown.
@@ -389,6 +397,50 @@ class BlocklistAddAction final : public IAction {
 ```
 
 On execution, it calls `Blocklist::instance().add(src_ip_v4_, ttl_)`. Success/failure is logged to stderr.
+
+---
+
+## BlockTcpAction — TCP Connection Teardown (`actions/BlockTcpAction.hpp`)
+
+`BlockTcpAction` is an `IAction` that instantly kills a specific TCP socket tuple using the kernel's `tcp_drop` facility (available via `NETLINK_INET_DIAG` + `SOCK_DESTROY`). It is pushed by `ringBufferHandler` alongside `BlocklistAddAction` whenever an event is classified as **actionable**.
+
+Unlike the blocklist action (which prevents future connections from a source IP), `BlockTcpAction` targets the **current active connection** by its exact 4-tuple (source IP, destination IP, source port, destination port).
+
+```cpp
+class BlockTcpAction final : public IAction {
+    // src_ip_v4 / dst_ip_v4:  IPv4 addresses (network byte order)
+    // src_port / dst_port:    TCP ports (host byte order)
+    // reason:                 Human-readable reason (included in stderr log)
+    BlockTcpAction(uint32_t src_ip_v4,
+                   uint32_t dst_ip_v4,
+                   uint16_t src_port,
+                   uint16_t dst_port,
+                   std::string reason);
+    boost::asio::awaitable<void> execute_async() override;
+};
+```
+
+### How it works
+
+On execution, `BlockTcpAction::execute_async()`:
+
+1. Opens a `NETLINK_INET_DIAG` socket (`SOCK_DGRAM | SOCK_CLOEXEC`).
+2. Builds an `inet_diag_req_v2` struct with `SOCK_DESTROY` as the Netlink message type, matching `AF_INET`, `IPPROTO_TCP`, and all TCP states (`0xFFF`).
+3. Sets `idiag_cookie[0]` and `idiag_cookie[1]` to `~0ULL` — the kernel interprets this as "don't care / match any socket".
+4. Sends the destroy command via `sendmsg()` to the kernel.
+5. Reads the kernel's reply via `recvmsg()` — `NLMSG_ERROR` with `error == 0` indicates the destroy request was accepted.
+6. Logs success or failure (with `strerror(errno)` on error).
+
+### `tcp_drop` / `SOCK_DESTROY` semantics (Linux 4.10+)
+
+- The kernel tears down the TCP socket that matches the given 4-tuple **without touching the owning process**.
+- The process receives a standard error (typically `EPIPE` / `ECONNRESET`) on its next I/O operation.
+- The operation is asynchronous from the kernel's perspective: the Netlink reply only confirms that the request was **accepted**, not that the socket has already been destroyed.
+
+### Design Rationale
+
+- **Not killing the PID** — The action operates entirely at the kernel TCP socket layer, never sending signals to the process. This is safe even if multiple connections share the same process.
+- **Complementary to blocklist** — The blocklist prevents new connections from the offending IP. `BlockTcpAction` terminates the current connection immediately, providing instant response without waiting for the TCP keepalive or timeout.
 
 ---
 
@@ -528,7 +580,7 @@ public:
 - **BPF object build** (optional via `HTTPS_GUARD_BUILD_BPF`):
   - Generates a target-kernel `vmlinux.h` using `bpftool btf dump`.
   - Compiles `https_guard/https_guard.bpf.c` with `clang -target bpf` and CO-RE flags.
-- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/Blocklist.cpp`, `actions/LogAction.cpp`, `actions/BlocklistAction.cpp`, and `ebpf/bpf_program.cpp`.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/Blocklist.cpp`, `actions/LogAction.cpp`, `actions/BlocklistAction.cpp`, `actions/BlockTcpAction.cpp`, and `ebpf/bpf_program.cpp`.
 - **Secondary target**: `action_runner` — compiles `actions/main.cpp` plus `actions/ActionLoop.cpp` for exercising the dispatcher loop in isolation.
 - **Include paths**: `https_guard/`, `actions/`, `coroutine/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
@@ -590,7 +642,7 @@ The recipe sources include all source files under `files/`:
 - systemd unit files
 - Config file (`https-guard.conf`)
 - CMake build definition (`CMakeLists.txt`)
-- All C++ source and header files under `https_guard/`, `actions/`, `ebpf/`, and `coroutine/`
+- All C++ source and header files under `https_guard/`, `actions/`, `ebpf/`, and `coroutine/`, including the new `BlockTcpAction.hpp` and `BlockTcpAction.cpp`.
 
 ---
 
@@ -602,7 +654,7 @@ Each systemd unit file (`*.service`) invokes a shell wrapper script installed on
 
 | Recipe source (`.service`) | Install path (executable) | Source script | Binary launched | Role |
 |----------------------------|---------------------------|---------------|-----------------|------|
-| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging, hybrid enforcement (blocklist) |
+| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guard-daemon.sh` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, anomaly detection, JSON logging, hybrid enforcement (blocklist + TCP teardown) |
 | `https-guard-event-bridge.service` | `/usr/sbin/https-guard-event-bridge` | `https-guard-event-bridge.sh` | — (pure shell) | Tails the event log, dispatches events to D-Bus / journal / Redfish log |
 | `simulated-event-generator.service` | `/usr/sbin/simulated-event-generator` | `simulated-event-generator.sh` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
 
@@ -649,6 +701,7 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │     → Classify event + mark actionable             │  │
    │  │     └── pushAction(LogAction)                      │  │
    │  │     └── pushAction(BlocklistAddAction)             │  │
+   │  │     └── pushAction(BlockTcpAction)                 │  │
    │  └──────────────────────┬─────────────────────────────┘  │
    │                         │ ActionLoop background thread   │
    │  ┌──────────────────────▼─────────────────────────────┐  │
@@ -656,7 +709,7 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │                                                    │  │
    │  │  ┌─────────────────────────────────────────────┐   │  │
    │  │  │ LogAction::execute_async()                  │   │  │
-   │  │  │  → acquire_stream(log_file)                 │   │  │
+   │  │  │  → acquire_stream(cfg.output_path)          │   │  │
    │  │  │  → async_write(JSON line + "\n")            │   │  │
    │  │  └─────────────────────────────────────────────┘   │  │
    │  │                                                    │  │
@@ -664,6 +717,12 @@ eBPF XDP hook                              eBPF Uprobe hook
    │  │  │ BlocklistAddAction::execute_async()         │   │  │
    │  │  │  → Blocklist::add(src_ip, ttl)              │   │  │
    │  │  │  → bpf_map_update_elem(blocklist_fd, ...)   │   │  │
+   │  │  └─────────────────────────────────────────────┘   │  │
+   │  │                                                    │  │
+   │  │  ┌─────────────────────────────────────────────┐   │  │
+   │  │  │ BlockTcpAction::execute_async()             │   │  │
+   │  │  │  → SOCK_DESTROY via NETLINK_INET_DIAG       │   │  │
+   │  │  │  → Kernel tears down TCP 4-tuple            │   │  │
    │  │  └─────────────────────────────────────────────┘   │  │
    │  └────────────────────────────────────────────────────┘  │
    └──────────────────────┬───────────────────────────────────┘

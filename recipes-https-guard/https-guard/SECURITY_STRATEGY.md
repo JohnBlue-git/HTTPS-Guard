@@ -122,9 +122,10 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 | `https_guard/https_guard.bpf.c:469-500` | Uprobe `SSL_write`: event is submitted, returns `0` — no override, no block |
 | `actions/blocklist.bpf.h:22-36` | `blocklist_check()` inline function — performs `XDP_DROP` for active blocklist entries; prunes expired entries via `bpf_map_delete_elem()` |
 | `https_guard/https_guard_program.cpp:48-55` | `Blocklist::instance().adopt()` — daemon adopts the blocklist BPF map fd during program attachment |
-| `https_guard/https_guard_program.cpp:114-119` | `pushAction(BlocklistAddAction)` — actionable events write the source IP into the blocklist map |
+| `https_guard/https_guard_program.cpp:118-135` | `pushAction(BlocklistAddAction)` + `pushAction(BlockTcpAction)` — actionable events write the source IP into the blocklist map **and** kill the current TCP 4-tuple |
 | `https_guard/main.cpp:71` | `kDefaultBlocklistTtl = 5 minutes` — configurable blocklist TTL |
 | `actions/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry and writes via `bpf_map_update_elem()` into the kernel BPF map |
+| `actions/BlockTcpAction.cpp:55-182` | `BlockTcpAction::execute_async()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` to tear down the exact TCP 4-tuple |
 | `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
 | `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |
 
@@ -167,9 +168,9 @@ Packet arrives on port 443
 
 All classification (severity assignment, anomaly rule matching, message formatting) happens in userspace C++ code (`main.cpp` → `https_guard_program.cpp` → inline headers `pattern_detector.hpp` and `redfish_event_message.hpp`). The dispatch to Redfish EventService is deferred further to a separate shell bridge process (`https-guard-event-bridge.sh`).
 
-### Hybrid Extension — Implemented
+### Hybrid Extension — Implemented (Two-Action Response)
 
-The architecture now implements a **fully operational** hybrid extension:
+The architecture now implements a **fully operational** hybrid extension with **two simultaneous countermeasures**:
 
 ```
   ┌──────────────────────────────────┐
@@ -182,17 +183,29 @@ The architecture now implements a **fully operational** hybrid extension:
   │      5min, reason)               │
   │  → Blocklist::add() writes       │
   │    expiry into BPF map           │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────┐
-  │  Next packet from 10.0.0.5       │
   │                                  │
-  │  XDP hook calls                  │
-  │  blocklist_check(10.0.0.5)       │
-  │  → active entry found            │
-  │  → XDP_DROP (zero round-trip)    │
-  └──────────────────────────────────┘
+  │  → BlockTcpAction(10.0.0.5,      │
+  │      dst_ip, port, dst_port,     │
+  │      reason)                     │
+  │  → SOCK_DESTROY via              │
+  │    NETLINK_INET_DIAG             │
+  └──────┬────────────┬──────────────┘
+         │            │
+         ▼            ▼
+  ┌────────────┐  ┌──────────────────────┐
+  │ Next pkt   │  │ Current TCP conn     │
+  │ from IP    │  │ matching 4-tuple     │
+  │ 10.0.0.5   │  │ is torn down by      │
+  │            │  │ kernel (SOCK_DESTROY)│
+  │ XDP hook   │  │ Process gets         │
+  │ calls      │  │ EPIPE/ECONNRESET     │
+  │ blocklist  │  │ on next I/O          │
+  │ _check()   │  └──────────────────────┘
+  │            │
+  │ → active   │
+  │   entry    │
+  │ → XDP_DROP │
+  └────────────┘
 ```
 
 The initial detection is asynchronous (Strategy 2), but the follow-up enforcement is synchronous (Strategy 1). The eBPF map (`src_blocklist`, a `BPF_MAP_TYPE_HASH`) serves as the bridge between the two strategies. This pattern — **"detect in userspace, enforce in kernel"** — is widely used in production systems like Cilium and Falco.
@@ -205,8 +218,9 @@ The initial detection is asynchronous (Strategy 2), but the follow-up enforcemen
 | BPF `blocklist_check()` | `actions/blocklist.bpf.h:22-36` | Inline helper returning `XDP_DROP` for active entries, pruning expired ones |
 | XDP hook integration | `https_guard/https_guard.bpf.c:334-335` | Calls `blocklist_check(ip->saddr)` as first processing step |
 | Userspace Blocklist singleton | `actions/Blocklist.hpp`, `actions/Blocklist.cpp` | Wraps BPF map fd; provides `add()`, `contains()`, `adopt()`, `formatIp()` |
-| Countermeasure action | `actions/BlocklistAction.hpp`, `actions/BlocklistAction.cpp` | `IAction` implementation that calls `Blocklist::add()` |
-| Action dispatch | `https_guard/https_guard_program.cpp:64-121` | `ringBufferHandler()` classifies events as actionable and pushes `BlocklistAddAction` |
+| Countermeasure action (blocklist) | `actions/BlocklistAction.hpp`, `actions/BlocklistAction.cpp` | `IAction` implementation that calls `Blocklist::add()` |
+| Countermeasure action (TCP teardown) | `actions/BlockTcpAction.hpp`, `actions/BlockTcpAction.cpp` | `IAction` implementation that sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` |
+| Action dispatch | `https_guard/https_guard_program.cpp:64-145` | `ringBufferHandler()` classifies events as actionable and pushes both `BlocklistAddAction` and `BlockTcpAction` |
 | Default TTL | `https_guard/main.cpp:18` | `kDefaultBlocklistTtl = 5 minutes` |
 
 ### Summary

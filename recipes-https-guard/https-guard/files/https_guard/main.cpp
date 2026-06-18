@@ -68,7 +68,8 @@ int main(int argc, char** argv)
         action_loop,
         cfg.openssl_lib_path,
         if_nametoindex(cfg.iface.c_str()),
-        std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl));
+        std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl),
+        cfg.output_path);
     if (!program.loadFilter()) {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;

@@ -5,6 +5,7 @@
 #include "Blocklist.hpp"
 #include "LogAction.hpp"
 #include "BlocklistAction.hpp"
+#include "BlockTcpAction.hpp"
 
 namespace https_guard {
 
@@ -12,12 +13,14 @@ HttpGuardProgram::HttpGuardProgram(std::string object_path,
                                    ActionLoop& action_loop,
                                    std::string openssl_lib_path,
                                    unsigned int ifindex,
-                                   std::chrono::seconds blocklist_ttl) noexcept
+                                   std::chrono::seconds blocklist_ttl,
+                                   std::string output_path) noexcept
     : BpfProgram(std::move(object_path))
     , action_loop_(action_loop)
     , openssl_lib_path_(std::move(openssl_lib_path))
     , ifindex_(ifindex)
     , blocklist_ttl_(blocklist_ttl)
+    , output_path_(std::move(output_path))
 {
 }
 
@@ -107,15 +110,31 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
     }
 
     // LogAction
-    RedfishEventMessage event_msg(*evt, message_id, message, severity);
-    action_loop_.pushAction(std::make_unique<LogAction>(
-        event_msg.format(), std::string("/var/log/https_guard.log")));
+    RedfishEventMessage event_msg(
+        *evt, message_id, message, severity);
+    action_loop_.pushAction(
+        std::make_unique<LogAction>(
+        event_msg.format(),
+        output_path_));
 
     if (actionable && evt->src_ip_v4 != 0) {
-        // BlocklistAction
+        // BlocklistAction — prevent future connections from this source IP
         action_loop_.pushAction(
             std::make_unique<BlocklistAddAction>(
-            evt->src_ip_v4, blocklist_ttl_, message));
+            evt->src_ip_v4,
+            blocklist_ttl_,
+            message));
+
+        // BlockTcpAction — kill the specific TCP connection immediately
+        // using the kernel's tcp_drop (SOCK_DESTROY) facility, which
+        // tears down the socket without touching the owning process.
+        action_loop_.pushAction(
+            std::make_unique<BlockTcpAction>(
+            evt->src_ip_v4,
+            evt->dst_ip_v4,
+            evt->src_port,
+            evt->dst_port,
+            message));
     }
     return 0;
 }

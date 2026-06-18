@@ -129,6 +129,7 @@ add_executable(https_guardd
     actions/Blocklist.cpp
     actions/LogAction.cpp
     actions/BlocklistAction.cpp
+    actions/BlockTcpAction.cpp
     ebpf/bpf_program.cpp
 )
 
