@@ -74,6 +74,8 @@ SRC_URI = " \
     file://actions/LogAction.cpp \
     file://actions/BlocklistAction.hpp \
     file://actions/BlocklistAction.cpp \
+    file://actions/TcpDestroyer.hpp \
+    file://actions/TcpDestroyer.cpp \
     file://actions/BlockTcpAction.hpp \
     file://actions/BlockTcpAction.cpp \
     file://actions/main.cpp \

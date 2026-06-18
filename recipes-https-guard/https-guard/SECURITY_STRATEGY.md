@@ -125,7 +125,8 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 | `https_guard/https_guard_program.cpp:118-135` | `pushAction(BlocklistAddAction)` + `pushAction(BlockTcpAction)` — actionable events write the source IP into the blocklist map **and** kill the current TCP 4-tuple |
 | `https_guard/main.cpp:71` | `kDefaultBlocklistTtl = 5 minutes` — configurable blocklist TTL |
 | `actions/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry and writes via `bpf_map_update_elem()` into the kernel BPF map |
-| `actions/BlockTcpAction.cpp:55-182` | `BlockTcpAction::execute_async()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` to tear down the exact TCP 4-tuple |
+| `actions/TcpDestroyer.cpp:69-182` | `TcpDestroyer::execute()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` to tear down the exact TCP 4-tuple |
+| `actions/BlockTcpAction.cpp:29-57` | `BlockTcpAction::execute_async()` — constructs `TcpDestroyer` and offloads blocking call via `std::async` |
 | `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits |
 | `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |
 
@@ -219,7 +220,8 @@ The initial detection is asynchronous (Strategy 2), but the follow-up enforcemen
 | XDP hook integration | `https_guard/https_guard.bpf.c:334-335` | Calls `blocklist_check(ip->saddr)` as first processing step |
 | Userspace Blocklist singleton | `actions/Blocklist.hpp`, `actions/Blocklist.cpp` | Wraps BPF map fd; provides `add()`, `contains()`, `adopt()`, `formatIp()` |
 | Countermeasure action (blocklist) | `actions/BlocklistAction.hpp`, `actions/BlocklistAction.cpp` | `IAction` implementation that calls `Blocklist::add()` |
-| Countermeasure action (TCP teardown) | `actions/BlockTcpAction.hpp`, `actions/BlockTcpAction.cpp` | `IAction` implementation that sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` |
+| Countermeasure action (TCP teardown) | `actions/BlockTcpAction.hpp`, `actions/BlockTcpAction.cpp` | `IAction` adapter that offloads blocking Netlink I/O via `std::async` |
+| Netlink SOCK_DESTROY RAII wrapper | `actions/TcpDestroyer.hpp`, `actions/TcpDestroyer.cpp` | RAII class: opens fd in constructor, closes in destructor; sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` |
 | Action dispatch | `https_guard/https_guard_program.cpp:64-145` | `ringBufferHandler()` classifies events as actionable and pushes both `BlocklistAddAction` and `BlockTcpAction` |
 | Default TTL | `https_guard/main.cpp:18` | `kDefaultBlocklistTtl = 5 minutes` |
 

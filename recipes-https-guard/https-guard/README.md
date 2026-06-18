@@ -69,7 +69,9 @@ files/
 │   ├── BlocklistAction.hpp                           # Countermeasure action: add src IP to blocklist
 │   ├── BlocklistAction.cpp                           # BlocklistAddAction implementation
 │   ├── BlockTcpAction.hpp                            # Countermeasure action: kill TCP 4-tuple via tcp_drop
-│   ├── BlockTcpAction.cpp                            # BlockTcpAction implementation
+│   ├── BlockTcpAction.cpp                            # BlockTcpAction implementation (std::async wrapper)
+│   ├── TcpDestroyer.hpp                              # RAII wrapper: Netlink SOCK_DESTROY lifecycle
+│   ├── TcpDestroyer.cpp                              # TcpDestroyer implementation
 │   └── blocklist.bpf.h                               # BPF-side blocklist header (XDP_DROP check)
 ```
 
@@ -420,16 +422,28 @@ class BlockTcpAction final : public IAction {
 };
 ```
 
+### Architecture
+
+The TCP teardown logic is split across two classes:
+
+| Class | Role | File |
+|-------|------|------|
+| `TcpDestroyer` | RAII wrapper: opens a `NETLINK_INET_DIAG` socket in the constructor, closes it in the destructor. Provides a synchronous `execute()` method that performs the Netlink SOCK_DESTROY send/recv. | `TcpDestroyer.hpp`, `TcpDestroyer.cpp` |
+| `BlockTcpAction` | `IAction` adapter that constructs a `TcpDestroyer` in its `execute_async()` coroutine and offloads the blocking call via `std::async`. | `BlockTcpAction.hpp`, `BlockTcpAction.cpp` |
+
 ### How it works
 
-On execution, `BlockTcpAction::execute_async()`:
+`BlockTcpAction::execute_async()` is a Boost.Asio coroutine that:
 
-1. Opens a `NETLINK_INET_DIAG` socket (`SOCK_DGRAM | SOCK_CLOEXEC`).
-2. Builds an `inet_diag_req_v2` struct with `SOCK_DESTROY` as the Netlink message type, matching `AF_INET`, `IPPROTO_TCP`, and all TCP states (`0xFFF`).
-3. Sets `idiag_cookie[0]` and `idiag_cookie[1]` to `~0ULL` — the kernel interprets this as "don't care / match any socket".
-4. Sends the destroy command via `sendmsg()` to the kernel.
-5. Reads the kernel's reply via `recvmsg()` — `NLMSG_ERROR` with `error == 0` indicates the destroy request was accepted.
-6. Logs success or failure (with `strerror(errno)` on error).
+1. **Constructs a `TcpDestroyer`** via `std::make_shared<TcpDestroyer>(...)` — the constructor opens a `NETLINK_INET_DIAG` socket (`SOCK_DGRAM | SOCK_CLOEXEC`). The `shared_ptr` keeps the destroyer alive across the `std::async` boundary.
+2. **Offloads the blocking call** with `std::async(std::launch::async, ...)` — the synchronous `TcpDestroyer::execute()` runs on a C++ runtime-managed thread pool:
+   - Builds an `inet_diag_req_v2` struct with `SOCK_DESTROY` as the Netlink message type, matching `AF_INET`, `IPPROTO_TCP`, and all TCP states (`0xFFF`).
+   - Sets `idiag_cookie[0]` and `idiag_cookie[1]` to `~0ULL` — the kernel interprets this as "don't care / match any socket".
+   - Sends the destroy command via `sendmsg()` to the kernel.
+   - Reads the kernel's reply via `recvmsg()` — `NLMSG_ERROR` with `error == 0` indicates the destroy request was accepted.
+   - Logs success or failure (with `strerror(errno)` on error).
+3. **Polls the returned `std::future<bool>`** — a tight loop checks `future.wait_for(1ms)` and yields back to the ActionLoop's `io_context` via `co_await boost::asio::post(boost::asio::use_awaitable)` between each check, ensuring other coroutines are not starved.
+4. **RAII cleanup** — when the `shared_ptr`'s last copy goes out of scope (after the `std::async` task completes), the `TcpDestroyer` destructor closes the Netlink fd automatically, eliminating any risk of fd leaks.
 
 ### `tcp_drop` / `SOCK_DESTROY` semantics (Linux 4.10+)
 
