@@ -12,7 +12,7 @@ typedef unsigned int       uint32_t;
 typedef unsigned long long uint64_t;
 #else
 #include <stdint.h>
-#endif
+#endif // __BPF__
 
 #define HG_COMM_LEN            16
 #define HG_IP_STR_LEN          32

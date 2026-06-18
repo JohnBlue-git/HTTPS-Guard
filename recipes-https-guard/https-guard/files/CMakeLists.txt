@@ -118,19 +118,19 @@ if(HTTPS_GUARD_BUILD_BPF)
 endif()
 
 add_executable(action_runner
-    actions/main.cpp
-    actions/ActionLoop.cpp
+    actions/core/main.cpp
+    actions/core/ActionLoop.cpp
 )
 
 add_executable(https_guardd
     https_guard/main.cpp
     https_guard/https_guard_program.cpp
-    actions/ActionLoop.cpp
-    actions/Blocklist.cpp
-    actions/LogAction.cpp
-    actions/BlocklistAction.cpp
-    actions/BlockTcpAction.cpp
-    actions/TcpDestroyer.cpp
+    actions/core/ActionLoop.cpp
+    actions/log/LogAction.cpp
+    actions/blocklist/Blocklist.cpp
+    actions/blocklist/BlocklistAction.cpp
+    actions/tcp/BlockTcpAction.cpp
+    actions/tcp/TcpDestroyer.cpp
     ebpf/bpf_program.cpp
 )
 
@@ -144,7 +144,10 @@ foreach(target IN ITEMS https_guardd action_runner)
         PRIVATE
         https_guard
         actions
-        coroutine
+        actions/core
+        actions/blocklist
+        actions/tcp
+        actions/log
         ebpf
         ${LIBBPF_INCLUDE_DIRS}
         ${nlohmann_json_INCLUDE_DIRS}

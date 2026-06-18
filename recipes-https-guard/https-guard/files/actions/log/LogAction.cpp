@@ -7,7 +7,7 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 
-#include "../coroutine/async_mutex.hpp"
+#include "async_mutex.hpp"
 #include "LogAction.hpp"
 
 namespace asio = boost::asio;

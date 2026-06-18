@@ -5,11 +5,6 @@
 #include <string>
 #include <vector>
 
-#include "ActionLoop.hpp"
-#include "events.h"
-#include "pattern_detector.hpp"
-#include "tls_version.hpp"
-
 namespace https_guard {
 
 class BpfProgram {

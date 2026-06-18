@@ -55,31 +55,31 @@ SRC_URI = " \
     file://simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
-    file://https_guard/main.cpp \
     file://https_guard/events.h \
+    file://https_guard/https_guard.bpf.c \
     file://https_guard/redfish_event_message.hpp \
     file://https_guard/pattern_detector.hpp \
     file://https_guard/tls_version.hpp \
+    file://https_guard/main.cpp \
     file://https_guard/https_guard_program.hpp \
     file://https_guard/https_guard_program.cpp \
-    file://https_guard/https_guard.bpf.c \
     file://ebpf/bpf_program.hpp \
     file://ebpf/bpf_program.cpp \
-    file://actions/ActionLoop.hpp \
-    file://actions/ActionLoop.cpp \
-    file://actions/Blocklist.hpp \
-    file://actions/Blocklist.cpp \
-    file://actions/blocklist.bpf.h \
-    file://actions/LogAction.hpp \
-    file://actions/LogAction.cpp \
-    file://actions/BlocklistAction.hpp \
-    file://actions/BlocklistAction.cpp \
-    file://actions/TcpDestroyer.hpp \
-    file://actions/TcpDestroyer.cpp \
-    file://actions/BlockTcpAction.hpp \
-    file://actions/BlockTcpAction.cpp \
-    file://actions/main.cpp \
-    file://coroutine/async_mutex.hpp \
+    file://actions/core/main.cpp \
+    file://actions/core/ActionLoop.hpp \
+    file://actions/core/ActionLoop.cpp \
+    file://actions/log/async_mutex.hpp \
+    file://actions/log/LogAction.hpp \
+    file://actions/log/LogAction.cpp \
+    file://actions/blocklist/Blocklist.hpp \
+    file://actions/blocklist/Blocklist.cpp \
+    file://actions/blocklist/blocklist.bpf.h \
+    file://actions/blocklist/BlocklistAction.hpp \
+    file://actions/blocklist/BlocklistAction.cpp \
+    file://actions/tcp/TcpDestroyer.hpp \
+    file://actions/tcp/TcpDestroyer.cpp \
+    file://actions/tcp/BlockTcpAction.hpp \
+    file://actions/tcp/BlockTcpAction.cpp \
 "
 
 S = "${UNPACKDIR}"

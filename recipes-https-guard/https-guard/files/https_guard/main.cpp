@@ -8,9 +8,9 @@
 #include <iostream>
 #include <string>
 
-#include "ActionLoop.hpp"
-#include "LogAction.hpp"
 #include "https_guard_program.hpp"
+#include "core/ActionLoop.hpp"
+#include "log/LogAction.hpp"
 
 namespace {
 

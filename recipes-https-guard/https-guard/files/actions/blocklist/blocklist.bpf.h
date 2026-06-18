@@ -35,6 +35,6 @@ static __always_inline int blocklist_check(__u32 src_ip_v4)
     return XDP_DROP;
 }
 
-#endif
+#endif // __cplusplus
 
-#endif
+#endif /* HTTPS_GUARD_BLOCKLIST_BPF_H */

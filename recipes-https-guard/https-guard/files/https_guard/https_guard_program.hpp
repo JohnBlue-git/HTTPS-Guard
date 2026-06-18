@@ -8,9 +8,7 @@
 #include "tls_version.hpp"
 #include "pattern_detector.hpp"
 #include "redfish_event_message.hpp"
-#include "ActionLoop.hpp"
-#include "Blocklist.hpp"
-#include "BlocklistAction.hpp"
+#include "core/ActionLoop.hpp"
 
 namespace https_guard {
 

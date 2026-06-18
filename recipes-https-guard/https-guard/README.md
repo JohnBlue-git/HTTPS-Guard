@@ -16,13 +16,13 @@ This directory contains the complete source code of the **HTTPS-Guard** agent �
 - [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
 - [C++ Daemon (`https_guard/main.cpp`)](#c-daemon-https_guardmaincpp)
 - [Pattern Detector (`https_guard/pattern_detector.hpp`)](#pattern-detector-https_guardpattern_detectorhpp)
-- [ActionLoop — Async Event Dispatcher (`actions/ActionLoop.hpp`)](#actionloop--async-event-dispatcher-actionsactionloophpp)
-- [LogAction — Async File Writer (`actions/LogAction.hpp`)](#logaction--async-file-writer-actionslogactionhpp)
-- [Blocklist — Source IP Blocklist Manager (`actions/Blocklist.hpp`)](#blocklist--source-ip-blocklist-manager-actionsblocklisthpp)
-- [BlocklistAddAction — Countermeasure Action (`actions/BlocklistAction.hpp`)](#blocklistaddaction--countermeasure-action-actionsblocklistactionhpp)
-- [BlockTcpAction — TCP Connection Teardown (`actions/BlockTcpAction.hpp`)](#blocktcpaaction--tcp-connection-teardown-actionsblocktcpaactionhpp)
-- [Blocklist BPF Header (`actions/blocklist.bpf.h`)](#blocklist-bpf-header-actionsblocklistbpfh)
-- [AsyncFileStreamManager — Coroutine-Safe File Writer (`coroutine/async_mutex.hpp`)](#asyncfilestreammanager--coroutine-safe-file-writer-coroutineasync_mutexhpp)
+- [ActionLoop — Async Event Dispatcher (`actions/core/ActionLoop.hpp`)](#actionloop--async-event-dispatcher-actionscoreactionloophpp)
+- [LogAction — Async File Writer (`actions/log/LogAction.hpp`)](#logaction--async-file-writer-actionsloglogactionhpp)
+- [Blocklist — Source IP Blocklist Manager (`actions/blocklist/Blocklist.hpp`)](#blocklist--source-ip-blocklist-manager-actionsblocklistblocklisthpp)
+- [BlocklistAddAction — Countermeasure Action (`actions/blocklist/BlocklistAction.hpp`)](#blocklistaddaction--countermeasure-action-actionsblocklistblocklistactionhpp)
+- [BlockTcpAction — TCP Connection Teardown (`actions/tcp/BlockTcpAction.hpp`)](#blocktcpaaction--tcp-connection-teardown-actionstcpblocktcpaactionhpp)
+- [Blocklist BPF Header (`actions/blocklist/blocklist.bpf.h`)](#blocklist-bpf-header-actionsblocklistblocklistbpfh)
+- [AsyncFileStreamManager — Coroutine-Safe File Writer (`actions/log/async_mutex.hpp`)](#asyncfilestreammanager--coroutine-safe-file-writer-actionslogasync_mutexhpp)
 - [Redfish Event Message (`https_guard/redfish_event_message.hpp`)](#redfish-event-message-https_guardredfish_event_messagehpp)
 - [TLS Version (`https_guard/tls_version.hpp`)](#tls-version-https_guardtls_versionhpp)
 - [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
@@ -44,8 +44,6 @@ files/
 ├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
 ├── simulated-event-generator.service                 # systemd unit for synthetic event generator
 ├── simulated-event-generator.sh                      # Shell script that emits simulated events
-├── coroutine/
-│   └── async_mutex.hpp                               # AsyncFileStreamManager (coroutine-safe file I/O)
 ├── ebpf/
 │   ├── bpf_program.hpp                                # BPF program attachment wrapper
 │   └── bpf_program.cpp                                # BPF program wrapper implementation
@@ -59,20 +57,25 @@ files/
 │   ├── redfish_event_message.hpp                     # Redfish Event message with formatting (inline)
 │   └── tls_version.hpp                               # TLS version helpers (inline)
 ├── actions/
-│   ├── main.cpp                                      # ActionLoop smoke-test / demo entry point
-│   ├── ActionLoop.hpp                                # Boost.Asio-based event dispatcher interface
-│   ├── ActionLoop.cpp                                # Boost.Asio-based event dispatcher implementation
-│   ├── LogAction.hpp                                 # Async file-logging action interface
-│   ├── LogAction.cpp                                 # Async file-logging action implementation
-│   ├── Blocklist.hpp                                 # Singleton blocklist manager (BPF map wrapper)
-│   ├── Blocklist.cpp                                 # Blocklist singleton implementation
-│   ├── BlocklistAction.hpp                           # Countermeasure action: add src IP to blocklist
-│   ├── BlocklistAction.cpp                           # BlocklistAddAction implementation
-│   ├── BlockTcpAction.hpp                            # Countermeasure action: kill TCP 4-tuple via tcp_drop
-│   ├── BlockTcpAction.cpp                            # BlockTcpAction implementation (std::async wrapper)
-│   ├── TcpDestroyer.hpp                              # RAII wrapper: Netlink SOCK_DESTROY lifecycle
-│   ├── TcpDestroyer.cpp                              # TcpDestroyer implementation
-│   └── blocklist.bpf.h                               # BPF-side blocklist header (XDP_DROP check)
+│   ├── core/
+│   │   ├── ActionLoop.hpp                            # Boost.Asio-based event dispatcher interface
+│   │   ├── ActionLoop.cpp                            # Boost.Asio-based event dispatcher implementation
+│   │   └── main.cpp                                  # ActionLoop smoke-test / demo entry point
+│   ├── blocklist/
+│   │   ├── blocklist.bpf.h                           # BPF-side blocklist header (XDP_DROP check)
+│   │   ├── Blocklist.hpp                             # Singleton blocklist manager (BPF map wrapper)
+│   │   ├── Blocklist.cpp                             # Blocklist singleton implementation
+│   │   ├── BlocklistAction.hpp                       # Countermeasure action: add src IP to blocklist
+│   │   └── BlocklistAction.cpp                       # BlocklistAddAction implementation
+│   ├── tcp/
+│   │   ├── BlockTcpAction.hpp                        # Countermeasure action: kill TCP 4-tuple via tcp_drop
+│   │   ├── BlockTcpAction.cpp                        # BlockTcpAction implementation (Netlink async)
+│   │   ├── TcpDestroyer.hpp                          # RAII wrapper: Netlink SOCK_DESTROY lifecycle
+│   │   └── TcpDestroyer.cpp                          # TcpDestroyer implementation
+│   └── log/
+│       ├── async_mutex.hpp                           # AsyncFileStreamManager (coroutine-safe file I/O)
+│       ├── LogAction.hpp                             # Async file-logging action interface
+│       └── LogAction.cpp                             # Async file-logging action implementation
 ```
 
 ---
@@ -302,7 +305,7 @@ The user-space anomaly detection engine applies a set of **static signature rule
 
 ---
 
-## ActionLoop — Async Event Dispatcher (`actions/ActionLoop.hpp`)
+## ActionLoop — Async Event Dispatcher (`actions/core/ActionLoop.hpp`)
 
 The `ActionLoop` is a singleton that decouples eBPF event callback processing from downstream I/O (logging, D-Bus, blocklist updates, TCP teardown). It wraps a Boost.Asio `io_context` running on a dedicated background thread:
 
@@ -344,7 +347,7 @@ All actions implement `boost::asio::awaitable<void> execute_async()`, enabling c
 
 ---
 
-## LogAction — Async File Writer (`actions/LogAction.hpp`)
+## LogAction — Async File Writer (`actions/log/LogAction.hpp`)
 
 `LogAction` writes a JSON event line to a log file asynchronously, cooperating with the `ActionLoop` and `AsyncFileStreamManager`.
 
@@ -360,7 +363,7 @@ Writing to the filesystem directly from the eBPF ring-buffer callback would bloc
 
 ---
 
-## Blocklist — Source IP Blocklist Manager (`actions/Blocklist.hpp`)
+## Blocklist — Source IP Blocklist Manager (`actions/blocklist/Blocklist.hpp`)
 
 `Blocklist` is a singleton that wraps the shared BPF map (`src_blocklist`, a `BPF_MAP_TYPE_HASH`) that stores source IP → expiry timestamp mappings. It is the userspace interface for **hybrid enforcement**.
 
@@ -382,7 +385,7 @@ Writing to the filesystem directly from the eBPF ring-buffer callback would bloc
 
 ---
 
-## BlocklistAddAction — Countermeasure Action (`actions/BlocklistAction.hpp`)
+## BlocklistAddAction — Countermeasure Action (`actions/blocklist/BlocklistAction.hpp`)
 
 `BlocklistAddAction` is an `IAction` that adds a single source IP address to the blocklist with a configurable TTL. It is pushed by `ringBufferHandler` when an event is classified as **actionable** (TLS version violation or confirmed attack signature).
 
@@ -402,7 +405,7 @@ On execution, it calls `Blocklist::instance().add(src_ip_v4_, ttl_)`. Success/fa
 
 ---
 
-## BlockTcpAction — TCP Connection Teardown (`actions/BlockTcpAction.hpp`)
+## BlockTcpAction — TCP Connection Teardown (`actions/tcp/BlockTcpAction.hpp`)
 
 `BlockTcpAction` is an `IAction` that instantly kills a specific TCP socket tuple using the kernel's `tcp_drop` facility (available via `NETLINK_INET_DIAG` + `SOCK_DESTROY`). It is pushed by `ringBufferHandler` alongside `BlocklistAddAction` whenever an event is classified as **actionable**.
 
@@ -458,7 +461,7 @@ The TCP teardown logic is split across two classes:
 
 ---
 
-## Blocklist BPF Header (`actions/blocklist.bpf.h`)
+## Blocklist BPF Header (`actions/blocklist/blocklist.bpf.h`)
 
 This header is shared between the BPF C code and the C++ userspace. It defines:
 
@@ -475,7 +478,7 @@ The XDP program in `https_guard.bpf.c` includes this header via `#include "../ac
 
 ---
 
-## AsyncFileStreamManager — Coroutine-Safe File Writer (`coroutine/async_mutex.hpp`)
+## AsyncFileStreamManager — Coroutine-Safe File Writer (`actions/log/async_mutex.hpp`)
 
 The `AsyncFileStreamManager` provides coroutine-safe, asynchronous file writing for the `ActionLoop` framework. It solves the problem of multiple concurrent coroutines needing to write to the same log file without blocking or interleaving lines.
 
@@ -594,9 +597,9 @@ public:
 - **BPF object build** (optional via `HTTPS_GUARD_BUILD_BPF`):
   - Generates a target-kernel `vmlinux.h` using `bpftool btf dump`.
   - Compiles `https_guard/https_guard.bpf.c` with `clang -target bpf` and CO-RE flags.
-- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/ActionLoop.cpp`, `actions/Blocklist.cpp`, `actions/LogAction.cpp`, `actions/BlocklistAction.cpp`, `actions/BlockTcpAction.cpp`, and `ebpf/bpf_program.cpp`.
-- **Secondary target**: `action_runner` — compiles `actions/main.cpp` plus `actions/ActionLoop.cpp` for exercising the dispatcher loop in isolation.
-- **Include paths**: `https_guard/`, `actions/`, `coroutine/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
+- **Target**: `https_guardd` — compiles `https_guard/main.cpp`, `https_guard/https_guard_program.cpp`, `actions/core/ActionLoop.cpp`, `actions/blocklist/Blocklist.cpp`, `actions/log/LogAction.cpp`, `actions/blocklist/BlocklistAction.cpp`, `actions/tcp/BlockTcpAction.cpp`, `actions/tcp/TcpDestroyer.cpp`, and `ebpf/bpf_program.cpp`.
+- **Secondary target**: `action_runner` — compiles `actions/core/main.cpp` plus `actions/core/ActionLoop.cpp` for exercising the dispatcher loop in isolation.
+- **Include paths**: `https_guard/`, `actions/`, `actions/core/`, `actions/blocklist/`, `actions/tcp/`, `actions/log/`, `ebpf/`, libbpf headers, nlohmann_json headers, and Boost headers.
 - **Libraries**: `libbpf` + `nlohmann_json::nlohmann_json`.
 - **Compile definitions**: `BOOST_ERROR_CODE_HEADER_ONLY` for all targets.
 
@@ -656,7 +659,7 @@ The recipe sources include all source files under `files/`:
 - systemd unit files
 - Config file (`https-guard.conf`)
 - CMake build definition (`CMakeLists.txt`)
-- All C++ source and header files under `https_guard/`, `actions/`, `ebpf/`, and `coroutine/`, including the new `BlockTcpAction.hpp` and `BlockTcpAction.cpp`.
+- All C++ source and header files under `https_guard/`, `actions/`, and `ebpf/`.
 
 ---
 

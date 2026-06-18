@@ -2,10 +2,10 @@
 #include <utility>
 
 #include "https_guard_program.hpp"
-#include "Blocklist.hpp"
-#include "LogAction.hpp"
-#include "BlocklistAction.hpp"
-#include "BlockTcpAction.hpp"
+#include "log/LogAction.hpp"
+#include "blocklist/Blocklist.hpp"
+#include "blocklist/BlocklistAction.hpp"
+#include "tcp/BlockTcpAction.hpp"
 
 namespace https_guard {
 
@@ -76,7 +76,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
     std::string message;
     bool         actionable = false;
 
-    if (evt->event_type == HG_EVENT_TLS_VERSION_VIOLATION) {
+    if (evt->event_type == HG_EVENT_TLS_VERSION_VIOLATION)
+    {
         severity   = "Critical";
         message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
         message    = "Security violation: Process '" + std::string(evt->process) +
@@ -84,8 +85,10 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
                      ") attempted an HTTPS connection using an insecure TLS version (" +
                      TlsVersion(evt->tls_version).toString() + "). Packet was blocked.";
         actionable = true;
-    } else if (evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED ||
-               evt->event_type == HG_EVENT_HTTP_PAYLOAD_OBSERVED) {
+    }
+    else if (evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED ||
+            evt->event_type == HG_EVENT_HTTP_PAYLOAD_OBSERVED)
+    {
         std::string matched_rule;
         const bool suspicious = detector_.isSuspicious(evt->payload_snippet, matched_rule) ||
                                 evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED;
@@ -105,7 +108,9 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
                      "), rule '" + matched_rule +
                      "'. Source should be quarantined.";
         actionable = true;
-    } else {
+    }
+    else
+    {
         return 0;
     }
 
@@ -117,14 +122,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         event_msg.format(),
         output_path_));
 
-    if (actionable && evt->src_ip_v4 != 0) {
-        // BlocklistAction — prevent future connections from this source IP
-        action_loop_.pushAction(
-            std::make_unique<BlocklistAddAction>(
-            evt->src_ip_v4,
-            blocklist_ttl_,
-            message));
-
+    if (actionable && evt->src_ip_v4 != 0)
+    {
         // BlockTcpAction — kill the specific TCP connection immediately
         // using the kernel's tcp_drop (SOCK_DESTROY) facility, which
         // tears down the socket without touching the owning process.
@@ -135,7 +134,15 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
             evt->src_port,
             evt->dst_port,
             message));
+
+        // BlocklistAction — prevent future connections from this source IP
+        action_loop_.pushAction(
+            std::make_unique<BlocklistAddAction>(
+            evt->src_ip_v4,
+            blocklist_ttl_,
+            message));
     }
+
     return 0;
 }
 

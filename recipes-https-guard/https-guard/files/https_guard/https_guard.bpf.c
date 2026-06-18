@@ -22,7 +22,7 @@
 /* Hybrid enforcement: see actions/blocklist.bpf.h. The early-return XDP_DROP
  * check lives entirely in this header so the .bpf.c detection logic
  * stays uncluttered. */
-#include "../actions/blocklist.bpf.h"
+#include "../actions/blocklist/blocklist.bpf.h"
 
 /* BPF C is C99 without a standard library; provide bool ourselves. */
 #ifndef bool
