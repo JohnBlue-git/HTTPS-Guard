@@ -32,21 +32,30 @@ bool HttpGuardProgram::attachProgram() noexcept
     }
 
     bpf_link* xdp_link = bpf_program__attach_xdp(xdp_prog, ifindex_);
-    if (!xdp_link) {
+    if (!xdp_link || libbpf_get_error(xdp_link)) {
         return false;
     }
     links_.push_back(xdp_link);
 
     bpf_program* uprobe_prog = bpf_object__find_program_by_name(object_, "https_guard_ssl_write");
     if (!uprobe_prog) {
-        return false;
-    }
+        std::cerr << "https_guard: OpenSSL uprobe program missing; continuing with XDP only\n";
+    } else {
+        bpf_uprobe_opts uprobe_opts = {};
+        uprobe_opts.sz = sizeof(uprobe_opts);
+        uprobe_opts.retprobe = false;
+        uprobe_opts.func_name = "SSL_write";
 
-    bpf_link* uprobe_link = bpf_program__attach_uprobe(uprobe_prog, false, -1, openssl_lib_path_.c_str(), 0);
-    if (!uprobe_link) {
-        return false;
+        bpf_link* uprobe_link = bpf_program__attach_uprobe_opts(
+            uprobe_prog, -1, openssl_lib_path_.c_str(), 0, &uprobe_opts);
+        if (!uprobe_link || libbpf_get_error(uprobe_link)) {
+            std::cerr << "https_guard: failed to attach SSL_write uprobe at '"
+                      << openssl_lib_path_
+                      << "'; continuing with XDP only\n";
+        } else {
+            links_.push_back(uprobe_link);
+        }
     }
-    links_.push_back(uprobe_link);
 
     /* Adopt the blocklist map so ringBufferHandler can populate it after
      * classifying an event.  This is the only "countermeasure" touch

@@ -13,7 +13,7 @@ CONF_FILE="/etc/default/https-guard"
 DAEMON="/usr/sbin/https-guardd"
 BPF_OBJ="${HTTPS_GUARD_BPF_OBJ:-/usr/share/https-guard/https_guard.bpf.o}"
 IFACE="${HTTPS_GUARD_IFACE:-eth0}"
-SSL_LIB="${HTTPS_GUARD_SSL_LIB:-/usr/lib/x86_64-linux-gnu/libssl.so.3}"
+SSL_LIB="${HTTPS_GUARD_SSL_LIB:-/usr/lib/libssl.so.3}"
 OUTPUT="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
 
 # Verify the daemon binary exists

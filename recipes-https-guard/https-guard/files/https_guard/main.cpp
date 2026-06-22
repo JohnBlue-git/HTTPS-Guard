@@ -36,7 +36,7 @@ int main(int argc, char** argv)
     runtime_config cfg {
         .bpf_object_path = "./build/https_guard.bpf.o",
         .iface = "eth0",
-        .openssl_lib_path = "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+        .openssl_lib_path = "/usr/lib/libssl.so.3",
         .output_path = "/var/log/redfish/https_guard_events.log",
     };
 

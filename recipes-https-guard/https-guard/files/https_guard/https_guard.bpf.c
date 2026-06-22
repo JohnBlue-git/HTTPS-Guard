@@ -180,8 +180,6 @@ parse_tls_clienthello(struct hg_event *evt,
                       const unsigned char *payload_end)
 {
     const unsigned char *cursor = tcp_payload + 5;
-    const unsigned char *ext_end;
-    int i;
 
     /* --- Handshake protocol --- */
     if (cursor + 4 > payload_end)
@@ -238,71 +236,9 @@ parse_tls_clienthello(struct hg_event *evt,
         return;
     cursor += cm_len;
 
-    /* --- Extensions --- */
-    if (cursor + 2 > payload_end)
-        return;
-    int ext_total_len = ((int)cursor[0] << 8) | cursor[1];
-    cursor += 2;
-    if (cursor + ext_total_len > payload_end)
-        return;
-
-    /*
-     * Walk extensions.  We are interested in:
-     *   0x0000  –  Server Name Indication (SNI)
-     */
-    ext_end = cursor + ext_total_len;
-    int sni_len = 0;
-
-    while (cursor + 4 <= ext_end) {
-        __u16 ext_type = ((__u16)cursor[0] << 8) |
-                          (__u16)cursor[1];
-        __u16 ext_len  = ((__u16)cursor[2] << 8) |
-                          (__u16)cursor[3];
-        cursor += 4;
-
-        if (cursor + ext_len > ext_end)
-            return;
-
-        if (ext_type == 0x0000 && ext_len > 0) {
-            /* SNI list entry: ServerNameList length (2 bytes) */
-            if (cursor + 2 > ext_end)
-                return;
-            int sni_list_len = ((int)cursor[0] << 8) |
-                                cursor[1];
-            if (sni_list_len < 3 || sni_list_len > ext_len)
-                return;
-            cursor += 2;
-
-            /* First (and usually only) entry:
-             *   - NameType (1 byte, 0 = host_name)
-             *   - NameLength (2 bytes)
-             *   - Name (variable) */
-            if (cursor + 3 > ext_end)
-                return;
-            __u8 name_type = cursor[0];
-            int name_len = ((int)cursor[1] << 8) |
-                            cursor[2];
-            cursor += 3;
-
-            if (name_type == 0 && name_len > 0) {
-                if (cursor + name_len > ext_end)
-                    return;
-                int copy_sz = name_len < (int)sizeof(evt->sni) - 1
-                                  ? name_len
-                                  : (int)sizeof(evt->sni) - 1;
-                for (i = 0; i < (int)sizeof(evt->sni) - 1; i++) {
-                    if (i >= copy_sz)
-                        break;
-                    evt->sni[i] = cursor[i];
-                }
-                evt->sni[copy_sz] = '\0';
-                sni_len = copy_sz;
-            }
-            break;
-        }
-        cursor += ext_len;
-    }
-    (void)sni_len;
+    /* SNI extraction requires deeper variable-length parsing than the XDP
+     * verifier accepts reliably here. Keep the TLS version metadata path and
+     * leave evt->sni empty instead of rejecting the whole program. */
 }
 
 SEC("xdp")
