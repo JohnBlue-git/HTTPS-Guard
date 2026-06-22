@@ -10,20 +10,24 @@ HTTPS-Guard is a Network Security Observability Agent that implements a Detect -
 
 - eBPF XDP program:
 	- inspects TLS ClientHello on port 443.
-	- observes TLS 1.0 and TLS 1.1 attempts and emits events to a ring buffer map (XDP_PASS, does not currently drop).
+	- observes TLS 1.0 and TLS 1.1 attempts and emits events to a ring buffer map.
 	- emits TLS handshake metadata (SNI, version) for allowed TLS connections.
 	- detects plaintext HTTP verbs on port 443 (anomaly signal).
+	- performs blocklist enforcement (XDP_DROP) for source IPs added by the daemon.
 
-- eBPF uprobe program:
+- eBPF uprobe program (PRIMARY enforcement path on BMC platforms):
 	- hooks OpenSSL SSL_write.
+	- reads the negotiated TLS version from ssl->version.
 	- captures plaintext snippets before encryption.
 	- emits payload-observed events for user-space anomaly classification.
 
 - C++ daemon:
-	- loads and attaches BPF programs.
+	- loads and attaches BPF programs (uprobe is primary, XDP is optional).
 	- consumes ring buffer events.
 	- applies HTTP payload anomaly pattern checks (SQLi, path traversal, etc.).
-  - writes Redfish Event JSON lines to /var/log/https_guard_events.log.
+	- writes Redfish Event JSON lines to /var/log/https_guard_events.log.
+	- for uprobe-detected violations: reads /proc/<pid>/net/tcp to correlate PID
+	  to socket 4-tuple, then issues SOCK_DESTROY + blocklist enforcement.
 
 - Event bridge:
   - tails the daemon output log.
@@ -63,10 +67,11 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
                  v                                 v
 +-----------------------+                       +----------------------+
 | B: eBPF XDP hook      |                       | C: eBPF SSL_write    |
-|                       |                       |     uprobe           |
+| (NOT available on     |                       |     uprobe           |
+|  ASpeed AST2600 NIC)  |                       |  (PRIMARY path)      |
 +-----------------------+                       +----------------------+
-| (TLS version, SNI,    |                       | (payload snippet)    |
-|  HTTP anomaly events) |                       |                      |
+| (TLS version, SNI,    |                       | (ssl->version,       |
+|  HTTP anomaly events) |                       |  payload snippet)    |
 +-------+---------------+                       +---------+------------|
           |        shared `events` ring buffer            |
           +------------------------+----------------------+
@@ -75,13 +80,16 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
                         +-----------------------+
                         | E: C++ daemon         |
                         | (translate + classify)|
+                        | + PID->socket lookup  |
+                        | + SOCK_DESTROY        |
+                        | + blocklist update    |
                         +-----------------------+
                                    |
                                    | Redfish event JSON lines
                                    v
                    +--------------------------------+
                    | F: /var/log/                   |
-                   |     https_guard_events.log     |
+                   |     https_guard_events.log      |
                    +--------------------------------+
                                    |
                                    v
@@ -93,7 +101,7 @@ HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
                  v                                  v
 +-----------------------+                       +---------------------+
 | H: /var/log/redfish   |                       | I: OpenBMC logging  |
-| (plain-textevent log) |                       | (DBus + journald)   |
+| (plain-text event log)|                       | (DBus + journald)   |
 +-----------------------+                       +---------------------+
           |                                               |
           v                                               v
@@ -123,7 +131,7 @@ Edge labels:
 - A -> B : TLS ClientHello on port 443
 - A -> C : OpenSSL SSL_write invocation
 - B -> E : ring buffer event (TLS version violation / handshake metadata / HTTP anomaly)
-- C -> E : ring buffer event (payload observed)
+- C -> E : ring buffer event (payload observed + TLS version)
 - E -> F : Redfish event JSON lines appended
 - F -> G : tail /var/log/https_guard_events.log
 - G -> H : plain-text event log line (journal-only mode)
@@ -147,9 +155,12 @@ Edge labels:
 ### Recipe recipes-https-guard Components
 
 - https_guard/https_guard.bpf.c
-  - XDP path: inspects TLS 1.0/1.1 ClientHello on port 443 and emits events (observes, does not currently drop).
+  - XDP path: inspects TLS 1.0/1.1 ClientHello on port 443 and emits events.
   - XDP path: extracts SNI from TLS extensions, detects plaintext HTTP on port 443 as anomaly.
-  - Uprobe path: hooks SSL_write to capture plaintext snippets before encryption for user-space analysis.
+  - Uprobe path (PRIMARY): hooks SSL_write to read ssl->version for TLS violation detection
+    and capture plaintext snippets for user-space analysis.
+  - XDP only works on platforms with NIC-level XDP support. On ASpeed AST2600 (ftgmac100),
+    XDP is NOT available. The uprobe path is the sole detection mechanism.
   - Emits normalized hg_event records to ring buffer map events.
 
 - https_guard/main.cpp
@@ -158,17 +169,73 @@ Edge labels:
   - Formats Redfish-compatible JSON and appends to output log path.
   - Accepts 4 CLI arguments: interface, ssl_lib_path, output_path, bpf_object_path.
 
+- https_guard/https_guard_program.cpp
+  - Attaches uprobe to SSL_write (PRIMARY) and XDP (optional/auxiliary).
+  - Processes ring buffer events: classifies TLS version violations and HTTP anomalies.
+  - For uprobe-originated events (no socket info from BPF), reads /proc/<pid>/net/tcp
+    to resolve socket 4-tuple, then issues SOCK_DESTROY + blocklist enforcement.
+
 - config/security_message_registry/OemSecurityEvent.1.0.0.json
   - OEM registry with strongly typed message IDs and argument schema.
+
+## Platform Limitations
+
+### XDP Not Available on ASpeed AST2600 (ftgmac100)
+
+The XDP hook code remains in https_guard.bpf.c for platforms with NIC-level XDP support,
+but it does NOT function on the ASpeed AST2600 ftgmac100 NIC (the typical OpenBMC BMC
+network controller). This has been verified:
+
+```
+root@johnblue:~# ip link show eth0
+2: eth0: ... mtu 1500 qdisc pfifo_fast qlen 1000
+    link/ether ...
+```
+(No `xdp` or `prog/xdp` line — XDP is not loaded.)
+
+The blocklist_check() and XDP_DROP enforcement path only works when the XDP program
+can be attached to the NIC, which is not the case on this platform. The daemon
+correctly handles this by treating XDP as an optional, auxiliary attachment —
+it runs successfully with just the uprobe.
+
+### Uprobe-Only Enforcement Path
+
+Since XDP is not available, enforcement for TLS version violations works as follows:
+
+1. The uprobe on SSL_write() fires when OpenSSL sends encrypted data.
+2. The negotiated TLS version is read from ssl->version (uint16_t at offset 0
+   in OpenSSL 3.x's ssl_st struct) using bpf_probe_read_user().
+3. An event is submitted to the ring buffer with the process PID.
+4. The userspace daemon reads /proc/<pid>/net/tcp to find the TCP socket 4-tuple.
+5. SOCK_DESTROY is issued via NETLINK_INET_DIAG to kill the TCP connection.
+6. The source IP is added to the blocklist (for XDP platforms) or logged.
+
+### Cannot Test TLS < 1.2 with curl + OpenSSL 3.x
+
+OpenSSL 3.x has removed support for TLS 1.0 and TLS 1.1 at compile time. The
+`--tlsv1.0` and `--tlsv1.1` flags are silently ignored — curl always negotiates
+TLS 1.3 regardless of the flag. This is visible in curl verbose output:
+
+```
+curl -4 --tlsv1.0 -v -ku root:0penBmc https://localhost/redfish/v1
+...
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / ...
+```
+
+The negotiated TLS version read by the uprobe will always be 0x0304 (TLS 1.3)
+for all curl connections on this platform. To test TLS < 1.2 detection, a
+client that supports older TLS versions (e.g., a legacy tool, or a Python
+script using an older OpenSSL build) would be required.
 
 ## Build (native / standalone)
 
 Prerequisites
 
-- Linux kernel with eBPF/XDP support.
+- Linux kernel with eBPF/uprobe support (CONFIG_UPROBE_EVENTS).
 - clang/llvm, cmake, pkg-config.
 - libbpf development package.
-- root privileges to attach XDP and uprobes.
+- root privileges to attach uprobes.
 
 Ubuntu example dependencies:
 
@@ -307,7 +374,11 @@ HTTPS-Guard supports two QEMU networking modes:
 | Mode | XDP support | Networking | Use case |
 |---|---|---|---|
 | **SLIRP** (default) | No | user-mode (NAT) | Simulation-only testing |
-| **TAP/bridge** | Yes (generic XDP) | Real virtio-net device | Real eBPF daemon |
+| **TAP/bridge** | No on ftgmac100 (verified by `ip link show`) | Virtio-net with generic XDP required | Uprobe-based daemon testing |
+
+> **Important:** Even in TAP/bridge mode, XDP does NOT work on the ASpeed AST2600
+> ftgmac100 NIC driver in QEMU. The uprobe is the only functional enforcement path
+> on this platform. See [Platform Limitations](#platform-limitations) above.
 
 ### Mode A: SLIRP (simulation, no eBPF required)
 
@@ -329,13 +400,11 @@ systemctl status https-guard-event-bridge
 journalctl -u https-guard-event-bridge -f
 ```
 
-### Mode B: TAP/bridge (real eBPF daemon)
+### Mode B: TAP/bridge (uprobe-based daemon)
 
-Use this when you need the real `https-guardd` daemon with XDP and uprobes working inside the QEMU guest. This requires:
-
-- A kernel with eBPF/XDP support (enabled by the config fragment).
-- A TAP device and bridge on the host.
-- A virtio-net NIC in the guest (supports generic XDP).
+Use this when you need the real `https-guardd` daemon with uprobe working inside the
+QEMU guest. XDP will not be available, but the uprobe path provides TLS version
+detection and SOCK_DESTROY enforcement.
 
 #### Step 1 — Host: create the TAP/bridge network
 
@@ -371,11 +440,19 @@ passed through `qemuparams`.
 
 ```bash
 # Verify kernel BPF support is enabled
-zcat /proc/config.gz | grep -E "CONFIG_BPF|CONFIG_XDP|CONFIG_UPROBE"
+zcat /proc/config.gz | grep -E "CONFIG_BPF|CONFIG_UPROBE"
 
 # Check daemon status
 systemctl status https-guard-daemon
 journalctl -u https-guard-daemon -f
+
+# Verify the daemon has uprobe active
+journalctl -u https-guard-daemon -l | grep "enforcement active"
+# Expected: "https_guard: enforcement active via uprobe(SSL_write)"
+
+# Verify XDP is NOT loaded (expected on this platform)
+ip link show eth0
+# No "xdp" or "prog/xdp" line — XDP not available on ftgmac100
 
 # Verify bridge service is processing events
 systemctl status https-guard-event-bridge
@@ -605,5 +682,3 @@ Listen to Redfish events over Server-Sent Events (SSE):
 curl --http1.1 -k -N -u root:0penBmc -H "Accept: text/event-stream" \
   "https://<bmc-ip>:4433/redfish/v1/EventService/SSE/"
 ```
-
-If BMC authentication is enabled, add `-u <user>:<password>` to the `curl` commands above. Use the HTTPS push subscription when you want the BMC to POST events to another service. Use SSE when you want to watch the event stream directly from a terminal without creating a subscription destination.

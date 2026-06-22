@@ -1,3 +1,4 @@
+#include <cstring>
 #include <iostream>
 #include <utility>
 
@@ -6,6 +7,7 @@
 #include "blocklist/Blocklist.hpp"
 #include "blocklist/BlocklistAction.hpp"
 #include "tcp/BlockTcpAction.hpp"
+#include "proc_peer_resolver.hpp"
 
 namespace https_guard {
 
@@ -26,20 +28,15 @@ HttpGuardProgram::HttpGuardProgram(std::string object_path,
 
 bool HttpGuardProgram::attachProgram() noexcept
 {
-    bpf_program* xdp_prog = bpf_object__find_program_by_name(object_, "https_guard_xdp");
-    if (!xdp_prog) {
-        return false;
-    }
+    bool have_uprobe = false;
+    bool have_xdp = false;
 
-    bpf_link* xdp_link = bpf_program__attach_xdp(xdp_prog, ifindex_);
-    if (!xdp_link || libbpf_get_error(xdp_link)) {
-        return false;
-    }
-    links_.push_back(xdp_link);
-
+    // Uprobe is the PRIMARY detection mechanism on BMC platforms where
+    // XDP may not be available (ASpeed AST2600 ftgmac100 NICs).
     bpf_program* uprobe_prog = bpf_object__find_program_by_name(object_, "https_guard_ssl_write");
     if (!uprobe_prog) {
-        std::cerr << "https_guard: OpenSSL uprobe program missing; continuing with XDP only\n";
+        std::cerr << "https_guard: OpenSSL uprobe program 'https_guard_ssl_write'"
+                  << " not found in BPF object (required)\n";
     } else {
         bpf_uprobe_opts uprobe_opts = {};
         uprobe_opts.sz = sizeof(uprobe_opts);
@@ -50,12 +47,42 @@ bool HttpGuardProgram::attachProgram() noexcept
             uprobe_prog, -1, openssl_lib_path_.c_str(), 0, &uprobe_opts);
         if (!uprobe_link || libbpf_get_error(uprobe_link)) {
             std::cerr << "https_guard: failed to attach SSL_write uprobe at '"
-                      << openssl_lib_path_
-                      << "'; continuing with XDP only\n";
+                      << openssl_lib_path_ << "': "
+                      << strerror(-libbpf_get_error(uprobe_link)) << "\n";
         } else {
             links_.push_back(uprobe_link);
+            have_uprobe = true;
         }
     }
+
+    // XDP is an AUXILIARY program — only works on platforms with
+    // NIC-level XDP support (not available on ASpeed AST2600 QEMU).
+    bpf_program* xdp_prog = bpf_object__find_program_by_name(object_, "https_guard_xdp");
+    if (xdp_prog) {
+        bpf_link* xdp_link = bpf_program__attach_xdp(xdp_prog, ifindex_);
+        if (!xdp_link || libbpf_get_error(xdp_link)) {
+            std::cerr << "https_guard: failed to attach XDP program to ifindex "
+                      << ifindex_ << " (non-fatal, continuing with uprobe only): "
+                      << strerror(-libbpf_get_error(xdp_link)) << "\n";
+        } else {
+            links_.push_back(xdp_link);
+            have_xdp = true;
+        }
+    } else {
+        std::cerr << "https_guard: XDP program not found; running uprobe only\n";
+    }
+
+    // Require at least one enforcement path.
+    if (!have_uprobe && !have_xdp) {
+        std::cerr << "https_guard: neither uprobe nor XDP could be attached\n";
+        return false;
+    }
+
+    // Log which enforcement paths are active.
+    std::cout << "https_guard: enforcement active via "
+              << (have_uprobe ? "uprobe(SSL_write) " : "")
+              << (have_xdp ? "xdp" : "")
+              << "\n";
 
     /* Adopt the blocklist map so ringBufferHandler can populate it after
      * classifying an event.  This is the only "countermeasure" touch
@@ -131,25 +158,73 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         event_msg.format(),
         output_path_));
 
-    if (actionable && evt->src_ip_v4 != 0)
+    if (actionable)
     {
-        // BlockTcpAction — kill the specific TCP connection immediately
-        // using the kernel's tcp_drop (SOCK_DESTROY) facility, which
-        // tears down the socket without touching the owning process.
-        action_loop_.pushAction(
-            std::make_unique<BlockTcpAction>(
-            evt->src_ip_v4,
-            evt->dst_ip_v4,
-            evt->src_port,
-            evt->dst_port,
-            message));
+        if (evt->src_ip_v4 != 0)
+        {
+            // XDP path: socket info is available.
+            // BlockTcpAction — kill the specific TCP connection immediately
+            // using the kernel's tcp_drop (SOCK_DESTROY) facility, which
+            // tears down the socket without touching the owning process.
+            action_loop_.pushAction(
+                std::make_unique<BlockTcpAction>(
+                evt->src_ip_v4,
+                evt->dst_ip_v4,
+                evt->src_port,
+                evt->dst_port,
+                message));
 
-        // BlocklistAction — prevent future connections from this source IP
-        action_loop_.pushAction(
-            std::make_unique<BlocklistAddAction>(
-            evt->src_ip_v4,
-            blocklist_ttl_,
-            message));
+            // BlocklistAction — prevent future connections from this source IP
+            action_loop_.pushAction(
+                std::make_unique<BlocklistAddAction>(
+                evt->src_ip_v4,
+                blocklist_ttl_,
+                message));
+        }
+        else
+        {
+            // Uprobe path: no socket info from BPF, but we have the PID.
+            // Read /proc/<pid>/net/tcp to find the TCP socket 4-tuple,
+            // then issue SOCK_DESTROY to kill the connection.
+            auto sockets = ProcPeerResolver::getTcpSockets(
+                static_cast<pid_t>(evt->pid));
+
+            if (sockets.empty()) {
+                std::cerr << "https_guard: uprobe PID " << evt->pid
+                          << " (" << evt->process << "), TLS version: "
+                          << TlsVersion(evt->tls_version).toString()
+                          << " — no TCP sockets found, cannot SOCK_DESTROY\n";
+            } else {
+                for (const auto& sock : sockets) {
+                    // Only act on established connections to port 443
+                    if (sock.dst_port != 443 && sock.dst_port != 0) {
+                        continue;
+                    }
+
+                    action_loop_.pushAction(
+                        std::make_unique<BlockTcpAction>(
+                        sock.src_ip_v4,
+                        sock.dst_ip_v4,
+                        sock.src_port,
+                        sock.dst_port,
+                        message));
+
+                    // Blocklist the source IP to prevent future connections
+                    if (sock.src_ip_v4 != 0) {
+                        action_loop_.pushAction(
+                            std::make_unique<BlocklistAddAction>(
+                            sock.src_ip_v4,
+                            blocklist_ttl_,
+                            message));
+                    }
+
+                    std::cerr << "https_guard: uprobe PID " << evt->pid
+                              << " (" << evt->process << "), TLS version: "
+                              << TlsVersion(evt->tls_version).toString()
+                              << " — SOCK_DESTROY sent\n";
+                }
+            }
+        }
     }
 
     return 0;

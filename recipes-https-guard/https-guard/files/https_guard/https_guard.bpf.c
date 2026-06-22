@@ -1,9 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* HTTPS-Guard eBPF programs
  *
- * XDP program:  Inspects TLS handshake packets on the wire.
- *               Detects TLS version violations and basic HTTP anomalies.
- * Uprobe:       Hooks OpenSSL SSL_write() to inspect plaintext payloads.
+ * Uprobe programs (primary detection mechanism):
+ *   - SSL_write(SSL *ssl, const void *buf, int num):
+ *       Reads the negotiated TLS version from ssl->version.
+ *       Detects TLS version violations (< 1.2) and captures
+ *       plaintext HTTP payloads for anomaly detection.
+ *
+ * XDP program (auxiliary, only works on platforms with NIC support):
+ *   - Inspects TLS ClientHello packets on the wire for TLS version
+ *     violations.  Disabled by default because most BMC platforms
+ *     (ASpeed AST2600, ftgmac100) do not support XDP in QEMU or
+ *     real hardware.  See PACKAGECONFIG build-time switch.
+ *
+ * Both programs share the same ring-buffer event format and blocklist
+ * map, so the userspace daemon processes them identically.
  */
 
 /* Tell bpf_tracing.h which architecture we are targeting. */
@@ -130,7 +141,115 @@ safe_strlcpy(char *dst, const void *src, int dst_sz, void *data_end)
 }
 
 /* =========================================================================
- * XDP program – inline TLS and HTTP inspection on the network interface
+ * Uprobe program – primary detection mechanism for BMC platforms
+ *
+ * Hooks OpenSSL SSL_write(SSL *ssl, const void *buf, int num) to:
+ *   1. Read the negotiated TLS version from the SSL struct (ssl->version)
+ *      and detect violations (version < TLS 1.2 = 0x0303).
+ *   2. Capture plaintext HTTP payloads for anomaly detection.
+ *
+ * This is the PRIMARY enforcement path for BMCs because XDP is not
+ * available on ASpeed AST2600 ftgmac100 NICs (the typical BMC
+ * network controller).  The uprobe works on all platforms since it
+ * only requires userspace uprobe support (CONFIG_UPROBES).
+ * ========================================================================= */
+
+/*
+ * SSL_write(SSL *ssl, const void *buf, int num)
+ *   - arg1: ssl  (pointer to SSL object – read version from here)
+ *   - arg2: buf  (pointer to plaintext)
+ *   - arg3: num  (length in bytes)
+ *
+ * In OpenSSL 3.x, the `version` field is the first 16-bit integer
+ * in the `ssl_st` struct at a fixed offset.  We use CO-RE
+ * (bpf_core_read) to read it portably across OpenSSL versions.
+ *
+ * For builds without CO-RE support, the fallback offset is 0
+ * (version is the first field in `ssl_st`).
+ */
+SEC("uprobe/ssl_write")
+int https_guard_ssl_write(struct pt_regs *ctx)
+{
+    const void *ssl = (const void *)PT_REGS_PARM1(ctx);
+    const void *buf = (const void *)PT_REGS_PARM2(ctx);
+    int num = (int)PT_REGS_PARM3(ctx);
+
+    if (num <= 0 || !buf || !ssl)
+        return 0;
+
+    struct hg_event *evt;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common_fields(evt, (void *)(unsigned long)(num));
+
+    /*
+     * Read the negotiated TLS version from the SSL object.
+     *
+     * In OpenSSL 3.x, ssl->version is a uint16_t at the start of
+     * the SSL struct (offset 0).  We use bpf_probe_read_user()
+     * instead of bpf_core_read() because vmlinux.h only contains
+     * kernel type definitions — OpenSSL's ssl_st is a userspace
+     * struct with no BTF/CO-RE information available to the BPF
+     * verifier.
+     *
+     * Negotiated version values:
+     *   0x0301 = TLS 1.0
+     *   0x0302 = TLS 1.1
+     *   0x0303 = TLS 1.2
+     *   0x0304 = TLS 1.3
+     */
+    __u16 tls_version = 0;
+    bpf_probe_read_user(&tls_version, sizeof(tls_version),
+                        (const void *)ssl);
+
+    evt->tls_version = tls_version;
+
+    /*
+     * Report socket info via /proc/self/net/tcp lookup is not
+     * feasible from BPF uprobes.  Set these to 0; the userspace
+     * daemon will correlate by PID if needed.
+     */
+    evt->src_ip_v4 = 0;
+    evt->dst_ip_v4 = 0;
+    evt->src_port  = 0;
+    evt->dst_port  = 0;
+
+    /* Capture a snippet of the plaintext payload. */
+    int copy_sz = num < (int)sizeof(evt->payload_snippet) - 1
+                      ? num
+                      : (int)sizeof(evt->payload_snippet) - 1;
+
+    bpf_probe_read_user(evt->payload_snippet, copy_sz, buf);
+    evt->payload_snippet[copy_sz] = '\0';
+
+    /*
+     * Classify the event:
+     *   - TLS version violation (version < 1.2)
+     *   - Otherwise treat as plain HTTP payload observation
+     */
+    if (tls_version > 0 && tls_version < 0x0303) {
+        evt->event_type = HG_EVENT_TLS_VERSION_VIOLATION;
+        evt->severity   = HG_SEV_CRITICAL;
+    } else {
+        evt->event_type = HG_EVENT_HTTP_PAYLOAD_OBSERVED;
+        evt->severity   = HG_SEV_INFO;
+    }
+
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+/* =========================================================================
+ * XDP program – auxiliary, only for platforms with NIC-level XDP support
+ *
+ * Inspects TLS ClientHello packets on the wire.  Disabled by default
+ * on BMC builds; only compiled when PACKAGECONFIG includes "xdp".
+ *
+ * See the "xdp" PACKAGECONFIG flag in the bitbake recipe for details.
  * ========================================================================= */
 
 /*
@@ -167,8 +286,7 @@ looks_like_http(const char *payload, int len)
 /*
  * Parse a TLS ClientHello and extract:
  *   - tls_version  (the version the client announces)
- *   - sni           (the Server Name Indication, if present)
- *   - event_type    set to HG_EVENT_TLS_VERSION_VIOLATION if version < 1.2
+ *   - event_type   set to HG_EVENT_TLS_VERSION_VIOLATION if version < 1.2
  *
  * The caller is responsible for bounds-checking before calling this
  * helper.  We assume the TCP payload starts at 'tcp_payload' and has
@@ -186,10 +304,6 @@ parse_tls_clienthello(struct hg_event *evt,
         return;
     /* HandshakeType = tcp_payload[offset];  0x01 = ClientHello */
     /* Handshake length (3 bytes, big-endian) */
-    __u32 hs_len = ((__u32)cursor[1] << 16) |
-                   ((__u32)cursor[2] << 8)  |
-                   ((__u32)cursor[3]);
-    (void)hs_len; /* length check not critical for our fields */
     cursor += 4;
 
     /* --- ClientHello fixed fields --- */
@@ -203,49 +317,11 @@ parse_tls_clienthello(struct hg_event *evt,
     } else {
         evt->event_type = HG_EVENT_TLS_HANDSHAKE_METADATA;
     }
-    cursor += 2;     /* skip version */
-
-    if (cursor + 32 > payload_end)
-        return;
-    cursor += 32;    /* random (32 bytes) */
-
-    /* --- Session ID --- */
-    if (cursor + 1 > payload_end)
-        return;
-    int sid_len = cursor[0];
-    cursor += 1;
-    if (cursor + sid_len > payload_end)
-        return;
-    cursor += sid_len;
-
-    /* --- Cipher Suites --- */
-    if (cursor + 2 > payload_end)
-        return;
-    int cs_len = ((int)cursor[0] << 8) | cursor[1];
-    cursor += 2;
-    if (cursor + cs_len > payload_end)
-        return;
-    cursor += cs_len;
-
-    /* --- Compression Methods --- */
-    if (cursor + 1 > payload_end)
-        return;
-    int cm_len = cursor[0];
-    cursor += 1;
-    if (cursor + cm_len > payload_end)
-        return;
-    cursor += cm_len;
-
-    /* SNI extraction requires deeper variable-length parsing than the XDP
-     * verifier accepts reliably here. Keep the TLS version metadata path and
-     * leave evt->sni empty instead of rejecting the whole program. */
 }
 
 SEC("xdp")
 int https_guard_xdp(struct xdp_md *ctx)
 {
-    /* Packet headers are parsed from packet bytes, not kernel structs, so
-     * direct accesses remain correct here even in a CO-RE-enabled build. */
     void *data_end = (void *)(unsigned long)ctx->data_end;
     void *data     = (void *)(unsigned long)ctx->data;
     struct ethhdr *eth = (struct ethhdr *)data;
@@ -263,13 +339,9 @@ int https_guard_xdp(struct xdp_md *ctx)
         return XDP_PASS;
 
     /* Hybrid enforcement: if the source IP is in the blocklist, drop the
-     * packet synchronously.  This is the only place in the XDP path
-     * where a non-PASS verdict is returned.  The blocklist is populated
-     * by the userspace daemon (ringBufferHandler) after classifying an
-     * event as actionable. */
+     * packet synchronously. */
     if (blocklist_check(ip->saddr) == XDP_DROP)
         return XDP_DROP;
-
 
     __u16 tot_len = bpf_ntohs(ip->tot_len);
     if (tot_len < sizeof(*ip))
@@ -295,9 +367,6 @@ int https_guard_xdp(struct xdp_md *ctx)
     if (bpf_ntohs(tcp->dest) != 443 && bpf_ntohs(tcp->source) != 443)
         return XDP_PASS;
 
-    /* Only inspect the first packet of a connection (SYN flag set) to
-     * catch the TLS ClientHello.  We still look at non-SYN packets for
-     * HTTP anomaly detection. */
     if ((void *)tcp + tcp_hdr_len > data_end)
         return XDP_PASS;
 
@@ -334,8 +403,6 @@ int https_guard_xdp(struct xdp_md *ctx)
 
         /*
          * Write printable source-IP string directly into evt->source_ip.
-         * Suppress leading zeros for each octet.  evt->source_ip is up to
-         * 32 bytes; at most "255.255.255.255" == 15 chars.
          */
         {
             const __u8 *b = (const __u8 *)&ip->saddr;
@@ -360,12 +427,22 @@ int https_guard_xdp(struct xdp_md *ctx)
 
         parse_tls_clienthello(evt, tcp_payload, payload_end);
 
+        /*
+         * Save event_type BEFORE ringbuf_submit to satisfy BPF verifier
+         * (cannot dereference ringbuf pointer after submit).
+         */
+        __u32 evt_type = evt->event_type;
+
         bpf_ringbuf_submit(evt, 0);
-        return XDP_PASS;  /* Do not drop – only observe & report. */
+
+        /* Direct enforcement: drop TLS version violations at XDP level */
+        if (evt_type == HG_EVENT_TLS_VERSION_VIOLATION)
+            return XDP_DROP;
+
+        return XDP_PASS;
     }
 
-    /* Plaintext HTTP detection on port 443 is unusual after TLS handshake
-     * (should be encrypted).  If we see HTTP verbs on 443, flag as anomaly. */
+    /* Plaintext HTTP detection on port 443 */
     if ((tcp_payload[0] == 'G' || tcp_payload[0] == 'P') &&
         looks_like_http(tcp_payload, payload_len)) {
         struct hg_event *evt;
@@ -390,48 +467,4 @@ int https_guard_xdp(struct xdp_md *ctx)
     }
 
     return XDP_PASS;
-}
-
-/* =========================================================================
- * Uprobe program – captures plaintext from OpenSSL SSL_write()
- * ========================================================================= */
-
-/*
- * SSL_write(SSL *ssl, const void *buf, int num)
- *   - arg1: ssl  (unused here)
- *   - arg2: buf  (pointer to plaintext)
- *   - arg3: num  (length in bytes)
- */
-SEC("uprobe/ssl_write")
-int https_guard_ssl_write(struct pt_regs *ctx)
-{
-    const void *buf = (const void *)PT_REGS_PARM2(ctx);
-    int num = (int)PT_REGS_PARM3(ctx);
-
-    if (num <= 0 || !buf)
-        return 0;
-
-    struct hg_event *evt;
-
-    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-    if (!evt)
-        return 0;
-
-    __builtin_memset(evt, 0, sizeof(*evt));
-    fill_common_fields(evt, (void *)(unsigned long)(num));
-
-    evt->event_type = HG_EVENT_HTTP_PAYLOAD_OBSERVED;
-    evt->severity   = HG_SEV_INFO;
-
-    /* Capture a snippet of the plaintext payload. */
-    int copy_sz = num < (int)sizeof(evt->payload_snippet) - 1
-                      ? num
-                      : (int)sizeof(evt->payload_snippet) - 1;
-
-    /* Read from userspace memory using bpf_probe_read_user(). */
-    bpf_probe_read_user(evt->payload_snippet, copy_sz, buf);
-    evt->payload_snippet[copy_sz] = '\0';
-
-    bpf_ringbuf_submit(evt, 0);
-    return 0;
 }

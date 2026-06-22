@@ -60,6 +60,7 @@ SRC_URI = " \
     file://https_guard/redfish_event_message.hpp \
     file://https_guard/pattern_detector.hpp \
     file://https_guard/tls_version.hpp \
+    file://https_guard/proc_peer_resolver.hpp \
     file://https_guard/main.cpp \
     file://https_guard/https_guard_program.hpp \
     file://https_guard/https_guard_program.cpp \
