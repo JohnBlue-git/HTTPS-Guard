@@ -4,7 +4,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
 
-DEPENDS += "libbpf pkgconfig clang-native bpftool-native nlohmann-json boost"
+DEPENDS += "libbpf pkgconfig clang-native bpftool-native nlohmann-json boost openssl"
 inherit systemd
 inherit cmake
 inherit pkgconfig
@@ -55,6 +55,7 @@ SRC_URI = " \
     file://simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
+    file://scripts/gen_ssl_offset.c \
     file://https_guard/events.h \
     file://https_guard/https_guard.bpf.c \
     file://https_guard/redfish_event_message.hpp \
@@ -92,12 +93,18 @@ EXTRA_OECMAKE += " \
     -DHTTPS_GUARD_BPF_CLANG_EXECUTABLE=${STAGING_BINDIR_NATIVE}/clang \
     -DHTTPS_GUARD_BPFTOOL_EXECUTABLE=${STAGING_SBINDIR_NATIVE}/bpftool \
     -DHTTPS_GUARD_TARGET_VMLINUX=${WORKDIR}/target-kernel-vmlinux \
-    -DHTTPS_GUARD_BPF_SYSROOT_INCLUDE=${RECIPE_SYSROOT}/usr/include \
     -DHTTPS_GUARD_BPF_SOURCE_PREFIX_MAP=${S}=/usr/src/debug/${PN}/${PV} \
     -DHTTPS_GUARD_BPF_BINARY_PREFIX_MAP=${B}=/usr/src/debug/${PN}/${PV} \
     -DHTTPS_GUARD_BPF_SYSROOT_PREFIX_MAP=${RECIPE_SYSROOT}= \
     -DHTTPS_GUARD_BPF_SYSROOT_NATIVE_PREFIX_MAP=${RECIPE_SYSROOT_NATIVE}= \
 "
+
+# Note: We intentionally do NOT set HTTPS_GUARD_BPF_SYSROOT_INCLUDE here.
+# The gen_ssl_offset host tool needs HOST OpenSSL headers, not target sysroot headers.
+# When cross-compiling, passing the target sysroot causes compilation failures
+# because the sysroot contains target-specific glibc headers (e.g. gnu/stubs-soft.h).
+# The BPF compilation (clang -target bpf) gets its includes from the BPF_SYSROOT
+# directly via the BPF_SYSROOT_INCLUDE flag in CMakeLists.txt when needed.
 
 do_configure[depends] += "virtual/kernel:do_compile"
 
@@ -125,6 +132,36 @@ do_configure:prepend() {
     fi
 
     ln -sf "${target_vmlinux}" "${WORKDIR}/target-kernel-vmlinux"
+
+    # Pre-build gen_ssl_offset with the NATIVE (build machine) compiler.
+    # This tool needs host OpenSSL headers, not target sysroot headers.
+    # In Yocto cross-compilation:
+    #   - HOST_PREFIX = target compiler prefix (e.g., arm-openbmc-linux-gnueabi-)
+    #   - BUILD_PREFIX = build machine compiler prefix (e.g., x86_64-linux-)
+    #   - BUILD_CC = full path to build machine compiler
+    # We use BUILD_CC which is the standard Yocto variable for native compilation.
+    GEN_SSL_OFFSET_CC="${BUILD_CC}"
+    
+    echo "Building gen_ssl_offset with native compiler: ${GEN_SSL_OFFSET_CC}"
+    ${GEN_SSL_OFFSET_CC} -o ${WORKDIR}/gen_ssl_offset ${S}/scripts/gen_ssl_offset.c || \
+        bbfatal "Failed to build gen_ssl_offset host tool"
+    
+    echo "gen_ssl_offset built successfully"
+}
+
+# Override do_compile to generate ssl_version_offset.h before CMake runs
+do_compile:prepend() {
+    if [ "${HTTPS_GUARD_BUILD_BPF}" != "ON" ]; then
+        return 0
+    fi
+
+    # Generate ssl_version_offset.h using the pre-built host tool
+    echo "Generating ssl_version_offset.h..."
+    ${WORKDIR}/gen_ssl_offset > ${B}/ssl_version_offset.h || \
+        bbfatal "Failed to generate ssl_version_offset.h"
+    
+    echo "ssl_version_offset.h generated successfully"
+    cat ${B}/ssl_version_offset.h
 }
 
 # ---------------------------------------------------------------------------

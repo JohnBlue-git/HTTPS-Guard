@@ -83,10 +83,45 @@ if(HTTPS_GUARD_BUILD_BPF)
     # struct.  Any CO-RE relocation for ssl_st fields would fail at BPF
     # program load time with "invalid CO-RE relocation".
     #
-    # Instead the BPF uprobe reads ssl->version directly from userspace
-    # memory via bpf_probe_read_user().  In OpenSSL 3.x, the 'version'
-    # field is at offset 0, stored as a 4-byte int with the negotiated
-    # TLS version in the lower 16 bits.  No BTF header is needed.
+    # Instead we generate a header with the compile-time offset of
+    # ssl_st.version using offsetof() from the actual OpenSSL header,
+    # then use bpf_probe_read_user() with that offset to read the
+    # TLS version directly from userspace memory.
+    # ------------------------------------------------------------------
+    # When cross-compiling (Yocto), gen_ssl_offset is built by the bitbake
+    # recipe (https-guard-openbmc.bb) using the host compiler, and the
+    # generated ssl_version_offset.h is passed in via HTTPS_GUARD_SSL_OFFSET_HEADER.
+    # When not cross-compiling, we build it here with CMake.
+    # ------------------------------------------------------------------
+    set(HTTPS_GUARD_SSL_OFFSET_BINARY ${CMAKE_CURRENT_BINARY_DIR}/gen_ssl_offset)
+    set(HTTPS_GUARD_SSL_OFFSET_HEADER ${CMAKE_CURRENT_BINARY_DIR}/ssl_version_offset.h)
+
+    if(NOT CMAKE_CROSSCOMPILING)
+        # Native build: compile gen_ssl_offset with the regular compiler
+        add_custom_command(
+            OUTPUT ${HTTPS_GUARD_SSL_OFFSET_BINARY}
+            COMMAND ${CMAKE_C_COMPILER}
+                    -o ${HTTPS_GUARD_SSL_OFFSET_BINARY}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_ssl_offset.c
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_ssl_offset.c
+            VERBATIM
+            COMMENT "Building ssl_st offset detection helper"
+        )
+
+        add_custom_command(
+            OUTPUT ${HTTPS_GUARD_SSL_OFFSET_HEADER}
+            COMMAND ${HTTPS_GUARD_SSL_OFFSET_BINARY} > ${HTTPS_GUARD_SSL_OFFSET_HEADER}
+            DEPENDS ${HTTPS_GUARD_SSL_OFFSET_BINARY}
+            VERBATIM
+            COMMENT "Generating ssl_version_offset.h from actual OpenSSL headers"
+        )
+    else()
+        # Cross-compiling: expect the recipe to provide ssl_version_offset.h
+        # The bitbake recipe generates this file before CMake runs.
+        if(NOT EXISTS "${HTTPS_GUARD_SSL_OFFSET_HEADER}")
+            message(WARNING "ssl_version_offset.h not found. Cross-compilation requires the bitbake recipe to generate it.")
+        endif()
+    endif()
 
     set(HTTPS_GUARD_BPF_FLAGS
         -target bpf
@@ -96,10 +131,6 @@ if(HTTPS_GUARD_BUILD_BPF)
         -I${CMAKE_CURRENT_BINARY_DIR}
         -I${CMAKE_CURRENT_SOURCE_DIR}/https_guard
     )
-
-    # NOTE: No libssl BTF header is needed — the uprobe reads ssl->version
-    # directly from userspace memory via bpf_probe_read_user().  See the
-    # comment block above and https_guard.bpf.c for details.
 
     if(LIBBPF_INCLUDE_DIRS)
         list(APPEND HTTPS_GUARD_BPF_FLAGS -I${LIBBPF_INCLUDE_DIRS})
@@ -126,6 +157,7 @@ if(HTTPS_GUARD_BUILD_BPF)
                 -o ${HTTPS_GUARD_BPF_OBJECT}
         DEPENDS
             ${HTTPS_GUARD_VMLINUX_HEADER}
+            ${HTTPS_GUARD_SSL_OFFSET_HEADER}
             ${CMAKE_CURRENT_SOURCE_DIR}/https_guard/https_guard.bpf.c
         VERBATIM
         COMMENT "Compiling HTTPS-Guard BPF object"
