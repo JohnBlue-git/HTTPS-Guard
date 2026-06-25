@@ -15,6 +15,7 @@ set(HTTPS_GUARD_BPF_SOURCE_PREFIX_MAP "" CACHE STRING "file-prefix-map for sourc
 set(HTTPS_GUARD_BPF_BINARY_PREFIX_MAP "" CACHE STRING "file-prefix-map for build paths")
 set(HTTPS_GUARD_BPF_SYSROOT_PREFIX_MAP "" CACHE STRING "file-prefix-map for target sysroot paths")
 set(HTTPS_GUARD_BPF_SYSROOT_NATIVE_PREFIX_MAP "" CACHE STRING "file-prefix-map for native sysroot paths")
+set(HTTPS_GUARD_LIBSSL_PATH "" CACHE FILEPATH "Path to libssl.so for BTF CO-RE header generation (unused — see note below)")
 
 include(FetchContent)
 
@@ -74,6 +75,19 @@ if(HTTPS_GUARD_BUILD_BPF)
         COMMENT "Generating target-kernel vmlinux.h for CO-RE"
     )
 
+    # Userspace struct access (ssl_st, OpenSSL):
+    #
+    # We do NOT use CO-RE (bpf_core_read) for userspace structs because
+    # CO-RE relocations require the target type to exist in the kernel's
+    # BTF — but ssl_st is a userspace struct from libssl.so, not a kernel
+    # struct.  Any CO-RE relocation for ssl_st fields would fail at BPF
+    # program load time with "invalid CO-RE relocation".
+    #
+    # Instead the BPF uprobe reads ssl->version directly from userspace
+    # memory via bpf_probe_read_user().  In OpenSSL 3.x, the 'version'
+    # field is at offset 0, stored as a 4-byte int with the negotiated
+    # TLS version in the lower 16 bits.  No BTF header is needed.
+
     set(HTTPS_GUARD_BPF_FLAGS
         -target bpf
         -D__TARGET_ARCH_${HTTPS_GUARD_BPF_TARGET_ARCH}
@@ -82,6 +96,10 @@ if(HTTPS_GUARD_BUILD_BPF)
         -I${CMAKE_CURRENT_BINARY_DIR}
         -I${CMAKE_CURRENT_SOURCE_DIR}/https_guard
     )
+
+    # NOTE: No libssl BTF header is needed — the uprobe reads ssl->version
+    # directly from userspace memory via bpf_probe_read_user().  See the
+    # comment block above and https_guard.bpf.c for details.
 
     if(LIBBPF_INCLUDE_DIRS)
         list(APPEND HTTPS_GUARD_BPF_FLAGS -I${LIBBPF_INCLUDE_DIRS})

@@ -1,184 +1,186 @@
-# HTTPS-Guard
+# Source Code Reference: recipes-https-guard/https-guard/files/
 
-HTTPS-Guard is a Network Security Observability Agent that implements a Detect -> Translate -> Dispatch security pipeline:
+This directory contains the complete source code of the **HTTPS-Guard** agent — an eBPF-based network security observability tool for OpenBMC. It implements a **Detect → Translate → Dispatch** pipeline using kernel-space uprobe (primary) and XDP (auxiliary) programs, a user-space C++ daemon, a shell-based event bridge, and Redfish EventService integration.
 
-- Detect in kernel space with eBPF.
-- Translate and classify in user space with a C++ daemon.
-- Dispatch through the event bridge as Redfish Event payloads for EventService subscribers.
+> For a top-level project overview, build instructions, and deployment guidance, see the root [`README.md`](../../README.md).
 
-## What is implemented in this repository
+---
 
-- eBPF XDP program:
-	- inspects TLS ClientHello on port 443.
-	- observes TLS 1.0 and TLS 1.1 attempts and emits events to a ring buffer map.
-	- emits TLS handshake metadata (SNI, version) for allowed TLS connections.
-	- detects plaintext HTTP verbs on port 443 (anomaly signal).
-	- performs blocklist enforcement (XDP_DROP) for source IPs added by the daemon.
+## Table of Contents
 
-- eBPF uprobe program (PRIMARY enforcement path on BMC platforms):
-	- hooks OpenSSL SSL_write.
-	- reads the negotiated TLS version from ssl->version.
-	- captures plaintext snippets before encryption.
-	- emits payload-observed events for user-space anomaly classification.
+- [Directory Layout](#directory-layout)
+- [eBPF Programs (`https_guard/https_guard.bpf.c`)](#ebpf-programs-https_guardhttps_guardbpfc)
+  - [Uprobe Hook: TLS Version Detection & Payload Capture (PRIMARY)](#uprobe-hook-tls-version-detection--payload-capture-primary)
+  - [XDP Hook: Wire-Level TLS Inspection (AUXILIARY)](#xdp-hook-wire-level-tls-inspection-auxiliary)
+  - [Hybrid Enforcement — XDP Blocklist (XDP_DROP)](#hybrid-enforcement--xdp-blocklist-xdp_drop)
+- [Platform Limitations](#platform-limitations)
+- [Event Data Model (`https_guard/events.h`)](#event-data-model-https_guardeventsh)
+- [C++ Daemon (`https_guard/main.cpp`)](#c-daemon-https_guardmaincpp)
+- [Pattern Detector (`https_guard/pattern_detector.hpp`)](#pattern-detector-https_guardpattern_detectorhpp)
+- [ProcPeerResolver — PID-to-Socket Correlation (`https_guard/proc_peer_resolver.hpp`)](#procpeerresolver--pid-to-socket-correlation-https_guardproc_peer_resolverhpp)
+- [ActionLoop — Async Event Dispatcher (`actions/core/ActionLoop.hpp`)](#actionloop--async-event-dispatcher-actionscoreactionloophpp)
+- [LogAction — Async File Writer (`actions/log/LogAction.hpp`)](#logaction--async-file-writer-actionsloglogactionhpp)
+- [Blocklist — Source IP Blocklist Manager (`actions/blocklist/Blocklist.hpp`)](#blocklist--source-ip-blocklist-manager-actionsblocklistblocklisthpp)
+- [BlocklistAddAction — Countermeasure Action (`actions/blocklist/BlocklistAction.hpp`)](#blocklistaddaction--countermeasure-action-actionsblocklistblocklistactionhpp)
+- [BlockTcpAction — TCP Connection Teardown (`actions/tcp/BlockTcpAction.hpp`)](#blocktcpaaction--tcp-connection-teardown-actionstcpblocktcpaactionhpp)
+- [Blocklist BPF Header (`actions/blocklist/blocklist.bpf.h`)](#blocklist-bpf-header-actionsblocklistblocklistbpfh)
+- [AsyncFileStreamManager — Coroutine-Safe File Writer (`actions/log/async_mutex.hpp`)](#asyncfilestreammanager--coroutine-safe-file-writer-actionslogasync_mutexhpp)
+- [Redfish Event Message (`https_guard/redfish_event_message.hpp`)](#redfish-event-message-https_guardredfish_event_messagehpp)
+- [TLS Version (`https_guard/tls_version.hpp`)](#tls-version-https_guardtls_versionhpp)
+- [CMake Build (`CMakeLists.txt`)](#cmake-build-cmakeliststxt)
+- [Configuration (`https-guard.conf`)](#configuration-https-guardconf)
+- [Security Strategy](SECURITY_STRATEGY.md)
+- [OpenBMC Recipe (`https-guard-openbmc.bb`)](#openbmc-recipe-https-guard-openbmcbb)
 
-- C++ daemon:
-	- loads and attaches BPF programs (uprobe is primary, XDP is optional).
-	- consumes ring buffer events.
-	- applies HTTP payload anomaly pattern checks (SQLi, path traversal, etc.).
-	- writes Redfish Event JSON lines to /var/log/https_guard_events.log.
-	- for uprobe-detected violations: reads /proc/<pid>/net/tcp to correlate PID
-	  to socket 4-tuple, then issues SOCK_DESTROY + blocklist enforcement.
+---
 
-- Event bridge:
-  - tails the daemon output log.
-  - forwards events to D-Bus, journald, or /var/log/redfish depending on PACKAGECONFIG.
-
-- Simulation service:
-  - emits synthetic events for QEMU and slirp-based testing.
-
-- Redfish assets:
-	- OEM message registry in config/security_message_registry/OemSecurityEvent.1.0.0.json.
-	- event example payload in config/redfish_event_example.json.
-
-## Architecture
-
-### Mission
-
-HTTPS-Guard delivers a Detect -> Deny -> Dispatch pipeline:
-
-1. Detect and deny in kernel space with eBPF.
-2. Translate and enrich anomalies in user space.
-3. Dispatch events as Redfish EventService-compatible payloads.
-
-### Why this design
-
-- eBPF keeps enforcement at line-rate and close to the attack surface.
-- User-space daemon keeps policy updates and payload shaping flexible.
-- Redfish integration leverages existing BMC EventService fan-out instead of building a custom notification stack.
-
-### Data Flow
+## Directory Layout
 
 ```
-                    +----------------------------+
-                    | A: Intrusive HTTPS request |
-                    +----------------------------+
-                   /                             \
-                  /                               \
-                 v                                 v
-+-----------------------+                       +----------------------+
-| B: eBPF XDP hook      |                       | C: eBPF SSL_write    |
-| (NOT available on     |                       |     uprobe           |
-|  ASpeed AST2600 NIC)  |                       |  (PRIMARY path)      |
-+-----------------------+                       +----------------------+
-| (TLS version, SNI,    |                       | (ssl->version,       |
-|  HTTP anomaly events) |                       |  payload snippet)    |
-+-------+---------------+                       +---------+------------|
-          |        shared `events` ring buffer            |
-          +------------------------+----------------------+
-                                   |
-                                   v
-                        +-----------------------+
-                        | E: C++ daemon         |
-                        | (translate + classify)|
-                        | + PID->socket lookup  |
-                        | + SOCK_DESTROY        |
-                        | + blocklist update    |
-                        +-----------------------+
-                                   |
-                                   | Redfish event JSON lines
-                                   v
-                   +--------------------------------+
-                   | F: /var/log/                   |
-                   |     https_guard_events.log      |
-                   +--------------------------------+
-                                   |
-                                   v
-                  +--------------------------------+
-                  | G: https-guard-event-bridge    |
-                  +--------------------------------+
-                   /                              \
-                  /                                \
-                 v                                  v
-+-----------------------+                       +---------------------+
-| H: /var/log/redfish   |                       | I: OpenBMC logging  |
-| (plain-text event log)|                       | (DBus + journald)   |
-+-----------------------+                       +---------------------+
-          |                                               |
-          v                                               v
-+-----------------------+                       +-------------------------------+
-| J: bmcweb             |                       | K: bmcweb                     |
-| FilesystemLog-Watcher |                       | D-Bus monitor (Logging.Entry) |
-+-----------------------+                       +-------------------------------+
-          |                                               |
-          +-------------------+---------------------------+
-                              |
-                              v
-                +----------------------------+
-                | L: Redfish EventService    |
-                +----------------------------+
-                              |
-                              v
-                +----------------------------+
-                | M: SSE and HTTPS push      |
-                |     subscribers            |
-                +----------------------------+
+files/
+├── CMakeLists.txt                                    # CMake build definition
+├── https-guard.conf                                  # EnvironmentFile for systemd units
+├── https-guard-daemon.service                        # systemd unit for the eBPF daemon
+├── https-guard-daemon.sh                             # Shell wrapper that launches https-guardd
+├── https-guard-event-bridge.service                  # systemd unit for the event bridge
+├── https-guard-event-bridge.sh                       # Shell bridge: tails log → D-Bus/journal/redfish
+├── simulated-event-generator.service                 # systemd unit for synthetic event generator
+├── simulated-event-generator.sh                      # Shell script that emits simulated events
+├── ebpf/
+│   ├── bpf_program.hpp                                # BPF program attachment wrapper
+│   └── bpf_program.cpp                                # BPF program wrapper implementation
+├── https_guard/
+│   ├── events.h                                      # Shared event struct & enums (BPF + C++)
+│   ├── https_guard.bpf.c                              # eBPF programs (uprobe primary + XDP auxiliary)
+│   ├── https_guard_program.hpp                        # BPF object loader / ring-buffer adapter
+│   ├── https_guard_program.cpp                        # BPF lifecycle + event classification + PID->socket
+│   ├── main.cpp                                      # C++ daemon entry point
+│   ├── pattern_detector.hpp                          # User-space HTTP anomaly rules (inline)
+│   ├── proc_peer_resolver.hpp                        # /proc/<pid>/net/tcp parser for PID->socket (inline)
+│   ├── redfish_event_message.hpp                     # Redfish Event message with formatting (inline)
+│   └── tls_version.hpp                               # TLS version helpers (inline)
+├── actions/
+│   ├── core/
+│   │   ├── ActionLoop.hpp                            # Boost.Asio-based event dispatcher interface
+│   │   ├── ActionLoop.cpp                            # Boost.Asio-based event dispatcher implementation
+│   │   └── main.cpp                                  # ActionLoop smoke-test / demo entry point
+│   ├── blocklist/
+│   │   ├── blocklist.bpf.h                           # BPF-side blocklist header (XDP_DROP check)
+│   │   ├── Blocklist.hpp                             # Singleton blocklist manager (BPF map wrapper)
+│   │   ├── Blocklist.cpp                             # Blocklist singleton implementation
+│   │   ├── BlocklistAction.hpp                       # Countermeasure action: add src IP to blocklist
+│   │   └── BlocklistAction.cpp                       # BlocklistAddAction implementation
+│   ├── tcp/
+│   │   ├── BlockTcpAction.hpp                        # Countermeasure action: kill TCP 4-tuple via SOCK_DESTROY
+│   │   ├── BlockTcpAction.cpp                        # BlockTcpAction implementation (Netlink async)
+│   │   ├── TcpDestroyer.hpp                          # RAII wrapper: Netlink SOCK_DESTROY lifecycle
+│   │   └── TcpDestroyer.cpp                          # TcpDestroyer implementation
+│   └── log/
+│       ├── async_mutex.hpp                           # AsyncFileStreamManager (coroutine-safe file I/O)
+│       ├── LogAction.hpp                             # Async file-logging action interface
+│       └── LogAction.cpp                             # Async file-logging action implementation
 ```
 
-**Double-delivery prevention:** When the bridge uses D-Bus path (modes `dbus` or `both`), bmcweb's D-Bus monitor already dispatches to EventService subscribers. The filesystem log (`/var/log/redfish`) is **not** written in these modes to avoid duplicate delivery. The filesystem log is only written in `journal` mode, where FilesystemLogWatcher handles delivery.
+---
 
-Edge labels:
+## eBPF Programs (`https_guard/https_guard.bpf.c`)
 
-- A -> B : TLS ClientHello on port 443
-- A -> C : OpenSSL SSL_write invocation
-- B -> E : ring buffer event (TLS version violation / handshake metadata / HTTP anomaly)
-- C -> E : ring buffer event (payload observed + TLS version)
-- E -> F : Redfish event JSON lines appended
-- F -> G : tail /var/log/https_guard_events.log
-- G -> H : plain-text event log line (journal-only mode)
-- G -> I : DBus + journald emission (dbus / both mode)
-- H -> J : bmcweb watches /var/log/redfish
-- I -> K : bmcweb monitors D-Bus Logging.Entry
-- J, K -> L : Redfish Log Entry created
-- L -> M : SSE and HTTPS push to subscribers
+The single BPF C file compiles to one BPF object that contains **two independent hook sections**, both writing to the same shared `events` ring buffer map:
 
-### Repository layout
+| Section | Type | Hook Point | Purpose | Availability |
+|---------|------|------------|---------|-------------|
+| `SEC("uprobe/ssl_write")` — `https_guard_ssl_write` | Uprobe (PRIMARY) | Userspace function `SSL_write` in OpenSSL | Reads ssl->version for TLS violation detection; captures plaintext payload snippets | All platforms with CONFIG_UPROBE_EVENTS |
+| `SEC("xdp")` — `https_guard_xdp` | XDP (AUXILIARY) | Network driver (RX path) or generic SKB mode | Inspects TLS ClientHello on port 443; detects TLS version violations and plaintext HTTP | Native: NICs with ndo_bpf (not ftgmac100). Generic (SKB): any NIC including virtio-net in QEMU TAP+BRIDGE mode |
 
-- `conf/`: Yocto layer configuration for HTTPS-Guard.
-- `manifest/`: repo manifest for syncing OpenBMC and HTTPS-Guard.
-- `recipes-https-guard/https-guard/`: HTTPS-Guard OpenBMC recipe and deployment files.
-- `recipes-kernel/linux/`: Kernel config fragment for eBPF/XDP support.
-- `recipes-bmcweb/bmcweb/`: bmcweb package append for OpenBMC integration.
-- `recipes-phosphor/images/`: image append to install HTTPS-Guard into `obmc-phosphor-image`.
-- `scripts/`: Helper scripts (QEMU TAP setup, etc.).
-- `docs/architecture.md`: Design and data flow details.
+### Uprobe Hook: TLS Version Detection & Payload Capture (PRIMARY)
 
-### Recipe recipes-https-guard Components
+**What is hooked:**
 
-- https_guard/https_guard.bpf.c
-  - XDP path: inspects TLS 1.0/1.1 ClientHello on port 443 and emits events.
-  - XDP path: extracts SNI from TLS extensions, detects plaintext HTTP on port 443 as anomaly.
-  - Uprobe path (PRIMARY): hooks SSL_write to read ssl->version for TLS violation detection
-    and capture plaintext snippets for user-space analysis.
-  - XDP only works on platforms with NIC-level XDP support. On ASpeed AST2600 (ftgmac100),
-    XDP is NOT available. The uprobe path is the sole detection mechanism.
-  - Emits normalized hg_event records to ring buffer map events.
+- The OpenSSL library function `SSL_write(SSL *ssl, const void *buf, int num)`.
 
-- https_guard/main.cpp
-  - Loads BPF object and reads ring buffer events.
-  - Applies user-space anomaly rules for HTTP payloads.
-  - Formats Redfish-compatible JSON and appends to output log path.
-  - Accepts 4 CLI arguments: interface, ssl_lib_path, output_path, bpf_object_path.
+**What is captured:**
 
-- https_guard/https_guard_program.cpp
-  - Attaches uprobe to SSL_write (PRIMARY) and XDP (optional/auxiliary).
-  - Processes ring buffer events: classifies TLS version violations and HTTP anomalies.
-  - For uprobe-originated events (no socket info from BPF), reads /proc/<pid>/net/tcp
-    to resolve socket 4-tuple, then issues SOCK_DESTROY + blocklist enforcement.
+- **TLS version** (`ssl->version`) — read from the OpenSSL SSL object using `bpf_probe_read_user()`. The `ssl_st` struct layout in OpenSSL 3.x on ARM 32-bit places `version` at **offset 36** (not offset 0 — the struct has many pointer fields before it). Values:
+  - `0x0301` = TLS 1.0
+  - `0x0302` = TLS 1.1
+  - `0x0303` = TLS 1.2
+  - `0x0304` = TLS 1.3
+- **Plaintext buffer** (`buf`) — the unencrypted data that the application is about to send.
+- **Length** (`num`) — number of bytes of plaintext.
+- **Snippet** — up to 127 bytes of the plaintext payload are copied into `evt->payload_snippet`.
 
-- config/security_message_registry/OemSecurityEvent.1.0.0.json
-  - OEM registry with strongly typed message IDs and argument schema.
+**Filters applied:**
+
+- `num <= 0`, `buf == NULL`, or `ssl == NULL` → skip (no event emitted).
+- TLS version < 0x0303 → `HG_EVENT_TLS_VERSION_VIOLATION` (severity CRITICAL).
+- Otherwise → `HG_EVENT_HTTP_PAYLOAD_OBSERVED` (severity INFO).
+
+**Important note on reading userspace structs:**
+
+The uprobe uses `bpf_probe_read_user()` instead of `bpf_core_read()` because OpenSSL's `ssl_st` is a userspace library struct with no BTF/CO-RE information in `vmlinux.h`. Using `bpf_core_read()` would fail CO-RE relocation at program load time with "invalid CO-RE relocation" / "failed to resolve CO-RE relocation".
+
+The offset of the `version` field within `ssl_st` was empirically determined by scanning offsets 0-80 on the target platform. On ARM 32-bit (johnblue), the version field is at offset 36. On other architectures (e.g. x86_64 where pointers are 8 bytes), the offset will differ. If detection fails on a new platform, enable the `bpf_printk` diagnostic scanning code in the uprobe to locate the correct offset.
+
+### XDP Hook: Wire-Level TLS Inspection (AUXILIARY)
+
+> **IMPORTANT:** XDP comes in two modes:
+> - **Native XDP** (driver-level `ndo_bpf`): Requires NIC driver support. The ASpeed
+>   AST2600 ftgmac100 driver has zero XDP support — verified by `ip link show eth0`
+>   showing no `xdp` or `prog/xdp` line.
+> - **Generic XDP / SKB mode** (`XDP_FLAGS_SKB_MODE`): A software fallback that hooks
+>   into `netif_receive_skb()`. Works with any NIC, including virtio-net in QEMU
+>   TAP+BRIDGE mode.
+>
+> The daemon now tries **native XDP first**, then falls back to **generic (SKB) XDP**
+> automatically. This means XDP works in QEMU TAP+BRIDGE mode with virtio-net-pci.
+> On SLIRP (default) or real ftgmac100 hardware, both attempts fail gracefully and
+> the daemon continues with uprobe only.
+> See [Platform Limitations](#platform-limitations) below.
+
+**What is inspected:**
+
+1. **Ethernet + IP + TCP headers** — filters to IPv4, TCP-only traffic on port 443 (source or destination).
+2. **TLS ClientHello record** — identifies packets whose first byte is `0x16` (TLS Handshake ContentType).
+3. **TLS version field** — extracted from the ClientHello fixed portion at offset 5+4 (after the record header and handshake header). The version bytes `[major, minor]` are compared against `0x0303` (TLS 1.2):
+   - `< 0x0303` → `HG_EVENT_TLS_VERSION_VIOLATION` (severity `CRITICAL`)
+   - `>= 0x0303` → `HG_EVENT_TLS_HANDSHAKE_METADATA` (severity `INFO`)
+4. **Plaintext HTTP on port 443** — detects unencrypted HTTP method verbs (`GET`, `POST`, `PUT`, `DELETE`, `HEAD`) appearing on the wire.
+
+**Filtering actions:**
+
+- The XDP program calls `blocklist_check(ip->saddr)` before any inspection. If the source IP is in the blocklist, the packet is dropped (`XDP_DROP`).
+- For TLS version violations, the XDP program now returns `XDP_DROP` to proactively block the connection.
+- All other events are returned as `XDP_PASS`.
+
+### Hybrid Enforcement — XDP Blocklist (XDP_DROP)
+
+The blocklist mechanism is the **only** path in the XDP program that returns a non-PASS verdict. It enables a dynamic enforcement loop:
+
+```
+Kernel:  XDP hook sees packet → blocklist_check(ip->saddr)
+          ├── IP not in blocklist → XDP_PASS (continue inspection)
+          ├── IP expired         → delete entry → XDP_PASS
+          └── IP active          → XDP_DROP     ← enforcement
+                 ▲
+Userspace: daemon classifies event → actionable?
+          ├── yes → BlocklistAddAction(src_ip, ttl)
+          │        → Blocklist::add() writes expiry into BPF map
+          │        → BlockTcpAction: SOCK_DESTROY current TCP connection
+          └── no  → log only, no blocklist action
+```
+
+The blocklist map (`src_blocklist`) is a `BPF_MAP_TYPE_HASH` with a maximum of 1024 entries. Each entry maps a source IP (network byte order) to an absolute expiry timestamp in nanoseconds.
 
 ## Platform Limitations
+
+### XDP Support Summary
+
+| Platform | NIC | Native XDP | Generic XDP (SKB mode) | Current Status |
+|----------|-----|------------|------------------------|----------------|
+| x86 native host (supported NIC) | e.g. ixgbe, mlx5, virtio-net | ✅ Yes | ✅ Yes | ✅ XDP works natively |
+| QEMU johnblue TAP+BRIDGE | virtio-net-pci (via `-device virtio-net-pci`) | ✅ Yes | ✅ Yes | ✅ XDP works (generic SKB mode via `bpf_xdp_attach` fallback) |
+| QEMU johnblue SLIRP (default) | ftgmac100 (emulated, slirp backend) | ❌ No | ❌ No (slirp has no real netdev) | ❌ XDP not possible |
+| Real ASpeed AST2600 HW | ftgmac100 | ❌ No (no ndo_bpf) | ❌ No (ftgmac100 lacks generic XDP support) | ❌ XDP not possible |
 
 ### XDP Not Available on ASpeed AST2600 (ftgmac100)
 
@@ -193,22 +195,59 @@ root@johnblue:~# ip link show eth0
 ```
 (No `xdp` or `prog/xdp` line — XDP is not loaded.)
 
-The blocklist_check() and XDP_DROP enforcement path only works when the XDP program
-can be attached to the NIC, which is not the case on this platform. The daemon
-correctly handles this by treating XDP as an optional, auxiliary attachment —
-it runs successfully with just the uprobe.
+The daemon handles this correctly by treating XDP as an optional, auxiliary attachment.
+If the XDP attach fails, it logs a warning and continues with the uprobe only:
 
-### Uprobe-Only Enforcement Path
+```
+https_guard: XDP program not found; running uprobe only
+https_guard: enforcement active via uprobe(SSL_write)
+```
 
-Since XDP is not available, enforcement for TLS version violations works as follows:
+### Enabling XDP in QEMU (TAP+BRIDGE + virtio-net-pci)
+
+To get XDP working in QEMU, you **must** use TAP+BRIDGE networking with the virtio-net-pci
+device. The default SLIRP mode does NOT expose a real NIC to the guest.
+
+The daemon's XDP attach logic in `https_guard_program.cpp` now implements a two-step fallback:
+1. Try **native XDP** (`XDP_FLAGS_UPDATE_IF_NOEXIST`) — works on real NICs with ndo_bpf.
+2. On failure, try **generic XDP / SKB mode** (`XDP_FLAGS_SKB_MODE`) — works on virtio-net.
+
+This means when you launch QEMU with the TAP+BRIDGE configuration described in
+[johnblue.conf](../../conf/machine/johnblue.conf), XDP will attach successfully in
+generic SKB mode.
+
+**Verification inside the guest:**
+```bash
+# Check daemon logs for XDP attach status
+journalctl -u https-guard-daemon -l | grep "XDP attached"
+# Expected: "https_guard: XDP attached in generic (SKB) mode"
+
+# Verify XDP is loaded on the interface
+ip link show eth0 | grep -i xdp
+# Expected: "xdp/generic" or "xdp" in the output
+```
+
+**Kernel configuration requirement:**
+The kernel must have `CONFIG_NET_XDP_XMIT=y` for generic XDP. This is already enabled
+by the `bpf-kernel-config.cfg` fragment applied via `linux-aspeed_%.bbappend`. Build
+and verify with:
+```bash
+bitbake virtual/kernel -c menuconfig  # Search for CONFIG_NET_XDP_XMIT
+```
+
+### Uprobe-Only Enforcement
+
+When XDP is not available (SLIRP mode or real ftgmac100 hardware), enforcement works
+entirely through the uprobe+SOCK_DESTROY path:
+
+Since XDP is not available, TLS security enforcement works as follows:
 
 1. The uprobe on SSL_write() fires when OpenSSL sends encrypted data.
-2. The negotiated TLS version is read from ssl->version (uint16_t at offset 0
-   in OpenSSL 3.x's ssl_st struct) using bpf_probe_read_user().
+2. The negotiated TLS version is read from ssl->version.
 3. An event is submitted to the ring buffer with the process PID.
 4. The userspace daemon reads /proc/<pid>/net/tcp to find the TCP socket 4-tuple.
 5. SOCK_DESTROY is issued via NETLINK_INET_DIAG to kill the TCP connection.
-6. The source IP is added to the blocklist (for XDP platforms) or logged.
+6. The source IP is logged for follow-up.
 
 ### Cannot Test TLS < 1.2 with curl + OpenSSL 3.x
 
@@ -224,461 +263,254 @@ curl -4 --tlsv1.0 -v -ku root:0penBmc https://localhost/redfish/v1
 ```
 
 The negotiated TLS version read by the uprobe will always be 0x0304 (TLS 1.3)
-for all curl connections on this platform. To test TLS < 1.2 detection, a
-client that supports older TLS versions (e.g., a legacy tool, or a Python
-script using an older OpenSSL build) would be required.
+for all curl connections on this platform.
 
-## Build (native / standalone)
+---
 
-Prerequisites
+## Event Data Model (`https_guard/events.h`)
 
-- Linux kernel with eBPF/uprobe support (CONFIG_UPROBE_EVENTS).
-- clang/llvm, cmake, pkg-config.
-- libbpf development package.
-- root privileges to attach uprobes.
+The header is dual-purposed: it is included both by the BPF C program (compiled with `clang -target bpf`) and by the C++ daemon. When compiled for BPF, it provides its own minimal integer types; when compiled for C++, it uses `<stdint.h>`.
 
-Ubuntu example dependencies:
+### Event Types (`enum hg_event_type`)
 
-```bash
-sudo apt-get update
-sudo apt-get install -y clang llvm cmake pkg-config libbpf-dev linux-headers-$(uname -r)
+| Value | Name | Source | Meaning |
+|-------|------|--------|---------|
+| 1 | `HG_EVENT_TLS_VERSION_VIOLATION` | XDP or Uprobe | Client offered TLS version < 1.2 (could be 1.0 or 1.1) |
+| 2 | `HG_EVENT_TLS_HANDSHAKE_METADATA` | XDP | Client offered TLS ≥ 1.2; event carries SNI and version info |
+| 3 | `HG_EVENT_HTTP_PAYLOAD_OBSERVED` | Uprobe | A plaintext payload was observed via SSL_write |
+| 4 | `HG_EVENT_HTTP_ANOMALY_DETECTED` | XDP | Plaintext HTTP verbs observed on port 443 (suggesting a protocol violation) |
+
+### Severity Levels (`enum hg_severity`)
+
+| Value | Name | Used For |
+|-------|------|----------|
+| 0 | `HG_SEV_INFO` | TLS handshake metadata, payload observations |
+| 1 | `HG_SEV_WARNING` | HTTP anomalies (may indicate probing/misconfiguration) |
+| 2 | `HG_SEV_CRITICAL` | TLS version violations (insecure protocol in use) |
+
+### Event Struct (`struct hg_event`)
+
+```
+timestamp_ns (uint64)    — BPF ktime in nanoseconds
+event_type   (uint32)    — hg_event_type enum
+severity     (uint32)    — hg_severity enum
+pid          (uint32)    — Kernel PID of the process
+tgid         (uint32)    — Kernel TGID (thread group = process ID)
+src_ip_v4    (uint32)    — Source IPv4 address (network byte order) — 0 for uprobe events
+dst_ip_v4    (uint32)    — Destination IPv4 address (network byte order) — 0 for uprobe events
+src_port     (uint16)    — Source TCP port (host byte order) — 0 for uprobe events
+dst_port     (uint16)    — Destination TCP port (host byte order) — 0 for uprobe events
+tls_version  (uint16)    — TLS version code (e.g. 0x0301 = 1.0, 0x0304 = 1.3)
+tls_record_type (uint16) — TLS record ContentType (reserved for future use)
+process      (char[16])  — Comm name of the process (from bpf_get_current_comm)
+source_ip    (char[32])  — Dotted-decimal string of source IP (filled by XDP only)
+sni          (char[64])  — SNI hostname extracted from TLS ClientHello (XDP only)
+uri          (char[128]) — URI field (reserved for future use)
+payload_snippet (char[128]) — Plaintext snippet from uprobe or HTTP anomaly
 ```
 
-Build BPF object:
+---
 
-```bash
-chmod +x scripts/build_ebpf.sh
-./scripts/build_ebpf.sh
+## C++ Daemon (`https_guard/main.cpp`)
+
+The daemon's `main()` function orchestrates the full eBPF lifecycle and event dispatch pipeline via the ActionLoop:
+
+### Initialization Flow
+
+1. **Parse CLI arguments** (4 positional):
+   - `argv[1]` — Network interface (default: `eth0`).
+   - `argv[2]` — OpenSSL shared library path (default: `/usr/lib/x86_64-linux-gnu/libssl.so.3`).
+   - `argv[3]` — Output log path (default: `/var/log/redfish/https_guard_events.log`).
+   - `argv[4]` — BPF object file path (default: `./build/https_guard.bpf.o`).
+
+2. **Seed the ActionLoop** — obtains the singleton `ActionLoop::getInstance()` and pushes a `LogAction` that writes to the configured output path. The ActionLoop runs a background Boost.Asio `io_context` that processes actions asynchronously.
+
+3. **Load and verify** the BPF object via `libbpf`.
+
+4. **Create `HttpGuardProgram`** — passing the BPF object path, the `ActionLoop` reference, OpenSSL library path, network interface index, a default blocklist TTL of 5 minutes, and the configured output path. The program:
+   - Attaches the uprobe to `SSL_write` in the specified OpenSSL shared library (PRIMARY).
+   - Tries to attach the XDP program to the network interface (AUXILIARY, non-fatal if it fails).
+   - Adopts the blocklist BPF map (`src_blocklist`) so the daemon can populate it with offending source IPs.
+
+5. **Open ring buffer consumer** — `ring_buffer__new()` maps the `events` BPF map and registers the `on_event` callback.
+
+6. **Poll loop** — `ring_buffer__poll()` is called in a 200ms interval loop until SIGINT or SIGTERM is received.
+
+### Event Processing (`ringBufferHandler`)
+
+The callback classifies incoming ring buffer events and dispatches countermeasures:
+
+1. **Size validation** — drops undersized (< `sizeof(hg_event)`) records.
+2. **Event type dispatch**:
+   - `HG_EVENT_TLS_VERSION_VIOLATION` → critical event, marked actionable.
+   - `HG_EVENT_HTTP_PAYLOAD_OBSERVED`, `HG_EVENT_HTTP_ANOMALY_DETECTED`, or `HG_EVENT_TLS_HANDSHAKE_METADATA` → runs pattern detection; if suspicious, marked actionable. Non-suspicious events are logged as informational (not silently dropped).
+3. **Enforcement actions**:
+   - **LogAction** — always pushed (all events are logged, including non-suspicious ones).
+   - **XDP path** (src_ip_v4 != 0): BlockTcpAction + BlocklistAddAction with direct 4-tuple.
+   - **Uprobe path** (src_ip_v4 == 0): reads /proc/<pid>/net/tcp via ProcPeerResolver to find socket 4-tuple, then issues BlockTcpAction + BlocklistAddAction.
+
+---
+
+## Pattern Detector (`https_guard/pattern_detector.hpp`)
+
+The user-space anomaly detection engine applies a set of **static signature rules** to plaintext payload snippets.
+
+### Rule Set
+
+| Rule | Description |
+|------|-------------|
+| `../..` | Directory traversal |
+| `union select` | SQL injection |
+| `or 1=1` | SQL tautology |
+| `drop table` | SQL DDL injection |
+| `/etc/passwd` | File inclusion |
+| `%2e%2e%2f` | URL-encoded path traversal |
+| `cmd.exe` | Windows command execution |
+| `wget http` | Remote payload download |
+
+---
+
+## ProcPeerResolver — PID-to-Socket Correlation (`https_guard/proc_peer_resolver.hpp`)
+
+This utility parses `/proc/<pid>/net/tcp` to extract TCP socket 4-tuples from a process PID. It is used by the userspace daemon to correlate uprobe events (which only contain a PID, not socket info) with actual TCP connections, enabling SOCK_DESTROY enforcement.
+
+### Key Methods
+
+| Method | Description |
+|--------|-------------|
+| `getTcpSockets(pid_t pid)` | Returns vector of `TcpSocketEntry` with src_ip, dst_ip, src_port, dst_port |
+| `parseProcNetEntry(field, ip, port)` | Parses hex format "AABBCCDD:PPPP" → IP + port |
+
+### Format
+
+The `/proc/net/tcp` hex format stores IP bytes in reverse order:
+- `"0100007F:01BB"` → IP=127.0.0.1, Port=443
+
+---
+
+## ActionLoop — Async Event Dispatcher (`actions/core/ActionLoop.hpp`)
+
+The `ActionLoop` is a singleton that decouples eBPF event callback processing from downstream I/O. It wraps a Boost.Asio `io_context` running on a dedicated background thread.
+
+### Architecture
+
+```
+main thread (ring_buffer__poll)
+  │
+  └── on_event() callback
+       ├── pushAction(LogAction)          → ActionLoop queue
+       ├── pushAction(BlocklistAddAction) → ActionLoop queue
+       └── pushAction(BlockTcpAction)     → ActionLoop queue
+              │
+              ▼
+       Background thread (io_context::run)
+              │
+              ├── co_spawn LogAction::execute_async()
+              │    └── AsyncFileStreamManager::acquire_stream()
+              │         └── async_write() to log file
+              │
+              ├── co_spawn BlocklistAddAction::execute_async()
+              │    └── Blocklist::instance().add(src_ip, ttl)
+              │
+              └── co_spawn BlockTcpAction::execute_async()
+                   └── SOCK_DESTROY via NETLINK_INET_DIAG
 ```
 
-Build daemon:
+---
 
-```bash
-cmake -S . -B build
-cmake --build build -j
+## BlockTcpAction — TCP Connection Teardown (`actions/tcp/BlockTcpAction.hpp`)
+
+`BlockTcpAction` kills a specific TCP socket tuple using the kernel's `tcp_drop` facility (`NETLINK_INET_DIAG` + `SOCK_DESTROY`). It targets the **current active connection** by its exact 4-tuple.
+
+### Architecture
+
+| Class | Role |
+|-------|------|
+| `TcpDestroyer` | RAII wrapper: opens NETLINK_INET_DIAG socket, sends SOCK_DESTROY, closes fd |
+| `BlockTcpAction` | IAction adapter that constructs TcpDestroyer and runs it asynchronously |
+
+---
+
+## OpenBMC Recipe (`https-guard-openbmc.bb`)
+
+### SRC_URI
+
+The recipe sources include all source files under `files/`:
+- Shell wrappers, systemd unit files, config file
+- CMake build definition
+- All C++ source and header files under `https_guard/`, `actions/`, and `ebpf/`.
+
+### Build Steps
+
+1. `do_configure[depends]` — depends on `virtual/kernel:do_compile` for vmlinux.
+2. `do_configure:prepend` — locates target kernel vmlinux for CO-RE header generation. No libssl BTF header is generated (userspace shared libraries do not have BTF debug info).
+3. `do_compile` — CMake build handles both the C++ daemon and (optionally) the BPF object.
+4. `do_install` — installs shell wrappers, compiled daemon binary, action_runner, BPF object, systemd units, and config file.
+
+### PACKAGECONFIG Flags
+
+**Service selection:**
+
+| Flag | Daemon | Generator | Bridge |
+|------|--------|-----------|--------|
+| `simulation` (default) | ✗ | ✓ | ✓ |
+| `daemon` | ✓ | ✗ | ✓ |
+| `both` | ✓ | ✓ | ✓ |
+
+---
+
+## Event Flow Summary
+
+### Service / Shell-Script / Binary Mapping
+
+| Service | Executable | Binary launched | Role |
+|---------|-----------|----------------|------|
+| `https-guard-daemon.service` | `/usr/sbin/https-guard-daemon` | `https-guardd` (C++ compiled) | Real-time eBPF event capture, TLS version detection, anomaly classification, PID→socket lookup, SOCK_DESTROY, blocklist enforcement |
+| `https-guard-event-bridge.service` | `/usr/sbin/https-guard-event-bridge` | — (pure shell) | Tails the event log, dispatches events to D-Bus / journal / Redfish log |
+| `simulated-event-generator.service` | `/usr/sbin/simulated-event-generator` | — (pure shell) | Generates synthetic events for QEMU / simulation testing |
+
+### Complete Event Pipeline
+
 ```
-
-## Run (native)
-
-Usage:
-
-```bash
-sudo ./build/https_guardd <network_interface> <openssl_lib_path> <output_log_path> [bpf_object_path]
-```
-
-The 4th argument (bpf_object_path) is optional. Defaults to `./build/https_guard.bpf.o`.
-
-Example:
-
-```bash
-sudo ./build/https_guardd eth0 /usr/lib/x86_64-linux-gnu/libssl.so.3 /var/log/https_guard_events.log
-```
-
-The daemon writes one Redfish Event JSON record per line. This file path is intentionally chosen so an EventService log watcher can ingest and dispatch asynchronously to subscribers.
-
-## OpenBMC Build
-
-This repository includes a ready-to-use OpenBMC manifest and Yocto layer (`meta-https-guard`) that integrates HTTPS-Guard into an OpenBMC image.
-
-> **Note:** Adding `meta-https-guard` to the build is handled automatically by
-> `meta-https-guard/conf/templates/default/bblayers.conf.sample`, which is picked up
-> by the `setup` script when you initialise the build environment. No manual
-> `BBLAYERS` edits are needed.
-
-### Setup and build
-
-1. Create and enter a working directory:
-
-```bash
-mkdir <work_dir>
-cd <work_dir>
-```
-
-2. Initialise the repo manifest:
-
-```bash
-repo init -u https://github.com/JohnBlue-git/HTTPS-Guard.git -m manifest/main.xml
-```
-
-3. Sync all repositories (replace `<cpucore>` with your CPU thread count, e.g. `$(nproc)`):
-
-```bash
-repo sync -j$(nproc)
-```
-
-4. Create a tracking branch across all projects:
-
-```bash
-repo start master --all
-```
-
-5. Set up the OpenBMC build environment:
-
-```bash
-. setup johnblue
-```
-
-6. Build the image:
-
-```bash
-bitbake obmc-phosphor-image
-```
-
-### PACKAGECONFIG options
-
-The recipe `recipes-https-guard/https-guard/https-guard-openbmc.bb` supports two categories of PACKAGECONFIG flags, combined freely:
-
-#### Service selection (which systemd units are auto-enabled)
-
-| PACKAGECONFIG | Enables | Disables | Use case |
-|---|---|---|---|
-| `simulation` (default) | event-generator + event-bridge | daemon | QEMU with slirp, no real eBPF |
-| `daemon` | daemon + event-bridge | event-generator | Real eBPF with TAP/bridge network |
-| `both` | daemon + event-generator + event-bridge | — | Debugging, comparing real vs simulated |
-
-#### Event sink mode (how events reach Redfish EventService subscribers)
-
-| PACKAGECONFIG | Config value | D-Bus | systemd-cat | /var/log/redfish | EventService delivery path |
-|---|---|---|---|---|---|
-| `event-both` (default) | `both` | ✓ | ✓ | ✗ | bmcweb D-Bus Logging.Entry monitor |
-| `dbus-only` | `dbus` | ✓ | ✗ | ✗ | bmcweb D-Bus Logging.Entry monitor |
-| `journal-only` | `journal` | ✗ | ✓ | ✓ | bmcweb FilesystemLogWatcher |
-
-**Double-delivery prevention:** When D-Bus is used (`dbus` or `both` mode), bmcweb's D-Bus monitor already dispatches to all EventService subscribers. The filesystem log is **not** written to avoid duplicate delivery. The filesystem log is only written in `journal` mode.
-
-#### Usage
-
-Set PACKAGECONFIG in `conf/local.conf`:
-
-```bash
-# Simulation mode with journal-only sink (no D-Bus):
-PACKAGECONFIG:pn-https-guard-openbmc = "simulation journal-only"
-
-# Real daemon mode with D-Bus sink:
-PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"
-
-# Both daemon and simulation (for debugging), with both sinks:
-PACKAGECONFIG:pn-https-guard-openbmc = "both event-both"
-```
-
-Or override on the bitbake command line:
-
-```bash
-bitbake obmc-phosphor-image --extra-config 'PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"'
-```
-
-## QEMU Setup
-
-HTTPS-Guard supports two QEMU networking modes:
-
-| Mode | XDP support | Networking | Use case |
-|---|---|---|---|
-| **SLIRP** (default) | No | user-mode (NAT) | Simulation-only testing |
-| **TAP/bridge** | No on ftgmac100 (verified by `ip link show`) | Virtio-net with generic XDP required | Uprobe-based daemon testing |
-
-> **Important:** Even in TAP/bridge mode, XDP does NOT work on the ASpeed AST2600
-> ftgmac100 NIC driver in QEMU. The uprobe is the only functional enforcement path
-> on this platform. See [Platform Limitations](#platform-limitations) above.
-
-### Mode A: SLIRP (simulation, no eBPF required)
-
-This is the default. No special setup needed.
-
-```bash
-# Default PACKAGECONFIG is "simulation event-both"
-bitbake obmc-phosphor-image
-runqemu johnblue slirp nographic
-```
-
-Inside the guest, verify synthetic events are flowing:
-
-```bash
-systemctl status simulated-event-generator
-journalctl -u simulated-event-generator -f
-
-systemctl status https-guard-event-bridge
-journalctl -u https-guard-event-bridge -f
-```
-
-### Mode B: TAP/bridge (uprobe-based daemon)
-
-Use this when you need the real `https-guardd` daemon with uprobe working inside the
-QEMU guest. XDP will not be available, but the uprobe path provides TLS version
-detection and SOCK_DESTROY enforcement.
-
-#### Step 1 — Host: create the TAP/bridge network
-
-```bash
-./scripts/qemu-setup-tap.sh destroy
-./scripts/qemu-setup-tap.sh create
-```
-
-This creates bridge `br-httpsguard` and TAP `tap-httpsguard` with MAC `52:54:00:12:34:56`.
-The script uses `sudo` internally for the network operations; do not run the whole
-script with `sudo`, or the TAP device will be owned by `root` and QEMU will fail
-to attach to it as your user.
-
-#### Step 2 — Build the image with daemon mode
-
-```bash
-echo 'PACKAGECONFIG:pn-https-guard-openbmc = "daemon dbus-only"' >> conf/local.conf
-bitbake obmc-phosphor-image
-```
-
-#### Step 3 — Launch QEMU with TAP networking
-
-```bash
-QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
-QB_NET=none runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
-```
-
-`QB_NET=none` is required here because `runqemu` otherwise adds its own default
-network backend first, which would duplicate `net0` when the custom TAP device is
-passed through `qemuparams`.
-
-#### Step 4 — Inside the guest: verify and monitor
-
-```bash
-# Verify kernel BPF support is enabled
-zcat /proc/config.gz | grep -E "CONFIG_BPF|CONFIG_UPROBE"
-
-# Check daemon status
-systemctl status https-guard-daemon
-journalctl -u https-guard-daemon -f
-
-# Verify the daemon has uprobe active
-journalctl -u https-guard-daemon -l | grep "enforcement active"
-# Expected: "https_guard: enforcement active via uprobe(SSL_write)"
-
-# Verify XDP is NOT loaded (expected on this platform)
-ip link show eth0
-# No "xdp" or "prog/xdp" line — XDP not available on ftgmac100
-
-# Verify bridge service is processing events
-systemctl status https-guard-event-bridge
-journalctl -u https-guard-event-bridge -f
-
-# Check the event log
-cat /var/log/https_guard_events.log
-```
-
-### Kernel eBPF/XDP configuration
-
-The kernel recipe `linux-aspeed` is extended by `recipes-kernel/linux/linux-aspeed_%.bbappend`, which includes the config fragment `recipes-kernel/linux/bpf-kernel-config.cfg`. This enables all required kernel features:
-
-- `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_JIT`
-- `CONFIG_NET_XDP`, `CONFIG_NET_XDP_XMIT` (generic XDP fallback for virtio)
-- `CONFIG_UPROBE_EVENTS`, `CONFIG_UPROBES`, `CONFIG_KPROBES`
-- `CONFIG_DEBUG_INFO_BTF` (BTF required by CO-RE eBPF)
-- `CONFIG_BPF_EVENTS`, `CONFIG_FPROBE`
-- And more (see the config fragment for the full list)
-
-After building, verify the kernel includes these features:
-
-```bash
-bitbake virtual/kernel -c menuconfig
-# Search for CONFIG_BPF, CONFIG_XDP, CONFIG_UPROBE
-```
-
-Or check the generated config:
-
-```bash
-grep -E "CONFIG_BPF|CONFIG_XDP|CONFIG_UPROBE" tmp/work/johnblue-poky-linux/linux-aspeed/*/build/.config
-```
-
-### Verify services (QEMU or real hardware)
-
-```bash
-# In simulation mode:
-systemctl status simulated-event-generator.service
-journalctl -u simulated-event-generator -f
-
-# In daemon mode:
-systemctl status https-guard-daemon.service
-journalctl -u https-guard-daemon -f
-
-# Always running:
-systemctl status https-guard-event-bridge.service
-journalctl -u https-guard-event-bridge -f
-```
-
-### Validate logging and Redfish
-
-```bash
-busctl tree xyz.openbmc_project.Logging
-
-curl -k https://<bmc-ip>/redfish/v1/EventService
-curl -k https://<bmc-ip>/redfish/v1/EventService/Subscriptions
-```
-
-## Notes on production hardening
-
-- Replace static signatures with configurable rule packs.
-- Add JA3/JA4 fingerprint generation in user space.
-- Integrate with journald and OpenBMC dbus log pipelines.
-- Add unit tests for detector and payload formatter.
-- Add integration tests with replayed PCAP and synthetic SSL_write traffic.
-
-### Certificates in bmcweb
-
-bmcweb uses two PEM files inside the BMC to establish TLS connections, and
-relies on two more directories to decide which certificates/CA chains to
-trust. The four locations are summarised below:
-
-| Path | Role | Direction | Purpose |
-|------|------|-----------|---------|
-| `/etc/ssl/certs/https/server.pem` | Server certificate (Identity Store) | BMC -> client | Presented by bmcweb to your browser/HTTPS client when you open the Redfish web UI. This is the certificate (and matching private key embedded as a combined PEM) that the BMC "shows" to you during the TLS handshake on port 4433. |
-| `/etc/ssl/certs/https/client.pem` | Client certificate (Identity Store, optional) | BMC -> remote server | Used by bmcweb when it acts as a TLS **client**. This covers both ordinary outbound HTTPS calls from bmcweb and **mutual TLS (mTLS)** to a Redfish event subscriber — the BMC will present this certificate to the listener if the subscriber's destination is configured to request a client cert. |
-| `/etc/ssl/certs/https/` (folder) | Identity Store | BMC -> peer | The directory containing the PEM files above. Together they are what the BMC shows to *you* (as a server) and to *remote services* (as a client) during TLS handshakes. |
-| `/etc/ssl/certs/authority/` (folder) | Trust Store (Authority) | BMC <- remote server | The directory of CA / leaf certificates the BMC uses to decide whether a **remote** server (e.g. your event destination) is trusted. When the BMC POSTs an event to `https://<listener-ip>:8443/events`, it validates the listener's certificate chain against this directory. |
-
-Conceptually:
-
-- **Identity Store** (what the BMC shows to you): `/etc/ssl/certs/https/server.pem`
-  and `/etc/ssl/certs/https/client.pem`.
-- **Trust Store / Authority** (who the BMC trusts): `/etc/ssl/certs/authority/`.
-
-If a remote certificate is not in the Trust Store, the BMC will refuse the
-TLS connection unless the subscription is created with `VerifyCertificate:
-false`. The section below walks through both flows.
-
-### Subscribe to Redfish EventService (HTTPS push)
-
-The BMC delivers events by POSTing JSON payloads to a destination URL that
-you register through the Redfish `EventService/Subscriptions` endpoint. The
-full flow is: prepare a local HTTPS receiver, install its certificate into
-the BMC's Trust Store (optional but recommended), then create the
-subscription.
-
-#### Step 1 — Prepare an HTTPS receiver on the listener machine
-
-On the machine whose IP you will use as `Destination` (replace
-`192.168.11.76` with the actual IP that the BMC can reach), generate a
-self-signed certificate whose CN/SAN matches that IP:
-
-```bash
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout key.pem -out cert.pem -days 365 \
-  -subj "/CN=<bmc-ip>" \
-  -addext "subjectAltName = IP:192.168.11.76"
-```
-
-This produces two files: `cert.pem` (server certificate) and `key.pem`
-(matching private key).
-
-#### Step 2 — Run a minimal Python HTTPS listener
-
-Save the following as `~/MyListener/listener.py`:
-
-```python
-# save as ~/MyListener/listener.py
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import ssl
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
-        print(f"\n[EVENT RECEIVED] Path: {self.path}")
-        print(body.decode('utf-8'))
-        
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Success")
-
-# Configuration
-server_address = ('0.0.0.0', 8443)
-httpd = HTTPServer(server_address, Handler)
-
-# SSL Setup
-context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-# Since we generated separate files in Step 1:
-context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
-
-httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-
-print(f"Listener active on https://{server_address[0]}:{server_address[1]}/events")
-httpd.serve_forever()
-```
-
-Start the listener in another terminal:
-
-```bash
-cd ~/MyListener
-python3 listener.py
-```
-
-You should see `Listener active on https://0.0.0.0:8443/events`. The BMC
-will POST Redfish event payloads to `https://<listener-ip>:8443/events`.
-
-#### Step 3 — Add the listener's certificate to the BMC Trust Store
-
-Before subscribing with certificate verification enabled, the BMC must
-trust the listener's self-signed `cert.pem`. Upload it to
-`/redfish/v1/Managers/bmc/Truststore/Certificates/`. The `sed` command
-flattens the PEM file so that it can be passed inline as a JSON string:
-
-```bash
-curl -k -u root:0penBmc -X POST \
-  https://192.168.11.76:4433/redfish/v1/Managers/bmc/Truststore/Certificates/ \
-  -H "Content-Type: application/json" \
-  -d "{\"CertificateString\": \"$(sed ':a;N;$!ba;s/\n/\\n/g' cert.pem)\", \"CertificateType\": \"PEM\"}" -v
-```
-
-After this call, `cert.pem` is known to the BMC and the TLS handshake
-from the BMC to your listener will succeed even when `VerifyCertificate`
-is left at its default (`true`).
-
-#### Step 4 — Create the subscription
-
-With Trust Store entry in place (certificate verification enabled):
-
-```bash
-curl -k -X POST https://<bmc-ip>:4433/redfish/v1/EventService/Subscriptions \
-	-H "Content-Type: application/json" \
-	-d '{
-		"Destination": "https://<bmc-ip>:8443/events",
-		"Protocol": "Redfish",
-		"SubscriptionType": "RedfishEvent",
-		"Context": "https-guard-demo"
-	}'
-```
-
-Alternatively, if you do **not** want to install the listener certificate
-into the Trust Store (for example, while doing a quick local test), you
-can disable verification on a per-subscription basis by setting
-`VerifyCertificate` to `false`:
-
-```bash
-curl -k -X POST https://<bmc-ip>/redfish/v1/EventService/Subscriptions \
-	-H "Content-Type: application/json" \
-	-d '{
-		"Destination": "https://<listener-ip>:8443/events",
-		"VerifyCertificate": false,
-		"Protocol": "Redfish",
-		"SubscriptionType": "RedfishEvent",
-		"Context": "https-guard-demo"
-	}'
-```
-
-Notes:
-
-- `<bmc-ip>` is the BMC's address (default port `4433`).
-- `<listener-ip>` is the IP that the BMC can reach to deliver events
-  (the same IP you used as CN/SAN in Step 1).
-- `Context` is an opaque string echoed back in every event payload; it is
-  useful for filtering in your listener.
-- If BMC authentication is enabled, add `-u <user>:<password>` to the
-  `curl` commands above.
-- Use the HTTPS push subscription when you want the BMC to POST events to
-  another service. Use SSE when you want to watch the event stream
-  directly from a terminal without creating a subscription destination.
-
-Listen to Redfish events over Server-Sent Events (SSE):
-- HTTP/2 incompatibility: The connection negotiated h2 via ALPN (confirmed in the log: ALPN selected protocol "h2"). SseSocketRule::handleUpgrade in bmcweb only has overloads for plain TCP and TLS-over-TCP (HTTP/1.1). There is no HTTP/2 overload — so even with the correct path, SSE would fail. SSE requires HTTP/1.1.
-- Missing trailing slash: The route is registered as /redfish/v1/EventService/SSE/ (with /) but the curl request was /redfish/v1/EventService/SSE (without /). That's why the catch-all /redfish/<path> matched and returned 404.
-
-```bash
-curl --http1.1 -k -N -u root:0penBmc -H "Accept: text/event-stream" \
-  "https://<bmc-ip>:4433/redfish/v1/EventService/SSE/"
+         Kernel space                              User space
+         ===========                              ==========
+
+Wire: TLS ClientHello on TCP/443          Process: SSL_write(buf, num)
+  │                                               │
+  ▼                                               ▼
+eBPF XDP hook (AUXILIARY)                  eBPF Uprobe hook (PRIMARY)
+  │  (NOT on ASpeed ftgmac100)                   │  (ssl->version from OpenSSL)
+  │                                              │  (payload snippet)
+  │                                              │
+  └─────────────┬────────────────────────────────┘
+                │  shared `events` ring buffer (BPF_MAP_TYPE_RINGBUF)
+                ▼
+   ┌───────────────────────────────────────────────────────────┐
+   │  C++ daemon: https-guardd                                 │
+   │  ┌─────────────────────────────────────────────────────┐  │
+   │  │ ring_buffer__poll() loop                            │  │
+   │  │   → on_event() callback                             │  │
+   │  │     → pattern_detector.hpp (anomaly rules)          │  │
+   │  │     → Classify event                                │  │
+   │  │     → For uprobe events: ProcPeerResolver(pid)      │  │
+   │  │       reads /proc/<pid>/net/tcp → socket 4-tuple    │  │
+   │  │     └── pushAction(LogAction)                       │  │
+   │  │     └── pushAction(BlockTcpAction)                  │  │
+   │  │     └── pushAction(BlocklistAddAction)              │  │
+   │  └──────────────────────┬──────────────────────────────┘  │
+   │                         │ ActionLoop background thread    │
+   │  ┌──────────────────────▼─────────────────────────────┐   │
+   │  │ ActionLoop (Boost.Asio io_context)                 │   │
+   │  │  ┌─────────────────────────────────────────────┐   │   │
+   │  │  │ LogAction → async_write(JSON line)          │   │   │
+   │  │  ├─────────────────────────────────────────────┤   │   │
+   │  │  │ BlockTcpAction → SOCK_DESTROY via Netlink   │   │   │
+   │  │  ├─────────────────────────────────────────────┤   │   │
+   │  │  │ BlocklistAddAction → BPF map update         │   │   │
+   │  │  └─────────────────────────────────────────────┘   │   │
+   │  └────────────────────────────────────────────────────┘   │
+   └──────────────────────┬────────────────────────────────────┘
+                          │  /var/log/https_guard_events.log
+                          ▼
+                   Bridge → EventService subscribers
 ```

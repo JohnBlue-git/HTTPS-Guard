@@ -30,6 +30,19 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
+/* NOTE on OpenSSL ssl_st struct access:
+ *
+ * We do NOT use CO-RE (bpf_core_read) for userspace structs because
+ * CO-RE relocations require the target type to exist in the kernel's
+ * BTF — but ssl_st is a userspace struct from libssl.so, not a kernel
+ * struct.  The kernel BTF has no type ID for it, so any CO-RE
+ * relocation for ssl_st fields will fail at program load time with
+ * "invalid CO-RE relocation" / "failed to resolve CO-RE relocation".
+ *
+ * Instead we read ssl->version directly from userspace memory using
+ * bpf_probe_read_user() (see https_guard_ssl_write below for the
+ * exact offset, which was empirically determined). */
+
 /* Hybrid enforcement: see actions/blocklist.bpf.h. The early-return XDP_DROP
  * check lives entirely in this header so the .bpf.c detection logic
  * stays uncluttered. */
@@ -160,12 +173,26 @@ safe_strlcpy(char *dst, const void *src, int dst_sz, void *data_end)
  *   - arg2: buf  (pointer to plaintext)
  *   - arg3: num  (length in bytes)
  *
- * In OpenSSL 3.x, the `version` field is the first 16-bit integer
- * in the `ssl_st` struct at a fixed offset.  We use CO-RE
- * (bpf_core_read) to read it portably across OpenSSL versions.
+ * This is a USERS-UPROBE: it fires in the context of the process that
+ * calls SSL_write().  All data pointers (ssl, buf) are userspace virtual
+ * addresses.  The `version` field is read using bpf_probe_read_user()
+ * rather than bpf_core_read() because ssl_st is a userspace struct with
+ * no kernel BTF type ID — see the note at the top of this file.
  *
- * For builds without CO-RE support, the fallback offset is 0
- * (version is the first field in `ssl_st`).
+ * The ssl_st struct layout in OpenSSL 3.x on ARM 32-bit was
+ * empirically determined to place `version` at offset 36:
+ *
+ *   offset 0:  SSL_CTX *ctx          (4 bytes)
+ *   offset 4:  SSL_METHOD *method    (4 bytes)
+ *   offset 8:  BIO *wbio             (4 bytes)
+ *   offset 12: BIO *rbio             (4 bytes)
+ *   ...
+ *   offset 36: int version           <- TLS version code (0x0303=1.2, 0x0304=1.3)
+ *
+ * CAVEAT: This offset may differ on other architectures (e.g. x86_64
+ * where pointers are 8 bytes) or other OpenSSL versions.  If detection
+ * fails on a new platform, enable the bpf_printk diagnostic scanning
+ * code in the uprobe to locate the correct offset.
  */
 SEC("uprobe/ssl_write")
 int https_guard_ssl_write(struct pt_regs *ctx)
@@ -177,6 +204,10 @@ int https_guard_ssl_write(struct pt_regs *ctx)
     if (num <= 0 || !buf || !ssl)
         return 0;
 
+    // Would output to /sys/kernel/debug/tracing/trace_pipe
+    bpf_printk("https_guard: uprobe hit pid=%d num=%d\n",
+               bpf_get_current_pid_tgid() >> 32, num);
+
     struct hg_event *evt;
 
     evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
@@ -184,53 +215,42 @@ int https_guard_ssl_write(struct pt_regs *ctx)
         return 0;
 
     __builtin_memset(evt, 0, sizeof(*evt));
-    fill_common_fields(evt, (void *)(unsigned long)(num));
+    fill_common_fields(evt, NULL);
 
-    /*
-     * Read the negotiated TLS version from the SSL object.
+    /* ---------------------------------------------------------------
+     * Read ssl->version from userspace memory.
      *
-     * In OpenSSL 3.x, ssl->version is a uint16_t at the start of
-     * the SSL struct (offset 0).  We use bpf_probe_read_user()
-     * instead of bpf_core_read() because vmlinux.h only contains
-     * kernel type definitions — OpenSSL's ssl_st is a userspace
-     * struct with no BTF/CO-RE information available to the BPF
-     * verifier.
+     * We use bpf_probe_read_user() because the ssl pointer is a
+     * userspace virtual address.  bpf_probe_read_user() handles page
+     * faults gracefully — if the pointer is invalid, it returns -EFAULT
+     * and version_raw remains 0.
      *
-     * Negotiated version values:
-     *   0x0301 = TLS 1.0
-     *   0x0302 = TLS 1.1
-     *   0x0303 = TLS 1.2
-     *   0x0304 = TLS 1.3
-     */
+     * OpenSSL 3.x ssl_st struct layout (empirically determined on
+     * ARM 32-bit johnblue build, OpenSSL 3.x):
+     *
+     *   offset 0:  SSL_CTX *ctx          (4 bytes on 32-bit ARM)
+     *   offset 4:  SSL_METHOD *method     (4 bytes)
+     *   offset 8:  BIO *wbio              (4 bytes)
+     *   offset 12: BIO *rbio              (4 bytes)
+     *   ...
+     *   offset 36: int version            <-- TLS version code here!
+     *   ...
+     *
+     * The negotiated TLS version (e.g. TLS 1.2 = 0x0303, TLS 1.3 = 0x0304)
+     * is stored in the lower 16 bits of this 4-byte int at offset 36.
+     * --------------------------------------------------------------- */
+    __u32 version_raw = 0;
     __u16 tls_version = 0;
-    bpf_probe_read_user(&tls_version, sizeof(tls_version),
-                        (const void *)ssl);
 
+    if (bpf_probe_read_user(&version_raw, sizeof(version_raw),
+                            (const void *)((uintptr_t)ssl + 36)) == 0) {
+        tls_version = (__u16)(version_raw & 0xFFFF);
+    }
+
+    /* Store the TLS version in the event so userspace can log it */
     evt->tls_version = tls_version;
 
-    /*
-     * Report socket info via /proc/self/net/tcp lookup is not
-     * feasible from BPF uprobes.  Set these to 0; the userspace
-     * daemon will correlate by PID if needed.
-     */
-    evt->src_ip_v4 = 0;
-    evt->dst_ip_v4 = 0;
-    evt->src_port  = 0;
-    evt->dst_port  = 0;
-
-    /* Capture a snippet of the plaintext payload. */
-    int copy_sz = num < (int)sizeof(evt->payload_snippet) - 1
-                      ? num
-                      : (int)sizeof(evt->payload_snippet) - 1;
-
-    bpf_probe_read_user(evt->payload_snippet, copy_sz, buf);
-    evt->payload_snippet[copy_sz] = '\0';
-
-    /*
-     * Classify the event:
-     *   - TLS version violation (version < 1.2)
-     *   - Otherwise treat as plain HTTP payload observation
-     */
+    /* Classify the event based on TLS version */
     if (tls_version > 0 && tls_version < 0x0303) {
         evt->event_type = HG_EVENT_TLS_VERSION_VIOLATION;
         evt->severity   = HG_SEV_CRITICAL;
@@ -238,6 +258,24 @@ int https_guard_ssl_write(struct pt_regs *ctx)
         evt->event_type = HG_EVENT_HTTP_PAYLOAD_OBSERVED;
         evt->severity   = HG_SEV_INFO;
     }
+
+    /*
+     * Socket info is not available from an SSL_write uprobe
+     * (no packet context).  Set to 0; the userspace daemon
+     * correlates by PID via /proc/<pid>/net/tcp if needed.
+     */
+    evt->src_ip_v4 = 0;
+    evt->dst_ip_v4 = 0;
+    evt->src_port  = 0;
+    evt->dst_port  = 0;
+
+    /* Capture a snippet of the plaintext payload for anomaly detection */
+    int copy_sz = num < (int)sizeof(evt->payload_snippet) - 1
+                      ? num
+                      : (int)sizeof(evt->payload_snippet) - 1;
+
+    bpf_probe_read_user(evt->payload_snippet, copy_sz, buf);
+    evt->payload_snippet[copy_sz] = '\0';
 
     bpf_ringbuf_submit(evt, 0);
     return 0;

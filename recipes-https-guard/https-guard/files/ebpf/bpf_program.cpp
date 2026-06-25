@@ -1,4 +1,5 @@
 #include <utility>
+#include <iostream>
 
 #include "bpf_program.hpp"
 
@@ -110,9 +111,14 @@ void BpfProgram::closeObject() noexcept
 int BpfProgram::pollEvents(int timeout_ms) noexcept
 {
     if (!ring_buffer_) {
+        std::cerr << "https_guard: pollEvents called but ring_buffer_ is null\n";
         return -1;
     }
-    return ring_buffer__poll(ring_buffer_, timeout_ms);
+    const int rc = ring_buffer__poll(ring_buffer_, timeout_ms);
+    if (rc < 0 && rc != -EINTR) {
+        std::cerr << "https_guard: ring_buffer__poll returned " << rc << " (" << strerror(-rc) << ")\n";
+    }
+    return rc;
 }
 
 int BpfProgram::getProgramFd(const std::string& prog_name) const noexcept
@@ -138,11 +144,18 @@ bool BpfProgram::registerEventHandler() noexcept
 {
     const int map_fd = getMapFd("events");
     if (map_fd < 0) {
+        std::cerr << "https_guard: failed to find 'events' ring buffer map\n";
         return false;
     }
 
+    std::cerr << "https_guard: creating ring buffer (map_fd=" << map_fd << ")\n";
     ring_buffer_ = ring_buffer__new(map_fd, getRingBufferHandler(), this, nullptr);
-    return ring_buffer_ != nullptr;
+    if (!ring_buffer_) {
+        std::cerr << "https_guard: ring_buffer__new failed: " << strerror(errno) << "\n";
+        return false;
+    }
+    std::cerr << "https_guard: ring buffer created successfully\n";
+    return true;
 }
 
 void BpfProgram::releaseRingBuffer() noexcept

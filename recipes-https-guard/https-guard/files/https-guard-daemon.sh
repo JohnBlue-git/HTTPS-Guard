@@ -13,8 +13,51 @@ CONF_FILE="/etc/default/https-guard"
 DAEMON="/usr/sbin/https-guardd"
 BPF_OBJ="${HTTPS_GUARD_BPF_OBJ:-/usr/share/https-guard/https_guard.bpf.o}"
 IFACE="${HTTPS_GUARD_IFACE:-eth0}"
-SSL_LIB="${HTTPS_GUARD_SSL_LIB:-/usr/lib/libssl.so.3}"
 OUTPUT="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
+
+# Auto-detect libssl if not explicitly configured
+if [ -n "${HTTPS_GUARD_SSL_LIB:-}" ]; then
+    SSL_LIB="$HTTPS_GUARD_SSL_LIB"
+else
+    SSL_LIB=""
+    # Try common paths in order of likelihood on OpenBMC targets
+    for candidate in \
+        /usr/lib/libssl.so.3 \
+        /usr/lib64/libssl.so.3 \
+        /usr/lib/aarch64-linux-gnu/libssl.so.3 \
+        /usr/lib/arm-linux-gnueabihf/libssl.so.3 \
+        /usr/lib/arm-linux-gnueabi/libssl.so.3 \
+        /lib/libssl.so.3 \
+        /lib64/libssl.so.3
+    do
+        if [ -f "$candidate" ]; then
+            SSL_LIB="$candidate"
+            break
+        fi
+    done
+
+    # Fallback: search via /proc for any process that has libssl mapped
+    if [ -z "$SSL_LIB" ]; then
+        for pid_dir in /proc/[0-9]*; do
+            pid="${pid_dir##*/}"
+            maps_file="$pid_dir/maps"
+            [ -r "$maps_file" ] || continue
+            # Look for libssl.so in the process memory maps
+            found=$(grep -h 'libssl\.so' "$maps_file" 2>/dev/null | head -1 | awk '{print $NF}')
+            if [ -n "$found" ] && [ -f "$found" ]; then
+                SSL_LIB="$found"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$SSL_LIB" ]; then
+        echo "https-guard-daemon: WARNING: could not auto-detect libssl.so.3, defaulting to /usr/lib/libssl.so.3" >&2
+        SSL_LIB="/usr/lib/libssl.so.3"
+    else
+        echo "https-guard-daemon: auto-detected libssl at $SSL_LIB" >&2
+    fi
+fi
 
 # Verify the daemon binary exists
 if [ ! -x "$DAEMON" ]; then

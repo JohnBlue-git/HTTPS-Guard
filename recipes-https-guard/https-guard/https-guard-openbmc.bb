@@ -101,6 +101,8 @@ EXTRA_OECMAKE += " \
 
 do_configure[depends] += "virtual/kernel:do_compile"
 
+# Userspace struct access (ssl_st) does NOT use CO-RE — see the note in
+# https_guard.bpf.c and CMakeLists.txt for the rationale.
 do_configure:prepend() {
     if [ "${HTTPS_GUARD_BUILD_BPF}" != "ON" ]; then
         return 0

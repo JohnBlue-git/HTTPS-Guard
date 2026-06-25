@@ -75,7 +75,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::cout << "HTTPS-Guard daemon started\n"
+    std::cerr << "HTTPS-Guard daemon started\n"
               << "  interface: " << cfg.iface << "\n"
               << "  ssl lib:   " << cfg.openssl_lib_path << "\n"
               << "  bpf obj:   " << cfg.bpf_object_path << "\n"
@@ -85,6 +85,9 @@ int main(int argc, char** argv)
         const int rc = program.pollEvents(200);
         if (rc == -EINTR) {
             break;
+        }
+        if (rc < 0) {
+            std::cerr << "https_guard: pollEvents error: " << rc << " (" << strerror(-rc) << ")\n";
         }
     }
 

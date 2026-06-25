@@ -90,7 +90,7 @@ The single BPF C file compiles to one BPF object that contains **two independent
 | Section | Type | Hook Point | Purpose | Availability |
 |---------|------|------------|---------|-------------|
 | `SEC("uprobe/ssl_write")` — `https_guard_ssl_write` | Uprobe (PRIMARY) | Userspace function `SSL_write` in OpenSSL | Reads ssl->version for TLS violation detection; captures plaintext payload snippets | All platforms with CONFIG_UPROBE_EVENTS |
-| `SEC("xdp")` — `https_guard_xdp` | XDP (AUXILIARY) | Network driver (RX path) | Inspects TLS ClientHello on port 443; detects TLS version violations and plaintext HTTP | Only on platforms with NIC-level XDP support (NOT on ASpeed AST2600 ftgmac100) |
+| `SEC("xdp")` — `https_guard_xdp` | XDP (AUXILIARY) | Network driver (RX path) or generic SKB mode | Inspects TLS ClientHello on port 443; detects TLS version violations and plaintext HTTP | Native: NICs with ndo_bpf (not ftgmac100). Generic (SKB): any NIC including virtio-net in QEMU TAP+BRIDGE mode |
 
 ### Uprobe Hook: TLS Version Detection & Payload Capture (PRIMARY)
 
@@ -100,7 +100,7 @@ The single BPF C file compiles to one BPF object that contains **two independent
 
 **What is captured:**
 
-- **TLS version** (`ssl->version`) — read from the OpenSSL SSL object using `bpf_probe_read_user()`. In OpenSSL 3.x, the `version` field (uint16_t) is the first field of the `ssl_st` struct at offset 0. Values:
+- **TLS version** (`ssl->version`) — read from the OpenSSL SSL object using `bpf_probe_read_user()`. The `ssl_st` struct layout in OpenSSL 3.x on ARM 32-bit places `version` at **offset 36** (not offset 0 — the struct has many pointer fields before it). Values:
   - `0x0301` = TLS 1.0
   - `0x0302` = TLS 1.1
   - `0x0303` = TLS 1.2
@@ -117,14 +117,24 @@ The single BPF C file compiles to one BPF object that contains **two independent
 
 **Important note on reading userspace structs:**
 
-The uprobe uses `bpf_probe_read_user()` instead of `bpf_core_read()` because OpenSSL's `ssl_st` is a userspace library struct with no BTF/CO-RE information in `vmlinux.h`. Using `bpf_core_read()` would fail CO-RE relocation.
+The uprobe uses `bpf_probe_read_user()` instead of `bpf_core_read()` because OpenSSL's `ssl_st` is a userspace library struct with no BTF/CO-RE information in `vmlinux.h`. Using `bpf_core_read()` would fail CO-RE relocation at program load time with "invalid CO-RE relocation" / "failed to resolve CO-RE relocation".
+
+The offset of the `version` field within `ssl_st` was empirically determined by scanning offsets 0-80 on the target platform. On ARM 32-bit (johnblue), the version field is at offset 36. On other architectures (e.g. x86_64 where pointers are 8 bytes), the offset will differ. If detection fails on a new platform, enable the `bpf_printk` diagnostic scanning code in the uprobe to locate the correct offset.
 
 ### XDP Hook: Wire-Level TLS Inspection (AUXILIARY)
 
-> **IMPORTANT:** XDP is NOT available on the ASpeed AST2600 ftgmac100 NIC (the standard
-> BMC network controller). This has been verified by checking `ip link show eth0` which
-> shows no `xdp` or `prog/xdp` line. The XDP code remains in the BPF object for
-> platforms with NIC-level XDP support, but it does NOT function on typical BMC hardware.
+> **IMPORTANT:** XDP comes in two modes:
+> - **Native XDP** (driver-level `ndo_bpf`): Requires NIC driver support. The ASpeed
+>   AST2600 ftgmac100 driver has zero XDP support — verified by `ip link show eth0`
+>   showing no `xdp` or `prog/xdp` line.
+> - **Generic XDP / SKB mode** (`XDP_FLAGS_SKB_MODE`): A software fallback that hooks
+>   into `netif_receive_skb()`. Works with any NIC, including virtio-net in QEMU
+>   TAP+BRIDGE mode.
+>
+> The daemon now tries **native XDP first**, then falls back to **generic (SKB) XDP**
+> automatically. This means XDP works in QEMU TAP+BRIDGE mode with virtio-net-pci.
+> On SLIRP (default) or real ftgmac100 hardware, both attempts fail gracefully and
+> the daemon continues with uprobe only.
 > See [Platform Limitations](#platform-limitations) below.
 
 **What is inspected:**
@@ -163,6 +173,15 @@ The blocklist map (`src_blocklist`) is a `BPF_MAP_TYPE_HASH` with a maximum of 1
 
 ## Platform Limitations
 
+### XDP Support Summary
+
+| Platform | NIC | Native XDP | Generic XDP (SKB mode) | Current Status |
+|----------|-----|------------|------------------------|----------------|
+| x86 native host (supported NIC) | e.g. ixgbe, mlx5, virtio-net | ✅ Yes | ✅ Yes | ✅ XDP works natively |
+| QEMU johnblue TAP+BRIDGE | virtio-net-pci (via `-device virtio-net-pci`) | ✅ Yes | ✅ Yes | ✅ XDP works (generic SKB mode via `bpf_xdp_attach` fallback) |
+| QEMU johnblue SLIRP (default) | ftgmac100 (emulated, slirp backend) | ❌ No | ❌ No (slirp has no real netdev) | ❌ XDP not possible |
+| Real ASpeed AST2600 HW | ftgmac100 | ❌ No (no ndo_bpf) | ❌ No (ftgmac100 lacks generic XDP support) | ❌ XDP not possible |
+
 ### XDP Not Available on ASpeed AST2600 (ftgmac100)
 
 The XDP hook code remains in https_guard.bpf.c for platforms with NIC-level XDP support,
@@ -184,7 +203,42 @@ https_guard: XDP program not found; running uprobe only
 https_guard: enforcement active via uprobe(SSL_write)
 ```
 
+### Enabling XDP in QEMU (TAP+BRIDGE + virtio-net-pci)
+
+To get XDP working in QEMU, you **must** use TAP+BRIDGE networking with the virtio-net-pci
+device. The default SLIRP mode does NOT expose a real NIC to the guest.
+
+The daemon's XDP attach logic in `https_guard_program.cpp` now implements a two-step fallback:
+1. Try **native XDP** (`XDP_FLAGS_UPDATE_IF_NOEXIST`) — works on real NICs with ndo_bpf.
+2. On failure, try **generic XDP / SKB mode** (`XDP_FLAGS_SKB_MODE`) — works on virtio-net.
+
+This means when you launch QEMU with the TAP+BRIDGE configuration described in
+[johnblue.conf](../../conf/machine/johnblue.conf), XDP will attach successfully in
+generic SKB mode.
+
+**Verification inside the guest:**
+```bash
+# Check daemon logs for XDP attach status
+journalctl -u https-guard-daemon -l | grep "XDP attached"
+# Expected: "https_guard: XDP attached in generic (SKB) mode"
+
+# Verify XDP is loaded on the interface
+ip link show eth0 | grep -i xdp
+# Expected: "xdp/generic" or "xdp" in the output
+```
+
+**Kernel configuration requirement:**
+The kernel must have `CONFIG_NET_XDP_XMIT=y` for generic XDP. This is already enabled
+by the `bpf-kernel-config.cfg` fragment applied via `linux-aspeed_%.bbappend`. Build
+and verify with:
+```bash
+bitbake virtual/kernel -c menuconfig  # Search for CONFIG_NET_XDP_XMIT
+```
+
 ### Uprobe-Only Enforcement
+
+When XDP is not available (SLIRP mode or real ftgmac100 hardware), enforcement works
+entirely through the uprobe+SOCK_DESTROY path:
 
 Since XDP is not available, TLS security enforcement works as follows:
 
@@ -289,9 +343,9 @@ The callback classifies incoming ring buffer events and dispatches countermeasur
 1. **Size validation** — drops undersized (< `sizeof(hg_event)`) records.
 2. **Event type dispatch**:
    - `HG_EVENT_TLS_VERSION_VIOLATION` → critical event, marked actionable.
-   - `HG_EVENT_HTTP_PAYLOAD_OBSERVED` or `HG_EVENT_HTTP_ANOMALY_DETECTED` → runs pattern detection; if suspicious, marked actionable.
+   - `HG_EVENT_HTTP_PAYLOAD_OBSERVED`, `HG_EVENT_HTTP_ANOMALY_DETECTED`, or `HG_EVENT_TLS_HANDSHAKE_METADATA` → runs pattern detection; if suspicious, marked actionable. Non-suspicious events are logged as informational (not silently dropped).
 3. **Enforcement actions**:
-   - **LogAction** — always pushed.
+   - **LogAction** — always pushed (all events are logged, including non-suspicious ones).
    - **XDP path** (src_ip_v4 != 0): BlockTcpAction + BlocklistAddAction with direct 4-tuple.
    - **Uprobe path** (src_ip_v4 == 0): reads /proc/<pid>/net/tcp via ProcPeerResolver to find socket 4-tuple, then issues BlockTcpAction + BlocklistAddAction.
 
@@ -389,7 +443,7 @@ The recipe sources include all source files under `files/`:
 ### Build Steps
 
 1. `do_configure[depends]` — depends on `virtual/kernel:do_compile` for vmlinux.
-2. `do_configure:prepend` — locates target kernel vmlinux for CO-RE header generation.
+2. `do_configure:prepend` — locates target kernel vmlinux for CO-RE header generation. No libssl BTF header is generated (userspace shared libraries do not have BTF debug info).
 3. `do_compile` — CMake build handles both the C++ daemon and (optionally) the BPF object.
 4. `do_install` — installs shell wrappers, compiled daemon binary, action_runner, BPF object, systemd units, and config file.
 
@@ -431,31 +485,32 @@ eBPF XDP hook (AUXILIARY)                  eBPF Uprobe hook (PRIMARY)
   └─────────────┬────────────────────────────────┘
                 │  shared `events` ring buffer (BPF_MAP_TYPE_RINGBUF)
                 ▼
-   ┌──────────────────────────────────────────────────────────┐
+   ┌───────────────────────────────────────────────────────────┐
    │  C++ daemon: https-guardd                                 │
-   │  ┌────────────────────────────────────────────────────┐  │
+   │  ┌─────────────────────────────────────────────────────┐  │
    │  │ ring_buffer__poll() loop                            │  │
    │  │   → on_event() callback                             │  │
    │  │     → pattern_detector.hpp (anomaly rules)          │  │
    │  │     → Classify event                                │  │
    │  │     → For uprobe events: ProcPeerResolver(pid)      │  │
-   │  │       reads /proc/<pid>/net/tcp → socket 4-tuple   │  │
+   │  │       reads /proc/<pid>/net/tcp → socket 4-tuple    │  │
    │  │     └── pushAction(LogAction)                       │  │
    │  │     └── pushAction(BlockTcpAction)                  │  │
    │  │     └── pushAction(BlocklistAddAction)              │  │
    │  └──────────────────────┬──────────────────────────────┘  │
    │                         │ ActionLoop background thread    │
-   │  ┌──────────────────────▼─────────────────────────────┐  │
-   │  │ ActionLoop (Boost.Asio io_context)                  │  │
-   │  │  ┌─────────────────────────────────────────────┐   │  │
-   │  │  │ LogAction → async_write(JSON line)           │   │  │
-   │  │  ├─────────────────────────────────────────────┤   │  │
-   │  │  │ BlockTcpAction → SOCK_DESTROY via Netlink    │   │  │
-   │  │  ├─────────────────────────────────────────────┤   │  │
-   │  │  │ BlocklistAddAction → BPF map update          │   │  │
-   │  │  └─────────────────────────────────────────────┘   │  │
-   │  └────────────────────────────────────────────────────┘  │
-   └──────────────────────┬───────────────────────────────────┘
+   │  ┌──────────────────────▼─────────────────────────────┐   │
+   │  │ ActionLoop (Boost.Asio io_context)                 │   │
+   │  │  ┌─────────────────────────────────────────────┐   │   │
+   │  │  │ LogAction → async_write(JSON line)          │   │   │
+   │  │  ├─────────────────────────────────────────────┤   │   │
+   │  │  │ BlockTcpAction → SOCK_DESTROY via Netlink   │   │   │
+   │  │  ├─────────────────────────────────────────────┤   │   │
+   │  │  │ BlocklistAddAction → BPF map update         │   │   │
+   │  │  └─────────────────────────────────────────────┘   │   │
+   │  └────────────────────────────────────────────────────┘   │
+   └──────────────────────┬────────────────────────────────────┘
                           │  /var/log/https_guard_events.log
                           ▼
                    Bridge → EventService subscribers
+```

@@ -2,6 +2,8 @@
 #include <iostream>
 #include <utility>
 
+#include <linux/if_link.h>  /* XDP_FLAGS_SKB_MODE, XDP_FLAGS_UPDATE_IF_NOEXIST */
+
 #include "https_guard_program.hpp"
 #include "log/LogAction.hpp"
 #include "blocklist/Blocklist.hpp"
@@ -46,27 +48,66 @@ bool HttpGuardProgram::attachProgram() noexcept
         bpf_link* uprobe_link = bpf_program__attach_uprobe_opts(
             uprobe_prog, -1, openssl_lib_path_.c_str(), 0, &uprobe_opts);
         if (!uprobe_link || libbpf_get_error(uprobe_link)) {
+            int err = libbpf_get_error(uprobe_link);
             std::cerr << "https_guard: failed to attach SSL_write uprobe at '"
-                      << openssl_lib_path_ << "': "
-                      << strerror(-libbpf_get_error(uprobe_link)) << "\n";
+                      << openssl_lib_path_ << "' (err=" << err
+                      << ", " << strerror(-err) << ")\n";
         } else {
+            std::cerr << "https_guard: uprobe attached to " << openssl_lib_path_
+                      << " (link fd=" << bpf_link__fd(uprobe_link) << ")\n";
             links_.push_back(uprobe_link);
             have_uprobe = true;
         }
     }
 
-    // XDP is an AUXILIARY program — only works on platforms with
-    // NIC-level XDP support (not available on ASpeed AST2600 QEMU).
+    // XDP is an AUXILIARY program — works in native mode on NICs with
+    // ndo_bpf support, or in generic (SKB) mode on any NIC including
+    // virtio-net in QEMU TAP+BRIDGE mode.
+    //
+    // The attach order is:
+    //   1. Try native XDP  (XDP_FLAGS_UPDATE_IF_NOEXIST)
+    //   2. On failure, try generic XDP (XDP_FLAGS_SKB_MODE)
+    //   3. On both failures, log non-fatal and continue with uprobe only
     bpf_program* xdp_prog = bpf_object__find_program_by_name(object_, "https_guard_xdp");
     if (xdp_prog) {
-        bpf_link* xdp_link = bpf_program__attach_xdp(xdp_prog, ifindex_);
-        if (!xdp_link || libbpf_get_error(xdp_link)) {
-            std::cerr << "https_guard: failed to attach XDP program to ifindex "
-                      << ifindex_ << " (non-fatal, continuing with uprobe only): "
-                      << strerror(-libbpf_get_error(xdp_link)) << "\n";
+        int xdp_fd = bpf_program__fd(xdp_prog);
+        if (xdp_fd < 0) {
+            std::cerr << "https_guard: failed to get XDP program fd (non-fatal): "
+                      << strerror(errno) << "\n";
         } else {
-            links_.push_back(xdp_link);
-            have_xdp = true;
+            struct bpf_xdp_attach_opts opts = {};
+            opts.sz = sizeof(opts);
+            int native_err;
+            int generic_err;
+
+            // Attempt 1: native XDP (driver-level ndo_bpf).
+            // This works on real hardware NICs that support XDP natively.
+            native_err = bpf_xdp_attach(ifindex_, xdp_fd,
+                                        XDP_FLAGS_UPDATE_IF_NOEXIST, &opts);
+            if (native_err) {
+                // Attempt 2: generic XDP (SKB_MODE / software fallback).
+                // This works on virtio-net (QEMU TAP+BRIDGE) and any NIC
+                // that lacks native XDP but has generic XDP support in
+                // the kernel's netif_receive_skb() path.
+                generic_err = bpf_xdp_attach(
+                    ifindex_, xdp_fd,
+                    XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST,
+                    &opts);
+                if (generic_err) {
+                    std::cerr << "https_guard: failed to attach XDP program to ifindex "
+                              << ifindex_ << " (non-fatal, continuing with uprobe only):\n"
+                              << "  native XDP: " << strerror(-native_err) << "\n"
+                              << "  generic XDP: " << strerror(-generic_err) << "\n";
+                } else {
+                    links_.push_back(nullptr);  /* placeholder: bpf_xdp_attach has no link */
+                    have_xdp = true;
+                    std::cout << "https_guard: XDP attached in generic (SKB) mode\n";
+                }
+            } else {
+                links_.push_back(nullptr);
+                have_xdp = true;
+                std::cout << "https_guard: XDP attached in native mode\n";
+            }
         }
     } else {
         std::cerr << "https_guard: XDP program not found; running uprobe only\n";
@@ -103,14 +144,19 @@ ring_buffer_sample_fn HttpGuardProgram::getRingBufferHandler() noexcept
 int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
 {
     if (size < sizeof(hg_event)) {
+        std::cerr << "https_guard: ringbuffer callback: undersized event (" << size << " bytes)\n";
         return 0;
     }
 
     const auto* evt = static_cast<const hg_event*>(data);
+    std::cout << "https_guard: event received: type=" << evt->event_type
+              << ", process='" << evt->process << "' (PID " << evt->pid << ")"
+              << ", tls_version=" << evt->tls_version << "\n";
+
     std::string severity;
     std::string message_id;
     std::string message;
-    bool         actionable = false;
+    bool actionable = false;
 
     if (evt->event_type == HG_EVENT_TLS_VERSION_VIOLATION)
     {
@@ -123,32 +169,42 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         actionable = true;
     }
     else if (evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED ||
-            evt->event_type == HG_EVENT_HTTP_PAYLOAD_OBSERVED)
+             evt->event_type == HG_EVENT_HTTP_PAYLOAD_OBSERVED ||
+             evt->event_type == HG_EVENT_TLS_HANDSHAKE_METADATA)
     {
         std::string matched_rule;
         const bool suspicious = detector_.isSuspicious(evt->payload_snippet, matched_rule) ||
                                 evt->event_type == HG_EVENT_HTTP_ANOMALY_DETECTED;
 
-        if (!suspicious) {
-            return 0;
+        if (suspicious) {
+            if (matched_rule.empty()) {
+                matched_rule = "kernel-signature";
+            }
+            severity   = "Warning";
+            message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
+            message    = "Attack signature detected from process '" + std::string(evt->process) +
+                         "' (PID " + std::to_string(evt->pid) +
+                         "), rule '" + matched_rule +
+                         "'. Source should be quarantined.";
+            actionable = true;
+        } else {
+            // Log non-suspicious events as informational
+            severity   = "Informational";
+            message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+            message    = "HTTPS traffic observed from process '" + std::string(evt->process) +
+                         "' (PID " + std::to_string(evt->pid) +
+                         "), TLS version: " + TlsVersion(evt->tls_version).toString();
+            actionable = false;
         }
-
-        if (matched_rule.empty()) {
-            matched_rule = "kernel-signature";
-        }
-
-        severity   = "Warning";
-        message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
-        message    = "Attack signature detected from process '" + std::string(evt->process) +
-                     "' (PID " + std::to_string(evt->pid) +
-                     "), rule '" + matched_rule +
-                     "'. Source should be quarantined.";
-        actionable = true;
     }
     else
     {
+        std::cerr << "https_guard: unknown event_type=" << evt->event_type
+                  << ", skipping\n";
         return 0;
     }
+
+    std::cerr << "https_guard: pushing LogAction for event_type=" << evt->event_type << "\n";
 
     // LogAction
     RedfishEventMessage event_msg(

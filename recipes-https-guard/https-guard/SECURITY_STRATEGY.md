@@ -116,16 +116,15 @@ In an asynchronous model, the eBPF hook **defers** the decision to userspace. It
 
 | Location | Evidence |
 |----------|----------|
-| `https_guard/https_guard.bpf.c:171-220` | Uprobe `SSL_write`: reads ssl->version via `bpf_probe_read_user()`, submits event, returns 0 — always observational |
-| `https_guard/https_guard.bpf.c:377-378` | XDP `TLS version violation`: `if (evt_type == HG_EVENT_TLS_VERSION_VIOLATION) return XDP_DROP` — proactive XDP enforcement |
-| `https_guard/https_guard.bpf.c:270-271` | `blocklist_check(ip->saddr)` — hybrid enforcement: active blocklist entries trigger `XDP_DROP` before any inspection |
+| `https_guard/https_guard.bpf.c:192-277` | Uprobe `SSL_write`: reads ssl->version via `bpf_probe_read_user()` at offset 36, submits event, returns 0 — always observational |
+| `https_guard/https_guard.bpf.c:442-443` | XDP `TLS version violation`: `if (evt_type == HG_EVENT_TLS_VERSION_VIOLATION) return XDP_DROP` — proactive XDP enforcement |
+| `https_guard/https_guard.bpf.c:346-347` | `blocklist_check(ip->saddr)` — hybrid enforcement: active blocklist entries trigger `XDP_DROP` before any inspection |
 | `actions/blocklist/blocklist.bpf.h:22-36` | `blocklist_check()` inline function — performs `XDP_DROP` for active blocklist entries; prunes expired entries via `bpf_map_delete_elem()` |
-| `https_guard/https_guard_program.cpp:36-55` | `https_guard_ssl_write` uprobe attached first (PRIMARY); XDP attached second (optional) |
-| `https_guard/https_guard_program.cpp:95` | `"enforcement active via uprobe(SSL_write)"` — logs which enforcement paths are active |
-| `https_guard/https_guard_program.cpp:161-224` | Event handler: sends BlockTcpAction + BlocklistAddAction for actionable events |
-| `https_guard/https_guard_program.cpp:183-187` | For uprobe events: calls `ProcPeerResolver::getTcpSockets(pid)` to read `/proc/<pid>/net/tcp` |
-| `https_guard/https_guard_program.cpp:201-206` | Issues `BlockTcpAction` with resolved socket 4-tuple → SOCK_DESTROY |
-| `https_guard/https_guard_program.cpp:210-215` | Issues `BlocklistAddAction` with resolved source IP |
+| `https_guard/https_guard_program.cpp:38-61` | `https_guard_ssl_write` uprobe attached first (PRIMARY); XDP attached second (optional) |
+| `https_guard/https_guard_program.cpp:152-154` | Event received logging with process, PID, and TLS version |
+| `https_guard/https_guard_program.cpp:161-205` | Event handler: classifies TLS version violations and HTTP anomalies; logs all events including non-suspicious ones |
+| `https_guard/https_guard_program.cpp:245-282` | For uprobe events: calls `ProcPeerResolver::getTcpSockets(pid)` to read `/proc/<pid>/net/tcp` |
+| `https_guard/https_guard_program.cpp:253-281` | Issues `BlockTcpAction` with resolved socket 4-tuple → SOCK_DESTROY + `BlocklistAddAction` |
 | `https_guard/main.cpp:71` | `kDefaultBlocklistTtl = 5 minutes` — configurable blocklist TTL |
 | `actions/blocklist/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry and writes via `bpf_map_update_elem()` into the kernel BPF map |
 | `actions/tcp/TcpDestroyer.cpp:69-182` | `TcpDestroyer::execute()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` to tear down the exact TCP 4-tuple |
@@ -188,14 +187,22 @@ HTTPS-Guard adapts to the capabilities of the underlying platform:
 - The blocklist enables synchronous enforcement of future connections.
 - Uprobe provides TLS version detection and PID-to-socket correlation for enforcement.
 
-**On BMC platforms without XDP (e.g., ASpeed AST2600 ftgmac100):**
-- Only the uprobe program loads successfully.
-- XDP attachment fails gracefully (logged, non-fatal).
-- The daemon runs in uprobe-only mode.
+**On QEMU TAP+BRIDGE with virtio-net-pci:**
+- The daemon tries native XDP first (XDP_FLAGS_UPDATE_IF_NOEXIST).
+- If native XDP fails (no driver ndo_bpf), it falls back to generic XDP (XDP_FLAGS_SKB_MODE).
+- Generic XDP hooks into `netif_receive_skb()` in software — no driver support needed.
+- virtio-net supports both modes, so XDP attaches successfully in SKB mode.
+- Expected daemon log: `"https_guard: XDP attached in generic (SKB) mode"`
+- See [the recipe README](README.md#enabling-xdp-in-qemu-tapbridge--virtio-net-pci) for setup steps.
+
+**On BMC platforms without XDP (e.g., ASpeed AST2600 ftgmac100, QEMU SLIRP):**
+- Native XDP fails (ftgmac100 has no ndo_bpf).
+- Generic XDP also fails (SLIRP has no real netdev; real ftgmac100 lacks generic XDP too).
+- Both failures are logged but non-fatal — the daemon continues with uprobe only.
 - TLS version violations are detected reactively: the uprobe fires after `SSL_write()`,
   the daemon reads `/proc/<pid>/net/tcp` to find the socket, and issues SOCK_DESTROY
   to kill the TCP connection. The source IP is logged for follow-up.
-- This has been verified: `ip link show eth0` shows no `xdp` or `prog/xdp` line.
+- Verified: `ip link show eth0` shows no `xdp` or `prog/xdp` line on these platforms.
 
 ### How Uprobe-Only Enforcement Works
 
@@ -207,14 +214,15 @@ Process calls SSL_write(ssl, buf, num)
        ▼
   Uprobe fires on SSL_write
        │
-       ├── Reads ssl->version (uint16_t at offset 0 of ssl_st)
-       │     using bpf_probe_read_user()
+       ├── Reads ssl->version (4-byte int at offset 36 of ssl_st
+       │     on ARM 32-bit OpenSSL 3.x) using bpf_probe_read_user()
+       │     → extracts lower 16 bits (e.g. 0x0303 = TLS 1.2)
        │
        ├── If version < 0x0303 (TLS 1.2):
        │     → HG_EVENT_TLS_VERSION_VIOLATION
        │     → Severity: CRITICAL
        │
-       └── Submits event to ring buffer (with PID only, no socket info)
+       └── Submits event to ring buffer (with PID + TLS version, no socket info)
        │
        ▼
   Userspace daemon receives event
@@ -234,6 +242,11 @@ Process calls SSL_write(ssl, buf, num)
        │     → Future XDP packets from this IP would be dropped
        │
        └── LogAction → Redfish event JSON line
+       │
+       NOTE: The ssl_st offset is architecture-specific. On ARM 32-bit
+       (johnblue) the version field is at offset 36. On x86_64 with
+       8-byte pointers it would be at offset 20. If detection fails on
+       a new platform, enable the bpf_printk diagnostic scanning code.
 ```
 
 ### The challenge: curl + OpenSSL 3.x always uses TLS 1.3
