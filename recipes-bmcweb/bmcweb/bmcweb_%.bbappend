@@ -3,11 +3,9 @@
 RDEPENDS:${PN}:append = " phosphor-logging"
 EXTRA_OEMESON:append = " -Dbmcweb-logging=debug"
 
-# Fix: getUniqueEntryID() was passing the full log line to dateStringToEpoch(),
-# which rejects strings with trailing content. Extract the timestamp token first.
+# The timestamp extraction fix is already in upstream bmcweb, so no patch needed.
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI:append = " \
-    file://0001-fix-event-log-unique-entry-id-parse-timestamp-only.patch \
     file://OemSecurityEvent.1.0.0.json \
 "
 
