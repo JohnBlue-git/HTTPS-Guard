@@ -1,3 +1,7 @@
+/*
+ * HTTPS-Guard daemon - main entry point
+ *
+ */
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <chrono>

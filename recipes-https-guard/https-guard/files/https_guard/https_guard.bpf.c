@@ -312,13 +312,19 @@ int https_guard_xdp(struct xdp_md *ctx)
     void *data     = (void *)(unsigned long)ctx->data;
     struct ethhdr *eth = (struct ethhdr *)data;
 
+    bpf_printk("xdp: packet received\n");
+
     /* Must have at least an Ethernet header */
-    if ((void *)(eth + 1) > data_end)
+    if ((void *)(eth + 1) > data_end) {
+        bpf_printk("xdp: fail - not enough data for ethernet header\n");
         return XDP_PASS;
+    }
 
     /* Only IPv4 for now */
-    if (eth->h_proto != __bpf_constant_htons(ETH_P_IP))
+    if (eth->h_proto != __bpf_constant_htons(ETH_P_IP)) {
+        bpf_printk("xdp: skip - not IPv4 (proto=0x%x)\n", bpf_ntohs(eth->h_proto));
         return XDP_PASS;
+    }
 
     struct iphdr *ip = (struct iphdr *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
@@ -326,8 +332,10 @@ int https_guard_xdp(struct xdp_md *ctx)
 
     /* Hybrid enforcement: if the source IP is in the blocklist, drop the
      * packet synchronously. */
-    if (blocklist_check(ip->saddr) == XDP_DROP)
+    if (blocklist_check(ip->saddr) == XDP_DROP) {
+        bpf_printk("xdp: DROP - blocklist hit for %pI4\n", &ip->saddr);
         return XDP_DROP;
+    }
 
     __u16 tot_len = bpf_ntohs(ip->tot_len);
     if (tot_len < sizeof(*ip))
@@ -338,8 +346,10 @@ int https_guard_xdp(struct xdp_md *ctx)
         return XDP_PASS;
 
     /* Only TCP */
-    if (ip->protocol != IPPROTO_TCP)
+    if (ip->protocol != IPPROTO_TCP) {
+        bpf_printk("xdp: skip - not TCP (protocol=%d)\n", ip->protocol);
         return XDP_PASS;
+    }
 
     struct tcphdr *tcp = (struct tcphdr *)((char *)ip + ip_hdr_len);
     if ((void *)(tcp + 1) > data_end)
@@ -350,8 +360,11 @@ int https_guard_xdp(struct xdp_md *ctx)
         return XDP_PASS;
 
     /* Only care about port 443 (HTTPS) */
-    if (bpf_ntohs(tcp->dest) != 443 && bpf_ntohs(tcp->source) != 443)
+    if (bpf_ntohs(tcp->dest) != 443 && bpf_ntohs(tcp->source) != 443) {
+        bpf_printk("xdp: skip - not port 443 (src=%d dst=%d)\n", 
+                   bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
         return XDP_PASS;
+    }
 
     if ((void *)tcp + tcp_hdr_len > data_end)
         return XDP_PASS;
@@ -414,10 +427,12 @@ int https_guard_xdp(struct xdp_md *ctx)
         /* Parse TLS ClientHello - extract version and check for violation */
         const unsigned char *cursor = tcp_payload + 5;
         __u32 is_violation = 0;
+        __u16 tls_ver = 0;
         if (cursor + 2 <= payload_end) {
-            evt->tls_version = ((__u16)cursor[0] << 8) | (__u16)cursor[1];
+            tls_ver = ((__u16)cursor[0] << 8) | (__u16)cursor[1];
+            evt->tls_version = tls_ver;
             /* Minimal classification for XDP line-rate decision */
-            is_violation = (evt->tls_version < 0x0303) ? 1 : 0;
+            is_violation = (tls_ver < 0x0303) ? 1 : 0;
             evt->is_violation = is_violation;
         }
 
@@ -428,15 +443,20 @@ int https_guard_xdp(struct xdp_md *ctx)
          *
          * IMPORTANT: We use the local 'is_violation' variable, NOT evt->is_violation,
          * because bpf_ringbuf_submit() invalidates the evt pointer. */
-        if (is_violation)
+        if (is_violation) {
+            bpf_printk("xdp: DROP - TLS version violation (0x%04x < 0x0303)\n", 
+                       tls_ver);
             return XDP_DROP;
+        }
 
+        bpf_printk("xdp: PASS - TLS version OK (0x%04x)\n", tls_ver);
         return XDP_PASS;
     }
 
     /* Plaintext HTTP detection on port 443 */
     if ((tcp_payload[0] == 'G' || tcp_payload[0] == 'P') &&
         looks_like_http((const char *)tcp_payload, payload_len)) {
+        bpf_printk("xdp: HTTP detected on port 443\n");
         struct xdp_event *evt;
 
         evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);

@@ -181,36 +181,27 @@ bitbake https-guard-openbmc
 
 ## QEMU Configuration
 
-### Bridge Mode (Recommended for XDP)
+### Bridge Mode (For All Platforms Including AST2600)
 
-Bridge mode exposes a real network interface to the guest, enabling XDP support. This is required for XDP functionality.
+Bridge mode exposes a real network interface to the guest, enabling XDP support. This works on all platforms:
+- **AST2600 (johnblue)**: Uses built-in ftgmac100 (emulated hardware NIC)
+- **x86_64/aarch64**: Uses virtio-net-device (paravirtualized, better performance)
+
+**Key Point:** Bridge mode is a **host-side** configuration. The host doesn't care about the guest's architecture - it just passes Ethernet frames via a TAP device. The guest uses its native driver (ftgmac100 for AST2600, virtio-net for x86/ARM64).
 
 **Setup on host (one-time):**
 
 ```bash
-# Create TAP interface
-sudo ip tuntap add dev tap-httpsguard mode tap user $(whoami)
-sudo ip link set tap-httpsguard up
-
-# Create bridge
-sudo ip link add name br-httpsguard type bridge
-sudo ip link set br-httpsguard up
-
-# Attach TAP to bridge
-sudo ip link set tap-httpsguard master br-httpsguard
-
-# Optional: Attach host interface to bridge for external connectivity
-# sudo ip link set eth0 master br-httpsguard
+# Use the helper script
+sudo ./meta-https-guard/scripts/qemu-setup-tap.sh destroy
+sudo ./meta-https-guard/scripts/qemu-setup-tap.sh create
 ```
 
-**Launch QEMU with bridge mode:**
+**For AST2600 (johnblue):**
 
 ```bash
-# Set network options
-export QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
-
-# Run QEMU
-runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
+QB_NET=none runqemu johnblue nographic \
+  qemuparams='-netdev tap,id=net2,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net2'
 ```
 
 **Verify XDP is working inside guest:**
@@ -218,11 +209,21 @@ runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
 ```bash
 # Check daemon logs
 journalctl -u https-guard-daemon -l | grep "XDP attached"
-# Expected: "https_guard: XDP attached in generic (SKB) mode"
+# Expected: "https_guard: XDP attached in native mode"
 
 # Verify XDP program loaded
 ip link show eth0 | grep -i xdp
-# Expected: "xdp/generic" or "xdp" in output
+# Expected: "xdp" in output
+```
+
+**Test connectivity from host:**
+
+```bash
+# Ping the guest
+ping -c 3 192.168.100.2
+
+# Test HTTPS access
+curl -k https://192.168.100.2/redfish/v1
 ```
 
 ### SLIRP Mode (Default, Uprobe-Only)
@@ -232,7 +233,7 @@ SLIRP is the default QEMU networking mode. It uses user-mode networking and does
 **Launch QEMU with SLIRP (default):**
 
 ```bash
-runqemu johnblue nographic
+runqemu johnblue nographic slirp
 ```
 
 **Characteristics:**
@@ -263,9 +264,7 @@ runqemu johnblue nographic \
 - Native XDP: NIC driver with `ndo_bpf` support
 - Generic XDP: Real netdev with `netif_receive_skb()` hook
 
-SLIRP provides neither.
-
-**Workaround:** Use bridge mode (described above) for XDP functionality.
+SLIRP provides neither. For XDP functionality on AST2600, use bridge mode with ftgmac100 as described in the [Bridge Mode](#bridge-mode-recommended-for-xdp) section above.
 
 ## Deployment
 
@@ -353,9 +352,10 @@ curl -k -u root:0penBmc \
 curl -k -u root:0penBmc \
   https://localhost/redfish/v1/EventService/Subscriptions
 
-# View events
-curl -k -u root:0penBmc \
-  https://localhost/redfish/v1/EventService/Events
+# View events via SSE
+curl -k -N --https1.0 -u root:0penBmc \
+  -H "Accept: text/event-stream" \
+  https://192.168.11.76:4433/redfish/v1/EventService/SSE/
 ```
 
 ### D-Bus Event Monitoring
@@ -374,10 +374,28 @@ busctl call xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry \
 
 | Platform | NIC | Uprobe | XDP Native | XDP Generic | Status |
 |----------|-----|--------|------------|-------------|--------|
-| ASpeed AST2600 (johnblue) | ftgmac100 | ✅ | ❌ | ❌ | Uprobe-only |
+| ASpeed AST2600 (johnblue) | ftgmac100 | ✅ | ✅* | ❌ | Full (bridge mode) |
 | QEMU SLIRP | ftgmac100 (emulated) | ✅ | ❌ | ❌ | Uprobe-only |
-| QEMU TAP+BRIDGE | virtio-net-pci | ✅ | ✅ | ✅ | Full support |
+| QEMU TAP+BRIDGE | virtio-net-* | ✅ | ✅ | ✅ | Full support |
 | x86_64 (native) | ixgbe, mlx5, etc. | ✅ | ✅ | ✅ | Full support |
+
+\* XDP on AST2600 requires bridge mode with `-net nic,netdev=net2` (not SLIRP mode).
+
+### AST2600 Platform Notes
+
+The ASpeed AST2600 SoC used in `johnblue` has **no PCI bus** and **no virtio-bus**, which means:
+
+- ❌ `virtio-net-pci` cannot be used (requires PCI bus)
+- ❌ `virtio-net-device` cannot be used (requires virtio-bus)
+- ✅ Bridge mode works using the built-in ftgmac100 with `-net nic,netdev=net2`
+- ✅ Uprobe-based SSL_write detection works perfectly
+- ✅ XDP is available in bridge mode
+
+**Why no virtio?** The AST2600 is a BMC SoC with 4 built-in Ethernet controllers (ftgmac100). It has no PCIe controller, so QEMU's `-device virtio-net-*` options fail with error: `No 'virtio-bus' bus found`.
+
+**Bridge mode on AST2600:** The ftgmac100 is integrated into the SoC and automatically created by the `ast2600-evb` machine. Use `-net nic,netdev=net2` (not `-device ftgmac100`) to attach a TAP backend. This provides a real network interface for XDP support.
+
+**SLIRP mode limitation:** In SLIRP mode (default), the ftgmac100 driver connects to a virtual network stack without a real netdev, so XDP is not available. Use bridge mode for XDP functionality.
 
 ## Troubleshooting
 
@@ -450,7 +468,3 @@ For detailed source code documentation, see:
 ## License
 
 MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please submit pull requests or issues to the OpenBMC project.

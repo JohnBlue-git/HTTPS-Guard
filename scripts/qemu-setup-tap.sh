@@ -1,29 +1,22 @@
 #!/bin/bash
 # =============================================================================
-# QEMU TAP/bridge network setup for HTTPS-Guard eBPF/XDP testing
+# QEMU network setup for HTTPS-Guard eBPF/XDP testing
 #
-# This script creates a TAP device and bridge on the host, allowing the
-# QEMU guest to have a real virtio-net device that supports XDP generic
-# mode. Run this before launching QEMU with TAP networking.
+# Bridge mode works on all platforms including AST2600 (johnblue):
+# - AST2600: Uses built-in ftgmac100 with `-net nic,netdev=net2`
+# - x86_64/aarch64: Uses virtio-net-device with `-device virtio-net-device,netdev=net2`
 #
 # Usage:
-#   ./scripts/qemu-setup-tap.sh [create|destroy]
-#
-# After creating the bridge, build and run the QEMU image with:
-#   bitbake obmc-phosphor-image
-#   QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56'
-#   QB_NET=none runqemu johnblue nographic qemuparams="$QB_NETWORK_OPTION"
-#
-# Inside the guest, verify XDP works:
-#   ip link set eth0 xdp obj /usr/share/https-guard/https_guard.bpf.o sec xdp
-#   ip link show eth0
+#   sudo ./scripts/qemu-setup-tap.sh [create|destroy]
 # =============================================================================
 set -euo pipefail
 
 BRIDGE="br-httpsguard"
 TAP="tap-httpsguard"
-MAC="52:54:00:12:34:56"
 TAP_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+
+# Bridge IP (host side). Guest should use 192.168.100.2/24
+BRIDGE_IP="192.168.100.1/24"
 
 action="${1:-create}"
 
@@ -38,25 +31,39 @@ case "$action" in
         echo "[+] Attaching $TAP to $BRIDGE ..."
         sudo ip link set "$TAP" master "$BRIDGE"
 
+        echo "[+] Assigning IP $BRIDGE_IP to $BRIDGE ..."
+        sudo ip addr add "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || echo "    (IP already assigned)"
+
         echo "[+] Bringing links up ..."
         sudo ip link set "$TAP" up
         sudo ip link set "$BRIDGE" up
 
         echo "[+] Done. Bridge $BRIDGE ready with TAP $TAP."
         echo ""
-        echo "    Build and run QEMU with:"
-        echo "      QB_NETWORK_OPTION='-netdev tap,id=net0,ifname=$TAP,script=no,downscript=no -device virtio-net-pci,netdev=net0,mac=$MAC'"
-        echo "      QB_NET=none runqemu johnblue nographic qemuparams=\"\$QB_NETWORK_OPTION\""
+        echo "    Bridge IP: $BRIDGE_IP (host side)"
         echo ""
-        echo "    Inside the guest (after login):"
-        echo "      # Set HTTPS_GUARD_DAEMON_ENABLE=1 in /etc/default/https-guard"
-        echo "      # systemctl start https-guard-daemon.service"
-        echo "      # journalctl -u https-guard-daemon -f"
+        echo "    For AST2600 (johnblue):"
+        echo "      QB_NET=none runqemu johnblue nographic \\"
+        echo "        qemuparams='-netdev tap,id=net2,ifname=$TAP,script=no,downscript=no -net nic,netdev=net2'"
         echo ""
-        echo "    Guest network interface will be available at e.g. 192.168.42.15"
-        echo "    (assign via DHCP or static config inside the BMC)."
+        echo "    For virtio-capable platforms (x86_64, aarch64-virt):"
+        echo "      QB_NET=none runqemu <machine> nographic \\"
+        echo "        qemuparams='-netdev tap,id=net2,ifname=$TAP,script=no,downscript=no -device virtio-net-device,netdev=net2'"
+        echo ""
+        echo "    Inside the guest:"
+        echo "      ip addr add 192.168.100.2/24 dev eth0"
+        echo "      ip link set eth0 up"
+        echo "      ip route add default via 192.168.100.1"
+        echo "      echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
+        echo ""
+        echo "    Test connectivity from host:"
+        echo "      ping -c 3 192.168.100.2"
+        echo "      curl -k https://192.168.100.2/redfish/v1"
         ;;
     destroy)
+        echo "[-] Removing IP $BRIDGE_IP from $BRIDGE ..."
+        sudo ip addr del "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || true
+
         echo "[-] Destroying TAP $TAP ..."
         sudo ip link set "$TAP" down 2>/dev/null || true
         sudo ip tuntap del dev "$TAP" mode tap 2>/dev/null || true
