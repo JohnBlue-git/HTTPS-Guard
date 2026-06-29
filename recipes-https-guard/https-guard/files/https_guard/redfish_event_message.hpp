@@ -6,7 +6,7 @@
 #include <sstream>
 #include <string>
 
-#include "events.h"
+#include "hg_event.hpp"
 
 namespace https_guard {
 

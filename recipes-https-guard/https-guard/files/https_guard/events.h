@@ -25,30 +25,6 @@ enum hg_event_source {
 };
 
 /* =========================================================================
- * Legacy hg_event - kept for backward compatibility
- * ========================================================================= */
-struct hg_event {
-    uint64_t timestamp_ns;
-    uint32_t event_type;    /* Set by userspace (not used in BPF) */
-    uint32_t severity;      /* Set by userspace (not used in BPF) */
-
-    uint32_t pid;
-    uint32_t tgid;
-
-    uint32_t src_ip_v4;
-    uint32_t dst_ip_v4;
-    uint16_t src_port;
-    uint16_t dst_port;
-
-    uint16_t tls_version;
-    uint16_t tls_record_type;
-
-    char process[HG_COMM_LEN];
-    char source_ip[HG_IP_STR_LEN];
-    char payload_snippet[HG_PAYLOAD_SNIPPET_LEN];
-};
-
-/* =========================================================================
  * Uprobe event: PURELY OBSERVATIONAL
  * ========================================================================= */
 struct uprobe_event {

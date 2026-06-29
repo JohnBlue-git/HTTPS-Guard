@@ -164,148 +164,154 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
 
     const uint32_t event_source = *static_cast<const uint32_t*>(data);
 
-    std::string severity;
-    std::string message_id;
-    std::string message;
-    bool actionable = false;
-    uint32_t pid = 0;
-    uint32_t src_ip_v4 = 0;
-    uint32_t dst_ip_v4 = 0;
-    uint16_t src_port = 0;
-    uint16_t dst_port = 0;
-    uint16_t tls_version = 0;
-    char process[HG_COMM_LEN] = {0};
-    char payload_snippet[HG_PAYLOAD_SNIPPET_LEN] = {0};
+    hg_event evt{};
 
-    if (event_source == HG_SOURCE_UPROBE) {
-        /* ==============================================================
-         * UPROBE EVENT: Purely observational data from SSL_write
-         * ============================================================== */
+    /* ==============================================================
+    * UPROBE EVENT: Purely observational data from SSL_write
+    * ============================================================== */
+    if (event_source == HG_SOURCE_UPROBE)
+    {
         if (size < sizeof(struct uprobe_event)) {
             std::cerr << "https_guard: uprobe event too small: " << size << " bytes\n";
             return 0;
         }
 
-        const auto* evt = static_cast<const struct uprobe_event*>(data);
+        const auto* raw = static_cast<const struct uprobe_event*>(data);
 
-        std::cout << "https_guard: uprobe event received: process='" << evt->process
-                  << "' (PID " << evt->pid << "), tls_version=" << evt->tls_version << "\n";
+        evt.pid         = raw->pid;
+        evt.tls_version = raw->tls_version;
+        evt.process         = std::string(raw->process,         strnlen(raw->process,         sizeof(raw->process)));
+        evt.payload_snippet = std::string(raw->payload_snippet, strnlen(raw->payload_snippet, sizeof(raw->payload_snippet)));
 
-        pid = evt->pid;
-        tls_version = evt->tls_version;
-        memcpy(process, evt->process, sizeof(evt->process));
-        memcpy(payload_snippet, evt->payload_snippet, sizeof(evt->payload_snippet));
+        /* Resolve socket 4-tuple from /proc early so evt carries the full
+         * picture for both logging and enforcement.  Prefer a connection to
+         * port 443; fall back to the first entry if none match. */
+        {
+            const auto sockets = ProcPeerResolver::getTcpSockets(static_cast<pid_t>(evt.pid));
+            if (!sockets.empty()) {
+                const TcpSocketEntry* best = &sockets[0];
+                for (const auto& sock : sockets) {
+                    if (sock.dst_port == 443) { best = &sock; break; }
+                }
+                evt.src_ip_v4 = best->src_ip_v4;
+                evt.dst_ip_v4 = best->dst_ip_v4;
+                evt.src_port  = best->src_port;
+                evt.dst_port  = best->dst_port;
+            }
+        }
 
-        /* Uprobe path: no socket info available from BPF.
-         * Userspace will resolve via /proc/<pid>/net/tcp if needed. */
-        src_ip_v4 = 0;
-        dst_ip_v4 = 0;
-        src_port = 0;
-        dst_port = 0;
+        std::cout << "https_guard: uprobe event received: process='" << evt.process
+                  << "' (PID " << evt.pid << "), tls_version=" << evt.tls_version << "\n";
 
         /* Classify based on TLS version */
-        if (tls_version > 0 && tls_version < 0x0303) {
+        if (evt.tls_version > 0 && evt.tls_version < 0x0303)
+        {
             /* TLS version violation (< 1.2) */
-            severity   = "Critical";
-            message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
-            message    = "Security violation: Process '" + std::string(process) +
-                         "' (PID " + std::to_string(pid) +
-                         ") attempted an HTTPS connection using an insecure TLS version (" +
-                         TlsVersion(tls_version).toString() + "). Packet was blocked.";
-            actionable = true;
-        } else {
+            evt.severity   = "Critical";
+            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
+            evt.message    = "Security violation: Process '" + evt.process +
+                             "' (PID " + std::to_string(evt.pid) +
+                             ") attempted an HTTPS connection using an insecure TLS version (" +
+                             TlsVersion(evt.tls_version).toString() + "). Packet was blocked.";
+            evt.actionable = true;
+        }
+        else
+        {
             /* Normal traffic or unknown - apply anomaly detection */
             std::string matched_rule;
-            const bool suspicious = detector_.isSuspicious(payload_snippet, matched_rule);
+            const bool suspicious = detector_.isSuspicious(evt.payload_snippet, matched_rule);
 
             if (suspicious) {
                 if (matched_rule.empty()) {
                     matched_rule = "kernel-signature";
                 }
-                severity   = "Warning";
-                message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
-                message    = "Attack signature detected from process '" + std::string(process) +
-                             "' (PID " + std::to_string(pid) +
-                             "), rule '" + matched_rule +
-                             "'. Source should be quarantined.";
-                actionable = true;
+                evt.severity   = "Warning";
+                evt.message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
+                evt.message    = "Attack signature detected from process '" + evt.process +
+                                 "' (PID " + std::to_string(evt.pid) +
+                                 "), rule '" + matched_rule +
+                                 "'. Source should be quarantined.";
+                evt.actionable = true;
             } else {
-                severity   = "Informational";
-                message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
-                message    = "HTTPS traffic observed from process '" + std::string(process) +
-                             "' (PID " + std::to_string(pid) +
-                             "), TLS version: " + TlsVersion(tls_version).toString();
-                actionable = false;
+                evt.severity   = "Informational";
+                evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+                evt.message    = "HTTPS traffic observed from process '" + evt.process +
+                                 "' (PID " + std::to_string(evt.pid) +
+                                 "), TLS version: " + TlsVersion(evt.tls_version).toString();
             }
         }
     }
-    else if (event_source == HG_SOURCE_XDP) {
-        /* ==============================================================
-         * XDP EVENT: Minimal classification from XDP program
-         * ============================================================== */
+    /* ==============================================================
+    * XDP EVENT: Minimal classification from XDP program
+    * ============================================================== */
+    else if (event_source == HG_SOURCE_XDP)
+    {
         if (size < sizeof(struct xdp_event)) {
             std::cerr << "https_guard: xdp event too small: " << size << " bytes\n";
             return 0;
         }
 
-        const auto* evt = static_cast<const struct xdp_event*>(data);
+        const auto* raw = static_cast<const struct xdp_event*>(data);
 
-        std::cout << "https_guard: xdp event received: process='" << evt->process
-                  << "' (PID " << evt->pid << "), tls_version=" << evt->tls_version
-                  << ", is_violation=" << evt->is_violation << "\n";
+        evt.pid         = raw->pid;
+        evt.tls_version = raw->tls_version;
+        evt.src_ip_v4   = raw->src_ip_v4;
+        evt.dst_ip_v4   = raw->dst_ip_v4;
+        evt.src_port    = raw->src_port;
+        evt.dst_port    = raw->dst_port;
+        evt.process         = std::string(raw->process,         strnlen(raw->process,         sizeof(raw->process)));
+        evt.payload_snippet = std::string(raw->payload_snippet, strnlen(raw->payload_snippet, sizeof(raw->payload_snippet)));
 
-        pid = evt->pid;
-        tls_version = evt->tls_version;
-        src_ip_v4 = evt->src_ip_v4;
-        dst_ip_v4 = evt->dst_ip_v4;
-        src_port = evt->src_port;
-        dst_port = evt->dst_port;
-        memcpy(process, evt->process, sizeof(evt->process));
-        memcpy(payload_snippet, evt->payload_snippet, sizeof(evt->payload_snippet));
+        std::cout << "https_guard: xdp event received: process='" << evt.process
+                  << "' (PID " << evt.pid << "), tls_version=" << evt.tls_version
+                  << ", is_violation=" << raw->is_violation << "\n";
 
         /* XDP path: socket info is available from BPF.
          * Apply full classification in userspace. */
-        if (evt->is_violation) {
+        if (raw->is_violation)
+        {
             /* TLS version violation - already dropped by XDP, but log it */
-            severity   = "Critical";
-            message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
-            message    = "Security violation: Process '" + std::string(process) +
-                         "' (PID " + std::to_string(pid) +
-                         ") attempted an HTTPS connection using an insecure TLS version (" +
-                         TlsVersion(tls_version).toString() + "). Packet was blocked.";
-            actionable = true;
-        } else if (evt->is_violation == 0 && payload_snippet[0] != '\0') {
-            /* Plaintext HTTP on port 443 - apply anomaly detection */
+            evt.severity   = "Critical";
+            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
+            evt.message    = "Security violation: Process '" + evt.process +
+                             "' (PID " + std::to_string(evt.pid) +
+                             ") attempted an HTTPS connection using an insecure TLS version (" +
+                             TlsVersion(evt.tls_version).toString() + "). Packet was blocked.";
+            evt.actionable = true;
+        }
+        /* Plaintext HTTP on port 443 - apply anomaly detection */
+        else if (!evt.payload_snippet.empty())
+        {
             std::string matched_rule;
-            const bool suspicious = detector_.isSuspicious(payload_snippet, matched_rule);
+            const bool suspicious = detector_.isSuspicious(evt.payload_snippet, matched_rule);
 
             if (suspicious) {
                 if (matched_rule.empty()) {
                     matched_rule = "kernel-signature";
                 }
-                severity   = "Warning";
-                message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
-                message    = "Attack signature detected from process '" + std::string(process) +
-                             "' (PID " + std::to_string(pid) +
-                             "), rule '" + matched_rule +
-                             "'. Source should be quarantined.";
-                actionable = true;
+                evt.severity   = "Warning";
+                evt.message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
+                evt.message    = "Attack signature detected from process '" + evt.process +
+                                 "' (PID " + std::to_string(evt.pid) +
+                                 "), rule '" + matched_rule +
+                                 "'. Source should be quarantined.";
+                evt.actionable = true;
             } else {
-                severity   = "Informational";
-                message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
-                message    = "HTTPS traffic observed from process '" + std::string(process) +
-                             "' (PID " + std::to_string(pid) +
-                             "), TLS version: " + TlsVersion(tls_version).toString();
-                actionable = false;
+                evt.severity   = "Informational";
+                evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+                evt.message    = "HTTPS traffic observed from process '" + evt.process +
+                                 "' (PID " + std::to_string(evt.pid) +
+                                 "), TLS version: " + TlsVersion(evt.tls_version).toString();
             }
-        } else {
-            /* Normal TLS handshake - informational */
-            severity   = "Informational";
-            message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
-            message    = "HTTPS traffic observed from process '" + std::string(process) +
-                         "' (PID " + std::to_string(pid) +
-                         "), TLS version: " + TlsVersion(tls_version).toString();
-            actionable = false;
+        }
+        /* Normal TLS handshake - informational */
+        else
+        {
+            evt.severity   = "Informational";
+            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+            evt.message    = "HTTPS traffic observed from process '" + evt.process +
+                             "' (PID " + std::to_string(evt.pid) +
+                             "), TLS version: " + TlsVersion(evt.tls_version).toString();
         }
     }
     else
@@ -315,99 +321,39 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         return 0;
     }
 
-    std::cerr << "https_guard: pushing LogAction for severity=" << severity << "\n";
-
-    // Construct hg_event for RedfishEventMessage
-    struct hg_event evt_for_msg;
-    memset(&evt_for_msg, 0, sizeof(evt_for_msg));
-    evt_for_msg.timestamp_ns = 0;  // Will be set by RedfishEventMessage::format()
-    evt_for_msg.pid = pid;
-    evt_for_msg.tgid = 0;
-    evt_for_msg.src_ip_v4 = src_ip_v4;
-    evt_for_msg.dst_ip_v4 = dst_ip_v4;
-    evt_for_msg.src_port = src_port;
-    evt_for_msg.dst_port = dst_port;
-    evt_for_msg.tls_version = tls_version;
-    memcpy(evt_for_msg.process, process, sizeof(evt_for_msg.process));
-    memcpy(evt_for_msg.payload_snippet, payload_snippet, sizeof(evt_for_msg.payload_snippet));
-
-    // LogAction
-    RedfishEventMessage event_msg(
-        evt_for_msg, message_id, message, severity);
-    action_loop_.pushAction(
-        std::make_unique<LogAction>(
-        event_msg.format(),
-        output_path_));
-
-    if (actionable)
+    if (evt.actionable)
     {
-        if (src_ip_v4 != 0)
+        if (evt.src_ip_v4 != 0)
         {
-            // XDP path: socket info is available.
-            // BlockTcpAction — kill the specific TCP connection immediately
-            // using the kernel's tcp_drop (SOCK_DESTROY) facility, which
-            // tears down the socket without touching the owning process.
+            // Unified path for both XDP (socket from BPF) and uprobe (socket
+            // resolved from /proc).  Kill the connection and blocklist the source.
             action_loop_.pushAction(
                 std::make_unique<BlockTcpAction>(
-                src_ip_v4,
-                dst_ip_v4,
-                src_port,
-                dst_port,
-                message));
-
-            // BlocklistAction — prevent future connections from this source IP
+                evt.src_ip_v4,
+                evt.dst_ip_v4,
+                evt.src_port,
+                evt.dst_port,
+                evt.message));
             action_loop_.pushAction(
                 std::make_unique<BlocklistAddAction>(
-                src_ip_v4,
+                evt.src_ip_v4,
                 blocklist_ttl_,
-                message));
+                evt.message));
         }
         else
         {
-            // Uprobe path: no socket info from BPF, but we have the PID.
-            // Read /proc/<pid>/net/tcp to find the TCP socket 4-tuple,
-            // then issue SOCK_DESTROY to kill the connection.
-            auto sockets = ProcPeerResolver::getTcpSockets(
-                static_cast<pid_t>(pid));
-
-            if (sockets.empty()) {
-                std::cerr << "https_guard: uprobe PID " << pid
-                          << " (" << process << "), TLS version: "
-                          << TlsVersion(tls_version).toString()
-                          << " — no TCP sockets found, cannot SOCK_DESTROY\n";
-            } else {
-                for (const auto& sock : sockets) {
-                    // Only act on established connections to port 443
-                    if (sock.dst_port != 443 && sock.dst_port != 0) {
-                        continue;
-                    }
-
-                    action_loop_.pushAction(
-                        std::make_unique<BlockTcpAction>(
-                        sock.src_ip_v4,
-                        sock.dst_ip_v4,
-                        sock.src_port,
-                        sock.dst_port,
-                        message));
-
-                    // Blocklist the source IP to prevent future connections
-                    if (sock.src_ip_v4 != 0) {
-                        action_loop_.pushAction(
-                            std::make_unique<BlocklistAddAction>(
-                            sock.src_ip_v4,
-                            blocklist_ttl_,
-                            message));
-                    }
-
-                    std::cerr << "https_guard: uprobe PID " << pid
-                              << " (" << process << "), TLS version: "
-                              << TlsVersion(tls_version).toString()
-                              << " — SOCK_DESTROY sent\n";
-                }
-            }
+            std::cerr << "https_guard: uprobe PID " << evt.pid
+                      << " (" << evt.process << "), TLS version: "
+                      << TlsVersion(evt.tls_version).toString()
+                      << " — no TCP sockets found, cannot SOCK_DESTROY\n";
         }
     }
 
+    std::cerr << "https_guard: pushing LogAction for severity=" << evt.severity << "\n";
+    RedfishEventMessage event_msg(
+        evt, evt.message_id, evt.message, evt.severity);
+    action_loop_.pushAction(
+        std::make_unique<LogAction>(event_msg.format(), output_path_));
     return 0;
 }
 
