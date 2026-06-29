@@ -1,6 +1,8 @@
-# HTTPS-Guard Source Code Reference
+# HTTPS-Guard — Detailed Source Code Reference
 
-This directory contains the complete source code for the **HTTPS-Guard** agent — an eBPF-based network security observability tool for OpenBMC. It implements a **Detect → Translate → Dispatch** pipeline using kernel-space uprobe (primary) and XDP (auxiliary) programs, a user-space C++ daemon, and Redfish EventService integration.
+> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](../../README.md).
+
+This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Translate → Dispatch** pipeline: kernel-space eBPF programs (uprobe primary, XDP auxiliary) observe traffic and submit events via a ring buffer; the userspace daemon classifies events and triggers countermeasures.
 
 ## Table of Contents
 
@@ -404,17 +406,20 @@ HTTPS-Guard implements a **hybrid security model** combining synchronous and asy
 Environment file for systemd services:
 
 ```bash
-# Event sink mode: dbus, journal, or both
+# Event sink mode: dbus | journal | both
 HTTPS_GUARD_EVENT_MODE=both
 
-# Network interface to monitor
-HTTPS_GUARD_INTERFACE=eth0
+# Network interface for XDP attachment
+HTTPS_GUARD_IFACE=eth0
 
-# OpenSSL shared library path
+# Path to OpenSSL shared library (uprobe attachment point)
 HTTPS_GUARD_SSL_LIB=/usr/lib/libssl.so.3
 
-# Output log file path
-HTTPS_GUARD_OUTPUT=/var/log/https_guard_events.log
+# JSON event archive read by the event bridge
+HTTPS_GUARD_EVENT_FILE=/var/log/https_guard_events.log
+
+# Redfish log directory watched by bmcweb for EventService dispatch
+HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 ```
 
 ### PACKAGECONFIG Flags
@@ -660,15 +665,22 @@ HTTPS-Guard adapts to the capabilities of the underlying platform:
 - The blocklist enables synchronous enforcement of future connections.
 - Uprobe provides TLS version detection and PID-to-socket correlation for enforcement.
 
-**On QEMU TAP+BRIDGE with virtio-net-pci:**
+**On QEMU TAP+BRIDGE with virtio-net (x86_64/aarch64-virt only — NOT AST2600):**
 - The daemon tries native XDP first (XDP_FLAGS_UPDATE_IF_NOEXIST).
 - If native XDP fails (no driver ndo_bpf), it falls back to generic XDP (XDP_FLAGS_SKB_MODE).
 - Generic XDP hooks into `netif_receive_skb()` in software — no driver support needed.
 - virtio-net supports both modes, so XDP attaches successfully in SKB mode.
 - Expected daemon log: `"https_guard: XDP attached in generic (SKB) mode"`
-- See [the top-level README](../README.md#enabling-xdp-in-qemu-bridge-mode) for setup steps.
+- Note: `virtio-net-pci`/`virtio-net-device` cannot be used on AST2600 (no PCIe/virtio bus).
+  For AST2600 bridge mode, the built-in ftgmac100 NIC is used instead via `-net nic,netdev=net0`.
 
-**On BMC platforms without XDP (e.g., ASpeed AST2600 ftgmac100, QEMU SLIRP):**
+**On QEMU TAP+BRIDGE with AST2600 (johnblue) ftgmac100:**
+- See [the top-level README](../README.md#bridge-mode-recommended-for-xdp) for bridge setup.
+- The ftgmac100 may support native XDP if `CONFIG_XDP` is enabled in the kernel config.
+- If XDP loads: `"https_guard: XDP attached in native mode"` — full enforcement active.
+- If XDP is absent from kernel config: daemon falls back to uprobe-only mode (see below).
+
+**On QEMU SLIRP or platforms without XDP (e.g., ASpeed AST2600 without bridge mode):**
 - Native XDP fails (ftgmac100 has no ndo_bpf).
 - Generic XDP also fails (SLIRP has no real netdev; real ftgmac100 lacks generic XDP too).
 - Both failures are logged but non-fatal — the daemon continues with uprobe only.

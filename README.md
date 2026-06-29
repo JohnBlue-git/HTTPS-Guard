@@ -6,7 +6,7 @@ HTTPS-Guard is an eBPF-based network security observability and enforcement tool
 
 - [What is HTTPS-Guard?](#what-is-https-guard)
 - [Architecture Overview](#architecture-overview)
-- [Directory Structure](#directory-structure)
+- [Source Code Structure](#source-code-structure)
 - [Building HTTPS-Guard](#building-https-guard)
 - [QEMU Configuration](#qemu-configuration)
   - [Bridge Mode (Recommended for XDP)](#bridge-mode-recommended-for-xdp)
@@ -85,58 +85,35 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 
 **Design Principle:** BPF is **OBSERVATIONAL** (data collection only), userspace is **INTELLIGENT** (classification, decision-making, enforcement).
 
-## Directory Structure
+## Source Code Structure
+
+### Layer layout
 
 ```
 meta-https-guard/
-├── README.md                                    # This file
-├── conf/
-│   └── machine/
-│       └── johnblue.conf                        # QEMU machine configuration
-└── recipes-https-guard/
-    └── https-guard/
-        ├── README.md                            # Detailed source code documentation
-        ├── SECURITY_STRATEGY.md                 # Security model deep-dive
-        ├── https-guard-openbmc.bb               # BitBake recipe
-        └── files/
-            ├── CMakeLists.txt                   # Build system
-            ├── https-guard.conf                 # Runtime configuration
-            ├── https-guard-daemon.service       # systemd unit
-            ├── https-guard-daemon.sh            # Daemon launcher
-            ├── https-guard-event-bridge.service # Event bridge unit
-            ├── https-guard-event-bridge.sh      # Redfish event dispatcher
-            ├── simulated-event-generator.service
-            ├── simulated-event-generator.sh
-            ├── scripts/
-            │   └── gen_ssl_offset.c             # Build-time offset detector
-            ├── https_guard/
-            │   ├── events.h                     # Shared event structs
-            │   ├── https_guard.bpf.c            # eBPF programs
-            │   ├── https_guard_program.hpp/cpp  # BPF loader + classifier
-            │   ├── main.cpp                     # Daemon entry point
-            │   ├── pattern_detector.hpp         # Anomaly rules
-            │   ├── proc_peer_resolver.hpp       # PID→socket resolver
-            │   ├── redfish_event_message.hpp    # Redfish formatting
-            │   └── tls_version.hpp              # TLS version helpers
-            ├── actions/
-            │   ├── core/
-            │   │   ├── ActionLoop.hpp/cpp       # Async dispatcher
-            │   │   └── main.cpp                 # Test harness
-            │   ├── blocklist/
-            │   │   ├── blocklist.bpf.h          # BPF blocklist check
-            │   │   ├── Blocklist.hpp/cpp        # BPF map wrapper
-            │   │   ├── BlocklistAction.hpp/cpp  # Add IP to blocklist
-            │   │   └── BlocklistAction.hpp/cpp
-            │   ├── tcp/
-            │   │   ├── BlockTcpAction.hpp/cpp   # TCP teardown
-            │   │   └── TcpDestroyer.hpp/cpp     # Netlink SOCK_DESTROY
-            │   └── log/
-            │       ├── async_mutex.hpp          # Coroutine-safe I/O
-            │       ├── LogAction.hpp/cpp        # File logger
-            │       └── LogAction.hpp/cpp
-            └── ebpf/
-                ├── bpf_program.hpp/cpp          # BPF attachment wrapper
+├── conf/machine/johnblue.conf        # QEMU AST2600 machine definition (networking modes)
+├── recipes-https-guard/https-guard/  # Main recipe + all C++/eBPF source
+│   ├── https-guard-openbmc.bb        # BitBake recipe (build flags, install, PACKAGECONFIG)
+│   └── files/                        # Source tree — see recipes README for full details
+├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
+├── recipes-bmcweb/bmcweb/            # bmcweb OemSecurityEvent schema append
+├── scripts/qemu-setup-tap.sh         # Host bridge / TAP / NAT setup for QEMU testing
+└── manifest/main.xml                 # Repo manifest
 ```
+
+### Component roles
+
+The source under `files/` is split into five components:
+
+| Component | Path | Role |
+|-----------|------|------|
+| **eBPF programs** | `https_guard/https_guard.bpf.c` | Uprobe on `SSL_write()` captures TLS version + payload; XDP inspects ClientHello and enforces the blocklist |
+| **C++ daemon** (`https-guardd`) | `https_guard/` | Loads the BPF object, polls the ring buffer, classifies events, resolves PID→socket, dispatches actions |
+| **Enforcement actions** | `actions/` | Three async countermeasures: `LogAction` (file write), `BlockTcpAction` (SOCK_DESTROY via Netlink), `BlocklistAddAction` (BPF map update) |
+| **BPF wrapper** | `ebpf/` | RAII wrapper for BPF program load / attach / detach lifecycle |
+| **Event bridge** | `https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
+
+> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [recipes-https-guard/https-guard/README.md](recipes-https-guard/https-guard/README.md).
 
 ## Building HTTPS-Guard
 
@@ -181,7 +158,7 @@ bitbake https-guard-openbmc
 
 ## QEMU Configuration
 
-### Bridge Mode (For All Platforms Including AST2600)
+### Bridge Mode (Recommended for XDP)
 
 Bridge mode exposes a real network interface to the guest, enabling XDP support. This works on all platforms:
 - **AST2600 (johnblue)**: Uses built-in ftgmac100 (emulated hardware NIC)
@@ -199,9 +176,11 @@ sudo ./meta-https-guard/scripts/qemu-setup-tap.sh create
 
 **For AST2600 (johnblue):**
 
+The `ast2600-evb` machine's ftgmac100 NIC looks up `nd_table[0]` for its network backend. `-net nic,netdev=net0` creates that `nd_table` entry pointing at the TAP (it is NOT creating an extra NIC — the machine consumes the entry for its first ftgmac100, which appears as `eth0` in the guest).
+
 ```bash
 QB_NET=none runqemu johnblue nographic \
-  qemuparams='-netdev tap,id=net2,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net2'
+  qemuparams='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net0'
 ```
 
 **Verify XDP is working inside guest:**
@@ -220,10 +199,10 @@ ip link show eth0 | grep -i xdp
 
 ```bash
 # Ping the guest
-ping -c 3 192.168.100.2
+ping -c 3 192.168.200.2
 
 # Test HTTPS access
-curl -k https://192.168.100.2/redfish/v1
+curl -k https://192.168.200.2/redfish/v1
 ```
 
 ### SLIRP Mode (Default, Uprobe-Only)
@@ -301,27 +280,30 @@ bpftool map list
 
 ### Configuration
 
-Edit `/etc/default/https-guard`:
+Edit `/etc/default/https-guard` (installed from `https-guard.conf`):
 
 ```bash
-# Event sink mode: dbus, journal, or both
+# Event sink mode: dbus | journal | both
 HTTPS_GUARD_EVENT_MODE=both
 
-# Network interface
-HTTPS_GUARD_INTERFACE=eth0
+# Network interface for XDP attachment
+HTTPS_GUARD_IFACE=eth0
 
-# OpenSSL library path
+# Path to OpenSSL shared library (uprobe attachment point)
 HTTPS_GUARD_SSL_LIB=/usr/lib/libssl.so.3
 
-# Output log path
-HTTPS_GUARD_OUTPUT=/var/log/https_guard_events.log
+# JSON event archive read by the event bridge
+HTTPS_GUARD_EVENT_FILE=/var/log/https_guard_events.log
+
+# Redfish log directory watched by bmcweb for EventService dispatch
+HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 ```
 
 ## Monitoring Redfish Events
 
 ### Event Log Location
 
-Events are written to `/var/log/redfish/https_guard_events.log` in JSON format:
+The daemon writes events to `HTTPS_GUARD_EVENT_FILE` (`/var/log/https_guard_events.log`) in JSON format. The event bridge tails this file and forwards entries to D-Bus / the Redfish log directory:
 
 ```json
 {"@odata.type":"#Event.v1_7_0.Event","Name":"Platform Security Anomaly Event","Id":"1234567890","Events":[{"EventId":"evt-1234567890","Severity":"Critical","MessageId":"OemSecurityEvent.1.0.0.HttpsTlsVersionViolation","Message":"Security violation: Process 'curl' (PID 12043) attempted insecure TLS version (TLS 1.0). Packet was blocked.","MessageArgs":["curl","12043","TLS 1.0"],"EventTimestamp":"2024-01-15T10:30:45Z","OriginOfCondition":{"@odata.id":"/redfish/v1/Managers/bmc"}}]}
@@ -352,10 +334,15 @@ curl -k -u root:0penBmc \
 curl -k -u root:0penBmc \
   https://localhost/redfish/v1/EventService/Subscriptions
 
-# View events via SSE
+# View events via SSE (bridge mode: guest IP direct)
 curl -k -N --https1.0 -u root:0penBmc \
   -H "Accept: text/event-stream" \
-  https://192.168.11.76:4433/redfish/v1/EventService/SSE/
+  https://192.168.200.2/redfish/v1/EventService/SSE/
+
+# View events via SSE (SLIRP mode: host-forwarded port)
+curl -k -N --https1.0 -u root:0penBmc \
+  -H "Accept: text/event-stream" \
+  https://localhost:4433/redfish/v1/EventService/SSE/
 ```
 
 ### D-Bus Event Monitoring
@@ -379,7 +366,7 @@ busctl call xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry \
 | QEMU TAP+BRIDGE | virtio-net-* | ✅ | ✅ | ✅ | Full support |
 | x86_64 (native) | ixgbe, mlx5, etc. | ✅ | ✅ | ✅ | Full support |
 
-\* XDP on AST2600 requires bridge mode with `-net nic,netdev=net2` (not SLIRP mode).
+\* XDP on AST2600 requires bridge mode. Pass `-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net0` to runqemu (not SLIRP).
 
 ### AST2600 Platform Notes
 
@@ -387,13 +374,13 @@ The ASpeed AST2600 SoC used in `johnblue` has **no PCI bus** and **no virtio-bus
 
 - ❌ `virtio-net-pci` cannot be used (requires PCI bus)
 - ❌ `virtio-net-device` cannot be used (requires virtio-bus)
-- ✅ Bridge mode works using the built-in ftgmac100 with `-net nic,netdev=net2`
+- ✅ Bridge mode works using the built-in ftgmac100 with `-netdev tap,id=net0,... -net nic,netdev=net0`
 - ✅ Uprobe-based SSL_write detection works perfectly
 - ✅ XDP is available in bridge mode
 
 **Why no virtio?** The AST2600 is a BMC SoC with 4 built-in Ethernet controllers (ftgmac100). It has no PCIe controller, so QEMU's `-device virtio-net-*` options fail with error: `No 'virtio-bus' bus found`.
 
-**Bridge mode on AST2600:** The ftgmac100 is integrated into the SoC and automatically created by the `ast2600-evb` machine. Use `-net nic,netdev=net2` (not `-device ftgmac100`) to attach a TAP backend. This provides a real network interface for XDP support.
+**Bridge mode on AST2600:** The ftgmac100 is integrated into the SoC and automatically created by the `ast2600-evb` machine. Use `-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net0` — the `-net nic,netdev=net0` creates an nd_table[0] entry that the machine's ftgmac100 consumes as its backend. Do not use `-device ftgmac100` (it would try to place a second SoC-integrated device on the bus). This provides a real network interface for XDP support.
 
 **SLIRP mode limitation:** In SLIRP mode (default), the ftgmac100 driver connects to a virtual network stack without a real netdev, so XDP is not available. Use bridge mode for XDP functionality.
 
@@ -464,7 +451,3 @@ ls -la /var/log/https_guard_events.log
 For detailed source code documentation, see:
 - [recipes-https-guard/https-guard/README.md](recipes-https-guard/https-guard/README.md) - Complete code walkthrough
 - [recipes-https-guard/https-guard/SECURITY_STRATEGY.md](recipes-https-guard/https-guard/SECURITY_STRATEGY.md) - Security model deep-dive
-
-## License
-
-MIT License - See LICENSE file for details
