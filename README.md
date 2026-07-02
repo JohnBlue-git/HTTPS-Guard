@@ -160,49 +160,74 @@ bitbake https-guard-openbmc
 
 ### Bridge Mode (Recommended for XDP)
 
-Bridge mode exposes a real network interface to the guest, enabling XDP support. This works on all platforms:
-- **AST2600 (johnblue)**: Uses built-in ftgmac100 (emulated hardware NIC)
-- **x86_64/aarch64**: Uses virtio-net-device (paravirtualized, better performance)
+Bridge mode gives the guest a real TAP-backed Ethernet interface, which is required for XDP. SLIRP (the default) uses user-mode networking and cannot support XDP.
 
-**Key Point:** Bridge mode is a **host-side** configuration. The host doesn't care about the guest's architecture - it just passes Ethernet frames via a TAP device. The guest uses its native driver (ftgmac100 for AST2600, virtio-net for x86/ARM64).
+- **AST2600 (johnblue)**: Uses the machine's built-in `ftgmac100` NIC, backed by `tap-httpsguard`
+- **x86_64/aarch64**: Uses `virtio-net-device`, backed by the same TAP
 
-**Setup on host (one-time):**
+#### Step 1 — Host: create bridge and TAP (one-time)
+
+The helper script creates `br-httpsguard` (`192.168.200.1/24`), attaches `tap-httpsguard`, enables IP forwarding, and sets up NAT masquerade so the guest can reach the internet.
 
 ```bash
-# Use the helper script
+cd /path/to/HTTPS-Guard
 sudo ./meta-https-guard/scripts/qemu-setup-tap.sh destroy
 sudo ./meta-https-guard/scripts/qemu-setup-tap.sh create
 ```
 
-**For AST2600 (johnblue):**
+Expected output ends with:
+```bash
+[+] Done. Bridge br-httpsguard ready with TAP tap-httpsguard.
+    Bridge IP: 192.168.200.1/24 (host side)
+```
 
-The `ast2600-evb` machine's ftgmac100 NIC looks up `nd_table[0]` for its network backend. `-net nic,netdev=net0` creates that `nd_table` entry pointing at the TAP (it is NOT creating an extra NIC — the machine consumes the entry for its first ftgmac100, which appears as `eth0` in the guest).
+#### Step 2 — Host: launch QEMU in bridge mode
+
+For AST2600, `-net nic,netdev=net0` creates the `nd_table[0]` entry that the machine's `ftgmac100` consumes as its network backend (it does **not** add a second NIC). `QB_NET=none` prevents runqemu from adding its default SLIRP `net0` which would conflict.
 
 ```bash
 QB_NET=none runqemu johnblue nographic \
   qemuparams='-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net0'
 ```
 
-**Verify XDP is working inside guest:**
+#### Step 3 — Guest: configure networking
+
+Once the guest boots, assign a static IP to `eth0` (the ftgmac100 backed by the TAP):
 
 ```bash
-# Check daemon logs
-journalctl -u https-guard-daemon -l | grep "XDP attached"
-# Expected: "https_guard: XDP attached in native mode"
-
-# Verify XDP program loaded
-ip link show eth0 | grep -i xdp
-# Expected: "xdp" in output
+# Run inside the QEMU guest as root
+ip addr add 192.168.200.2/24 dev eth0
+ip link set eth0 up
+ip route add default via 192.168.200.1
+echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 ```
 
-**Test connectivity from host:**
+#### Step 4 — Host: verify connectivity
 
 ```bash
 # Ping the guest
 ping -c 3 192.168.200.2
 
-# Test HTTPS access
-curl -k https://192.168.200.2/redfish/v1
+# Test Redfish access
+# (but flag --tlsvx.x is been ignored by curl)
+curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.3
+curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.2
+curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.1
+curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.0
+```
+
+#### Step 5 — Guest: verify XDP is loaded
+
+```bash
+# Check the NIC for an attached XDP program
+ip link show eth0 | grep -i xdp
+# Expected line: "    prog/xdp  id <N>  name https_guard_xdp  ..."
+
+# Check daemon logs
+journalctl -u https-guard-daemon -l | grep -i xdp
+# Expected: "https_guard: XDP attached in native mode"
+#       or: "https_guard: XDP attached in generic (SKB) mode"
+# If neither: daemon is running uprobe-only (kernel lacks CONFIG_XDP)
 ```
 
 ### SLIRP Mode (Default, Uprobe-Only)

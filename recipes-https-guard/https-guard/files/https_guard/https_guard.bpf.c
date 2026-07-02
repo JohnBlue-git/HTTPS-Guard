@@ -424,8 +424,11 @@ int https_guard_xdp(struct xdp_md *ctx)
             evt->source_ip[p] = '\0';
         }
 
-        /* Parse TLS ClientHello - extract version and check for violation */
-        const unsigned char *cursor = tcp_payload + 5;
+        /* Parse TLS ClientHello - extract version and check for violation.
+         * Record header (5 bytes: ContentType + Version + Length) is
+         * followed by the Handshake header (4 bytes: HandshakeType +
+         * 3-byte Length) before the legacy_version field we want. */
+        const unsigned char *cursor = tcp_payload + 5 + 4;
         __u32 is_violation = 0;
         __u16 tls_ver = 0;
         if (cursor + 2 <= payload_end) {

@@ -327,6 +327,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         {
             // Unified path for both XDP (socket from BPF) and uprobe (socket
             // resolved from /proc).  Kill the connection and blocklist the source.
+
+            // BlockTcpAction
             action_loop_.pushAction(
                 std::make_unique<BlockTcpAction>(
                 evt.src_ip_v4,
@@ -334,6 +336,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
                 evt.src_port,
                 evt.dst_port,
                 evt.message));
+
+            // BlocklistAddAction
             action_loop_.pushAction(
                 std::make_unique<BlocklistAddAction>(
                 evt.src_ip_v4,
@@ -349,11 +353,12 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         }
     }
 
-    std::cerr << "https_guard: pushing LogAction for severity=" << evt.severity << "\n";
+    // LogAction
     RedfishEventMessage event_msg(
         evt, evt.message_id, evt.message, evt.severity);
     action_loop_.pushAction(
         std::make_unique<LogAction>(event_msg.format(), output_path_));
+    std::cerr << "https_guard: pushing LogAction for severity=" << evt.severity << "\n";
     return 0;
 }
 

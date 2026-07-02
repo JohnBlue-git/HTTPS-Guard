@@ -2,9 +2,8 @@
 # =============================================================================
 # QEMU network setup for HTTPS-Guard eBPF/XDP testing
 #
-# Bridge mode works on all platforms including AST2600 (johnblue):
-# - AST2600: Uses built-in ftgmac100 with `-net nic,netdev=net2`
-# - x86_64/aarch64: Uses virtio-net-device with `-device virtio-net-device,netdev=net2`
+# Creates: br-httpsguard (192.168.200.1/24) + tap-httpsguard + NAT masquerade
+# Guest should use 192.168.200.2/24 with gateway 192.168.200.1
 #
 # Usage:
 #   sudo ./scripts/qemu-setup-tap.sh [create|destroy]
@@ -15,62 +14,75 @@ BRIDGE="br-httpsguard"
 TAP="tap-httpsguard"
 TAP_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 
-# Bridge IP (host side). Guest should use 192.168.100.2/24
-BRIDGE_IP="192.168.100.1/24"
+BRIDGE_IP="192.168.200.1/24"
+BRIDGE_NET="192.168.200.0/24"
+
+# Auto-detect the host interface used for internet access
+HOST_IF=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
 
 action="${1:-create}"
 
 case "$action" in
     create)
         echo "[+] Creating bridge $BRIDGE ..."
-        sudo ip link add name "$BRIDGE" type bridge 2>/dev/null || echo "    (bridge $BRIDGE already exists)"
+        ip link add name "$BRIDGE" type bridge 2>/dev/null || echo "    (bridge $BRIDGE already exists)"
 
         echo "[+] Creating TAP device $TAP for user $TAP_USER ..."
-        sudo ip tuntap add dev "$TAP" mode tap user "$TAP_USER" 2>/dev/null || echo "    (tap $TAP already exists)"
+        ip tuntap add dev "$TAP" mode tap user "$TAP_USER" 2>/dev/null || echo "    (tap $TAP already exists)"
 
         echo "[+] Attaching $TAP to $BRIDGE ..."
-        sudo ip link set "$TAP" master "$BRIDGE"
+        ip link set "$TAP" master "$BRIDGE"
 
         echo "[+] Assigning IP $BRIDGE_IP to $BRIDGE ..."
-        sudo ip addr add "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || echo "    (IP already assigned)"
+        ip addr add "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || echo "    (IP already assigned)"
 
         echo "[+] Bringing links up ..."
-        sudo ip link set "$TAP" up
-        sudo ip link set "$BRIDGE" up
+        ip link set "$TAP" up
+        ip link set "$BRIDGE" up
 
-        echo "[+] Done. Bridge $BRIDGE ready with TAP $TAP."
+        echo "[+] Enabling IP forwarding and NAT (via $HOST_IF) ..."
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        iptables -t nat -C POSTROUTING -s "$BRIDGE_NET" -o "$HOST_IF" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -s "$BRIDGE_NET" -o "$HOST_IF" -j MASQUERADE
+        iptables -C FORWARD -i "$BRIDGE" -o "$HOST_IF" -j ACCEPT 2>/dev/null || \
+            iptables -A FORWARD -i "$BRIDGE" -o "$HOST_IF" -j ACCEPT
+        iptables -C FORWARD -i "$HOST_IF" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -A FORWARD -i "$HOST_IF" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
         echo ""
+        echo "[+] Done. Bridge $BRIDGE ready with TAP $TAP."
         echo "    Bridge IP: $BRIDGE_IP (host side)"
         echo ""
-        echo "    For AST2600 (johnblue):"
+        echo "    Launch QEMU (AST2600 / johnblue):"
         echo "      QB_NET=none runqemu johnblue nographic \\"
-        echo "        qemuparams='-netdev tap,id=net2,ifname=$TAP,script=no,downscript=no -net nic,netdev=net2'"
+        echo "        qemuparams='-netdev tap,id=net0,ifname=$TAP,script=no,downscript=no -net nic,netdev=net0'"
         echo ""
-        echo "    For virtio-capable platforms (x86_64, aarch64-virt):"
-        echo "      QB_NET=none runqemu <machine> nographic \\"
-        echo "        qemuparams='-netdev tap,id=net2,ifname=$TAP,script=no,downscript=no -device virtio-net-device,netdev=net2'"
-        echo ""
-        echo "    Inside the guest:"
-        echo "      ip addr add 192.168.100.2/24 dev eth0"
+        echo "    Inside the guest (as root):"
+        echo "      ip addr add 192.168.200.2/24 dev eth0"
         echo "      ip link set eth0 up"
-        echo "      ip route add default via 192.168.100.1"
+        echo "      ip route add default via 192.168.200.1"
         echo "      echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
         echo ""
-        echo "    Test connectivity from host:"
-        echo "      ping -c 3 192.168.100.2"
-        echo "      curl -k https://192.168.100.2/redfish/v1"
+        echo "    Verify from host:"
+        echo "      ping -c 3 192.168.200.2"
+        echo "      curl -k https://192.168.200.2/redfish/v1"
         ;;
     destroy)
+        echo "[-] Removing NAT rules ..."
+        iptables -t nat -D POSTROUTING -s "$BRIDGE_NET" -o "$HOST_IF" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$BRIDGE" -o "$HOST_IF" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$HOST_IF" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
         echo "[-] Removing IP $BRIDGE_IP from $BRIDGE ..."
-        sudo ip addr del "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || true
+        ip addr del "$BRIDGE_IP" dev "$BRIDGE" 2>/dev/null || true
 
         echo "[-] Destroying TAP $TAP ..."
-        sudo ip link set "$TAP" down 2>/dev/null || true
-        sudo ip tuntap del dev "$TAP" mode tap 2>/dev/null || true
+        ip link set "$TAP" down 2>/dev/null || true
+        ip tuntap del dev "$TAP" mode tap 2>/dev/null || true
 
         echo "[-] Destroying bridge $BRIDGE ..."
-        sudo ip link set "$BRIDGE" down 2>/dev/null || true
-        sudo ip link delete "$BRIDGE" type bridge 2>/dev/null || true
+        ip link set "$BRIDGE" down 2>/dev/null || true
+        ip link delete "$BRIDGE" type bridge 2>/dev/null || true
 
         echo "[-] Done."
         ;;
