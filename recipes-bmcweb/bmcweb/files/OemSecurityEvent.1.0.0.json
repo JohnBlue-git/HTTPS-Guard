@@ -8,19 +8,27 @@
   "Messages": {
     "HttpsTlsVersionViolation": {
       "Description": "An incoming or outgoing HTTPS connection attempted to use a banned TLS version.",
-      "Message": "Security violation: Process '%1' (PID %2) attempted an HTTPS connection using an insecure TLS version (%3). Packet was blocked.",
+      "Message": "%1",
       "Severity": "Critical",
-      "NumberOfArgs": 3,
-      "ParamTypes": ["string", "number", "string"],
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
       "Resolution": "Upgrade the client application to support TLS 1.2 or TLS 1.3."
     },
     "HttpsPayloadAnomalyDetected": {
       "Description": "An HTTP/HTTPS request contained strings indicative of a web attack payload.",
-      "Message": "Attack signature detected from process '%1' (PID %2), rule '%3'. Connection should be terminated or quarantined.",
+      "Message": "%1",
       "Severity": "Warning",
-      "NumberOfArgs": 3,
-      "ParamTypes": ["string", "number", "string"],
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
       "Resolution": "Inspect process behavior, validate source endpoint, and review server access logs."
+    },
+    "HttpsTrafficObserved": {
+      "Description": "Normal HTTPS traffic was observed.",
+      "Message": "%1",
+      "Severity": "OK",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "None."
     }
   }
 }

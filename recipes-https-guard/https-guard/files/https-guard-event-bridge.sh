@@ -50,14 +50,17 @@ emit_dbus_log() {
 # bmcweb's FilesystemLogWatcher picks it up and dispatches it to all
 # EventService subscribers (SSE and push/RedfishEvent).
 # Format: "<RFC3339-timestamp> <MessageId>,<MessageArg>"
-# OpenBMC.0.5.GeneralFirmwareSecurityViolation takes one string arg.
+# MessageId must be bmcweb's compiled OemSecurityEvent registry
+# (registries/oem_security_event_message_registry.hpp), which takes one
+# string arg and carries the real per-message severity.
 emit_redfish_log() {
     ts="$1"
-    desc="$2"
+    msg_id="$2"
+    desc="$3"
     # Commas are field delimiters in bmcweb log format; strip them.
     desc_clean="$(printf '%s' "$desc" | tr ',' ' ')"
-    printf '%s OpenBMC.0.5.GeneralFirmwareSecurityViolation,%s\n' \
-        "$ts" "$desc_clean" >> "$REDFISH_LOG"
+    printf '%s %s,%s\n' \
+        "$ts" "$msg_id" "$desc_clean" >> "$REDFISH_LOG"
 }
 
 extract_field() {
@@ -74,31 +77,38 @@ tail -n 0 -F "$EVENT_FILE" | while IFS= read -r line; do
     msg="$(extract_field "$line" "Message")"
     ts="$(extract_field "$line" "EventTimestamp")"
 
-    [ -n "$msg_id" ] || msg_id="OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected"
+    [ -n "$msg_id" ] || msg_id="OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected"
     [ -n "$sev" ] || sev="Warning"
     [ -n "$msg" ] || msg="HTTPS-Guard observed security anomaly"
     [ -n "$ts" ] || ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     case "$MODE" in
         dbus)
-            # D-Bus path: bmcweb monitors xyz.openbmc_project.Logging.Entry
-            # and dispatches to EventService subscribers.  The filesystem
-            # redfish log is NOT written to avoid duplicate delivery.
+            # D-Bus entry for local Redfish LogService/history.  bmcweb's
+            # EventService push to subscribers is driven by its
+            # FilesystemLogWatcher on REDFISH_LOG, not by D-Bus Logging
+            # entries, so that must be written too or no push is ever sent.
             emit_dbus_log "$msg_id" "$msg" "$sev"
+            if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
+                emit_redfish_log "$ts" "$msg_id" "$msg"
+            fi
             ;;
         journal)
             # Journal-only path: no D-Bus, so write the filesystem log
             # for bmcweb's FilesystemLogWatcher to pick up.
             echo "$line" | systemd-cat -t https-guard-event -p warning
             if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
-                emit_redfish_log "$ts" "$msg"
+                emit_redfish_log "$ts" "$msg_id" "$msg"
             fi
             ;;
         both|*)
-            # D-Bus delivers to EventService.  Filesystem log is NOT
-            # written because it would trigger duplicate delivery.
+            # D-Bus entry for local Redfish LogService/history, plus the
+            # filesystem log that actually triggers the EventService push.
             emit_dbus_log "$msg_id" "$msg" "$sev"
             echo "$line" | systemd-cat -t https-guard-event -p warning
+            if [ "$REDFISH_LOG_ENABLED" = "1" ]; then
+                emit_redfish_log "$ts" "$msg_id" "$msg"
+            fi
             ;;
     esac
 done

@@ -1,0 +1,130 @@
+From ff5b71a2f1859ff51443cc54aad46d1a3598578f Mon Sep 17 00:00:00 2001
+From: HTTPS-Guard <noreply@example.com>
+Date: Thu, 2 Jul 2026 10:39:52 +0800
+Subject: [PATCH] Add OemSecurityEvent message registry for HTTPS-Guard
+
+Upstream-Status: Inappropriate [OE-specific]
+
+Registers a compiled-in Redfish message registry for HTTPS-Guard's own
+OemSecurityEvent MessageIds, so bmcweb's FilesystemLogWatcher can resolve
+their real per-message severity instead of falling back to a borrowed
+OpenBMC.0.5.GeneralFirmwareSecurityViolation (always Critical). This is
+specific to the HTTPS-Guard OEM extension in this layer, not a general
+bmcweb improvement, so it is not intended for upstream submission.
+
+---
+ .../oem_security_event_message_registry.hpp   | 88 +++++++++++++++++++
+ redfish-core/include/registries_selector.hpp  |  2 +
+ 2 files changed, 90 insertions(+)
+ create mode 100644 redfish-core/include/registries/oem_security_event_message_registry.hpp
+
+diff --git a/redfish-core/include/registries/oem_security_event_message_registry.hpp b/redfish-core/include/registries/oem_security_event_message_registry.hpp
+new file mode 100644
+index 0000000..a7cfb05
+--- /dev/null
++++ b/redfish-core/include/registries/oem_security_event_message_registry.hpp
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: Copyright HTTPS-Guard project.
++#pragma once
++/****************************************************************
++ * HTTPS-Guard OEM Redfish Message Registry.
++ *
++ * Hand-authored (not DMTF/parse_registries.py generated) to mirror
++ * redfish-core/include/registries/OemSecurityEvent.1.0.0.json served at
++ * /redfish/v1/Registries/OemSecurityEvent.1.0.0/. Keep both in sync.
++ *
++ * Message templates take a single %1 argument: the fully-rendered
++ * description string the https-guard daemon already builds, so callers
++ * (https-guard-event-bridge.sh) pass it through as-is rather than
++ * decomposing it into separate MessageArgs.
++ ***************************************************************/
++#include "registries.hpp"
++
++#include <array>
++
++// clang-format off
++
++namespace redfish::registries
++{
++struct OemSecurityEvent
++{
++static constexpr Header header = {
++    "Copyright HTTPS-Guard project.",
++    "#MessageRegistry.v1_4_0.MessageRegistry",
++    1,
++    0,
++    0,
++    "HTTPS Guard Security Event Registry",
++    "en",
++    "This registry defines security and anomaly events detected at the kernel layer via eBPF.",
++    "OemSecurityEvent",
++    "HTTPS-Guard",
++};
++
++static constexpr const char* url =
++    "/redfish/v1/Registries/OemSecurityEvent.1.0.0/OemSecurityEvent.1.0.0.json";
++
++static constexpr std::array registry =
++{
++    MessageEntry{
++        "HttpsTlsVersionViolation",
++        {
++            "An incoming or outgoing HTTPS connection attempted to use a banned TLS version.",
++            "%1",
++            "Critical",
++            1,
++            {
++                "string",
++            },
++            "Upgrade the client application to support TLS 1.2 or TLS 1.3.",
++        }},
++    MessageEntry{
++        "HttpsPayloadAnomalyDetected",
++        {
++            "An HTTP/HTTPS request contained strings indicative of a web attack payload.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Inspect process behavior, validate source endpoint, and review server access logs.",
++        }},
++    MessageEntry{
++        "HttpsTrafficObserved",
++        {
++            "Normal HTTPS traffic was observed.",
++            "%1",
++            "OK",
++            1,
++            {
++                "string",
++            },
++            "None.",
++        }},
++};
++
++};
++// clang-format on
++
++[[gnu::constructor]] inline void registerOemSecurityEvent()
++{ registerRegistry<OemSecurityEvent>(); }
++
++} // namespace redfish::registries
+diff --git a/redfish-core/include/registries_selector.hpp b/redfish-core/include/registries_selector.hpp
+index 6440ca5..2dac224 100644
+--- a/redfish-core/include/registries_selector.hpp
++++ b/redfish-core/include/registries_selector.hpp
+@@ -8,6 +8,8 @@
+ // NOLINTNEXTLINE(misc-include-cleaner)
+ #include "registries/heartbeat_event_message_registry.hpp"
+ // NOLINTNEXTLINE(misc-include-cleaner)
++#include "registries/oem_security_event_message_registry.hpp"
++// NOLINTNEXTLINE(misc-include-cleaner)
+ #include "registries/openbmc_message_registry.hpp"
+ // NOLINTNEXTLINE(misc-include-cleaner)
+ #include "registries/resource_event_message_registry.hpp"
+-- 
+2.34.1
+

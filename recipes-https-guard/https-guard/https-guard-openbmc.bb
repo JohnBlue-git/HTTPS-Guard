@@ -42,6 +42,7 @@ PACKAGECONFIG ??= "simulation event-both"
 PACKAGECONFIG[simulation] = ""
 PACKAGECONFIG[daemon] = ""
 PACKAGECONFIG[both] = ""
+
 PACKAGECONFIG[dbus-only] = ""
 PACKAGECONFIG[journal-only] = ""
 PACKAGECONFIG[event-both] = ""

@@ -208,7 +208,7 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         {
             /* TLS version violation (< 1.2) */
             evt.severity   = "Critical";
-            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
+            evt.message_id = "OemSecurityEvent.1.0.HttpsTlsVersionViolation";
             evt.message    = "Security violation: Process '" + evt.process +
                              "' (PID " + std::to_string(evt.pid) +
                              ") attempted an HTTPS connection using an insecure TLS version (" +
@@ -226,15 +226,15 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
                     matched_rule = "kernel-signature";
                 }
                 evt.severity   = "Warning";
-                evt.message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
+                evt.message_id = "OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected";
                 evt.message    = "Attack signature detected from process '" + evt.process +
                                  "' (PID " + std::to_string(evt.pid) +
                                  "), rule '" + matched_rule +
                                  "'. Source should be quarantined.";
                 evt.actionable = true;
             } else {
-                evt.severity   = "Informational";
-                evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+                evt.severity   = "OK";
+                evt.message_id = "OemSecurityEvent.1.0.HttpsTrafficObserved";
                 evt.message    = "HTTPS traffic observed from process '" + evt.process +
                                  "' (PID " + std::to_string(evt.pid) +
                                  "), TLS version: " + TlsVersion(evt.tls_version).toString();
@@ -272,7 +272,7 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         {
             /* TLS version violation - already dropped by XDP, but log it */
             evt.severity   = "Critical";
-            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTlsVersionViolation";
+            evt.message_id = "OemSecurityEvent.1.0.HttpsTlsVersionViolation";
             evt.message    = "Security violation: Process '" + evt.process +
                              "' (PID " + std::to_string(evt.pid) +
                              ") attempted an HTTPS connection using an insecure TLS version (" +
@@ -290,15 +290,15 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
                     matched_rule = "kernel-signature";
                 }
                 evt.severity   = "Warning";
-                evt.message_id = "OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected";
+                evt.message_id = "OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected";
                 evt.message    = "Attack signature detected from process '" + evt.process +
                                  "' (PID " + std::to_string(evt.pid) +
                                  "), rule '" + matched_rule +
                                  "'. Source should be quarantined.";
                 evt.actionable = true;
             } else {
-                evt.severity   = "Informational";
-                evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+                evt.severity   = "OK";
+                evt.message_id = "OemSecurityEvent.1.0.HttpsTrafficObserved";
                 evt.message    = "HTTPS traffic observed from process '" + evt.process +
                                  "' (PID " + std::to_string(evt.pid) +
                                  "), TLS version: " + TlsVersion(evt.tls_version).toString();
@@ -307,8 +307,8 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
         /* Normal TLS handshake - informational */
         else
         {
-            evt.severity   = "Informational";
-            evt.message_id = "OemSecurityEvent.1.0.0.HttpsTrafficObserved";
+            evt.severity   = "OK";
+            evt.message_id = "OemSecurityEvent.1.0.HttpsTrafficObserved";
             evt.message    = "HTTPS traffic observed from process '" + evt.process +
                              "' (PID " + std::to_string(evt.pid) +
                              "), TLS version: " + TlsVersion(evt.tls_version).toString();

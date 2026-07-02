@@ -150,6 +150,44 @@ bitbake obmc-phosphor-image
 bitbake https-guard-openbmc
 ```
 
+### Configuring via local.conf
+
+`https-guard-openbmc`'s behavior is controlled by `PACKAGECONFIG`, set per-recipe in your build's `conf/local.conf` (or a distro/machine conf). The default is:
+
+```
+PACKAGECONFIG:pn-https-guard-openbmc ?= "simulation event-both"
+```
+
+**Service selection** — which systemd services get built/enabled (pick one):
+
+| Flag | Effect |
+|------|--------|
+| `simulation` (default) | Enables `simulated-event-generator`, disables the real eBPF daemon. No kernel eBPF/XDP or BPF toolchain required — good for a first QEMU boot. |
+| `daemon` | Enables the real `https-guardd` (uprobe + optional XDP), disables the simulator. Requires a kernel with `CONFIG_BPF`/`CONFIG_UPROBE_EVENTS` (and `CONFIG_NET_XDP` for XDP). |
+| `both` | Enables both, for comparing real vs. simulated events side by side. |
+
+**Event delivery mode** — how events reach Redfish EventService subscribers (pick one):
+
+| Flag | Effect |
+|------|--------|
+| `dbus-only` | Emits via D-Bus `xyz.openbmc_project.Logging.Create` only. |
+| `journal-only` | Emits via `systemd-cat` + writes `/var/log/redfish` for bmcweb's `FilesystemLogWatcher`. |
+| `event-both` (default) | Emits both D-Bus and journal, and also writes `/var/log/redfish` (required for the push to actually reach subscribers — see [Event Bridge Not Dispatching](#event-bridge-not-dispatching)). |
+
+Example: build with the real daemon and journal-only delivery:
+
+```
+# conf/local.conf
+MACHINE = "johnblue"
+PACKAGECONFIG:pn-https-guard-openbmc = "daemon journal-only"
+```
+
+Then rebuild:
+
+```bash
+bitbake https-guard-openbmc
+```
+
 ### Build Outputs
 
 - **Daemon binary:** `tmp/deploy/images/<machine>/https-guard-openbmc/usr/sbin/https-guardd`
@@ -331,41 +369,122 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 The daemon writes events to `HTTPS_GUARD_EVENT_FILE` (`/var/log/https_guard_events.log`) in JSON format. The event bridge tails this file and forwards entries to D-Bus / the Redfish log directory:
 
 ```json
-{"@odata.type":"#Event.v1_7_0.Event","Name":"Platform Security Anomaly Event","Id":"1234567890","Events":[{"EventId":"evt-1234567890","Severity":"Critical","MessageId":"OemSecurityEvent.1.0.0.HttpsTlsVersionViolation","Message":"Security violation: Process 'curl' (PID 12043) attempted insecure TLS version (TLS 1.0). Packet was blocked.","MessageArgs":["curl","12043","TLS 1.0"],"EventTimestamp":"2024-01-15T10:30:45Z","OriginOfCondition":{"@odata.id":"/redfish/v1/Managers/bmc"}}]}
+{"@odata.type":"#Event.v1_7_0.Event","Name":"Platform Security Anomaly Event","Id":"1234567890","Events":[{"EventId":"evt-1234567890","Severity":"Critical","MessageId":"OemSecurityEvent.1.0.HttpsTlsVersionViolation","Message":"Security violation: Process 'curl' (PID 12043) attempted an HTTPS connection using an insecure TLS version (TLS 1.0). Packet was blocked.","EventTimestamp":"2024-01-15T10:30:45Z","OriginOfCondition":{"@odata.id":"/redfish/v1/Managers/BMC"}}]}
 ```
+
+Note: `MessageId` uses exactly 4 dot-separated fields (`RegistryName.Major.Minor.MessageKey`) because bmcweb's `registries::getMessageComponents()` requires that shape to resolve severity/text — it does not accept a 3-part semver patch digit. The registry itself is compiled into bmcweb from
+`recipes-bmcweb/bmcweb/files/0001-add-oem-security-event-message-registry.patch`
+(mirrored for documentation at `/redfish/v1/Registries/OemSecurityEvent.1.0.0/`), so a Redfish EventService push for these MessageIds carries the real severity below rather than a generic borrowed one.
 
 ### Event Message IDs
 
 | Message ID | Severity | Description |
 |------------|----------|-------------|
-| `OemSecurityEvent.1.0.0.HttpsTlsVersionViolation` | Critical | TLS version < 1.2 detected |
-| `OemSecurityEvent.1.0.0.HttpsPayloadAnomalyDetected` | Warning | Attack signature in HTTP payload |
-| `OemSecurityEvent.1.0.0.HttpsTrafficObserved` | Informational | Normal HTTPS traffic observed |
+| `OemSecurityEvent.1.0.HttpsTlsVersionViolation` | Critical | TLS version < 1.2 detected |
+| `OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected` | Warning | Attack signature in HTTP payload |
+| `OemSecurityEvent.1.0.HttpsTrafficObserved` | OK | Normal HTTPS traffic observed |
 
 ### Subscribe to Events via Redfish
 
+bmcweb's EventService delivers events by POSTing them as HTTPS requests to a
+subscriber-supplied `Destination` URL. `scripts/listener/` provides a minimal
+HTTPS receiver (`listener.py`) for testing this end-to-end, backed by its own
+`cert.pem` / `key.pem`.
+
+#### Step 1 — Generate a certificate for the listener
+
 ```bash
-# Using curl to subscribe to events
-curl -k -u root:0penBmc \
-  -X POST https://localhost/redfish/v1/EventService/Subscriptions \
+cd meta-https-guard/scripts/listener
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout key.pem -out cert.pem -days 365 \
+  -subj "/CN=<listener_ip>" \
+  -addext "subjectAltName=IP:<listener_ip>"
+```
+
+Use the IP address of the machine that will run `listener.py`, reachable from
+the BMC guest — e.g. `192.168.200.1` (the host side of `br-httpsguard` in
+bridge mode, see [Step 1](#step-1--host-create-bridge-and-tap-one-time)
+above).
+
+#### Step 2 — Trust the certificate on the BMC
+
+The cert is self-signed, so bmcweb's outbound HTTPS client refuses it until
+it's added to the BMC's Redfish TrustStore:
+
+```bash
+jq -n --rawfile cert cert.pem '{CertificateString: $cert, CertificateType: "PEM"}' | \
+  curl -k -u root:0penBmc -X POST \
+    https://192.168.200.2/redfish/v1/Managers/bmc/Truststore/Certificates \
+    -H "Content-Type: application/json" -d @-
+```
+
+#### Step 3 — Start the listener (this also subscribes it to the BMC)
+
+On startup, `listener.py` auto-detects its own IP (the route the BMC would
+use to reach it) and POSTs a Redfish `EventService/Subscriptions` request on
+your behalf — no separate `curl` subscribe call needed:
+
+```bash
+python3 listener.py
+# [SUBSCRIBE] https://<listener_ip>:8443/events -> HTTP 201
+# Listener active on https://0.0.0.0:8443/events
+```
+
+Override the defaults (`BMC_HOST=192.168.200.2`, `BMC_USER=root`,
+`BMC_PASS=0penBmc`, `LISTENER_PORT=8443`) via environment variables if
+needed, e.g.:
+
+```bash
+BMC_HOST=192.168.200.2 LISTENER_IP=192.168.200.1 python3 listener.py
+```
+
+`LISTENER_IP` only needs to be set explicitly if auto-detection picks the
+wrong interface (e.g. multiple NICs on the host).
+
+If subscribing fails (e.g. the cert from Step 2 isn't trusted yet, or the
+BMC isn't reachable), `listener.py` logs `[SUBSCRIBE] failed: ...` but keeps
+running — you can still subscribe manually once the issue is fixed:
+
+```bash
+# Note: this bmcweb's EventService.v1_5_0 schema rejects "EventTypes"
+# (Base.1.19.PropertyUnknown) — it was dropped from the Redfish spec in
+# favor of RegistryPrefixes/MessageIds, so it's omitted here.
+curl -k -u root:0penBmc -X POST \
+  https://192.168.200.2/redfish/v1/EventService/Subscriptions \
   -H "Content-Type: application/json" \
   -d '{
-    "Destination": "http://client:8080/events",
-    "Protocol": "Redfish",
-    "EventTypes": ["Alert"]
+    "Destination": "https://<listener_ip>:8443/events",
+    "Protocol": "Redfish"
   }'
 
 # Query existing subscriptions
 curl -k -u root:0penBmc \
-  https://localhost/redfish/v1/EventService/Subscriptions
+  https://192.168.200.2/redfish/v1/EventService/Subscriptions
+```
 
+#### Step 4 — Trigger and verify
+
+```bash
+curl -ku root:0penBmc https://192.168.200.2/redfish/v1
+```
+
+`listener.py`'s terminal should print the pushed event:
+
+```
+[EVENT RECEIVED] Path: /events
+{"@odata.type":"#Event.v1_7_0.Event","Name":"Platform Security Anomaly Event",...}
+```
+
+#### Alternative: SSE streaming (no listener needed)
+
+```bash
 # View events via SSE (bridge mode: guest IP direct)
-curl -k -N --https1.0 -u root:0penBmc \
+curl -k -N --http1.0 -u root:0penBmc \
   -H "Accept: text/event-stream" \
   https://192.168.200.2/redfish/v1/EventService/SSE/
 
 # View events via SSE (SLIRP mode: host-forwarded port)
-curl -k -N --https1.0 -u root:0penBmc \
+curl -k -N --http1.0 -u root:0penBmc \
   -H "Accept: text/event-stream" \
   https://localhost:4433/redfish/v1/EventService/SSE/
 ```
@@ -470,6 +589,21 @@ ls -la /var/log/https_guard_events.log
 /usr/sbin/https-guard-event-bridge
 # Should output: "Bridge started, monitoring /var/log/https_guard_events.log"
 ```
+
+**No Redfish push arriving at a subscriber, even though the daemon/bridge logs show events:**
+Verified on `johnblue`: this bmcweb build dispatches EventService push notifications
+via its `filesystem_log_watcher` on `HTTPS_GUARD_REDFISH_LOG`
+(`/var/log/redfish`), *not* via D-Bus `Logging.Create` entries. All event
+modes (`dbus`/`journal`/`both`) now write to this file — if you're on an
+older checkout where `dbus`/`both` skip it, events will never reach a
+subscriber.
+
+Also observed: this watcher delivers accumulated log content to a
+subscriber as a batch **at subscribe time**, rather than reliably streaming
+each new line the instant it's appended. If a subscription has been open
+for a while and new events aren't showing up, try re-subscribing (or
+restart `listener.py`, which re-subscribes on startup) to force a
+catch-up flush.
 
 ## Development
 
