@@ -85,6 +85,8 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 
 **Design Principle:** BPF is **OBSERVATIONAL** (data collection only), userspace is **INTELLIGENT** (classification, decision-making, enforcement).
 
+> For an interactive, diagram-based walkthrough of this pipeline, see [DESIGN.html](DESIGN.html).
+
 ## Source Code Structure
 
 ### Layer layout
@@ -94,7 +96,7 @@ meta-https-guard/
 ├── conf/machine/johnblue.conf        # QEMU AST2600 machine definition (networking modes)
 ├── recipes-https-guard/https-guard/  # Main recipe + all C++/eBPF source
 │   ├── https-guard-openbmc.bb        # BitBake recipe (build flags, install, PACKAGECONFIG)
-│   └── files/                        # Source tree — see recipes README for full details
+│   └── files/                        # Source tree — see DESIGN.md for full details
 ├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
 ├── recipes-bmcweb/bmcweb/            # bmcweb OemSecurityEvent schema append
 ├── scripts/qemu-setup-tap.sh         # Host bridge / TAP / NAT setup for QEMU testing
@@ -113,7 +115,7 @@ The source under `files/` is split into five components:
 | **BPF wrapper** | `ebpf/` | RAII wrapper for BPF program load / attach / detach lifecycle |
 | **Event bridge** | `https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
-> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [recipes-https-guard/https-guard/README.md](recipes-https-guard/https-guard/README.md).
+> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md) (or [DESIGN.html](DESIGN.html) for the diagram-first version).
 
 ## Building HTTPS-Guard
 
@@ -247,7 +249,7 @@ echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 ping -c 3 192.168.200.2
 
 # Test Redfish access
-# (but flag --tlsvx.x is been ignored by curl)
+# (but the --tlsvX.X flag is ignored by curl — see the curl/OpenSSL 3.x caveat in DESIGN.md)
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.3
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.2
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.1
@@ -395,6 +397,7 @@ HTTPS receiver (`listener.py`) for testing this end-to-end, backed by its own
 
 ```bash
 cd meta-https-guard/scripts/listener
+
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout key.pem -out cert.pem -days 365 \
   -subj "/CN=<listener_ip>" \
@@ -412,6 +415,8 @@ The cert is self-signed, so bmcweb's outbound HTTPS client refuses it until
 it's added to the BMC's Redfish TrustStore:
 
 ```bash
+cd meta-https-guard/scripts/listener
+
 jq -n --rawfile cert cert.pem '{CertificateString: $cert, CertificateType: "PEM"}' | \
   curl -k -u root:0penBmc -X POST \
     https://192.168.200.2/redfish/v1/Managers/bmc/Truststore/Certificates \
@@ -420,12 +425,15 @@ jq -n --rawfile cert cert.pem '{CertificateString: $cert, CertificateType: "PEM"
 
 #### Step 3 — Start the listener (this also subscribes it to the BMC)
 
-On startup, `listener.py` auto-detects its own IP (the route the BMC would
-use to reach it) and POSTs a Redfish `EventService/Subscriptions` request on
-your behalf — no separate `curl` subscribe call needed:
+On startup, `listener.py` auto-detects its own IP — a UDP `connect()` to
+`BMC_HOST` that never actually sends a packet, it just resolves the outbound
+route/interface the BMC would use to reach you — and POSTs a Redfish
+`EventService/Subscriptions` request on your behalf, so no separate `curl`
+subscribe call is needed. It loads `cert.pem`/`key.pem` from its own script
+directory (not the caller's cwd), so it can be run from the repo root:
 
 ```bash
-python3 listener.py
+python3 meta-https-guard/scripts/listener/listener.py
 # [SUBSCRIBE] https://<listener_ip>:8443/events -> HTTP 201
 # Listener active on https://0.0.0.0:8443/events
 ```
@@ -435,7 +443,7 @@ Override the defaults (`BMC_HOST=192.168.200.2`, `BMC_USER=root`,
 needed, e.g.:
 
 ```bash
-BMC_HOST=192.168.200.2 LISTENER_IP=192.168.200.1 python3 listener.py
+LISTENER_IP=192.168.200.1 python3 meta-https-guard/scripts/listener/listener.py
 ```
 
 `LISTENER_IP` only needs to be set explicitly if auto-detection picks the
@@ -607,6 +615,4 @@ catch-up flush.
 
 ## Development
 
-For detailed source code documentation, see:
-- [recipes-https-guard/https-guard/README.md](recipes-https-guard/https-guard/README.md) - Complete code walkthrough
-- [recipes-https-guard/https-guard/SECURITY_STRATEGY.md](recipes-https-guard/https-guard/SECURITY_STRATEGY.md) - Security model deep-dive
+For detailed source code documentation, event struct layouts, and the security strategy deep-dive, see [DESIGN.md](DESIGN.md), or [DESIGN.html](DESIGN.html) for a diagram-first version of the same material.

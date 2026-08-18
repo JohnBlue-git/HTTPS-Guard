@@ -1,8 +1,8 @@
-# HTTPS-Guard — Detailed Source Code Reference
+# HTTPS-Guard — Design Reference
 
-> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](../../README.md).
+> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html).
 
-This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Translate → Dispatch** pipeline: kernel-space eBPF programs (uprobe primary, XDP auxiliary) observe traffic and submit events via a ring buffer; the userspace daemon classifies events and triggers countermeasures.
+This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline: kernel-space eBPF programs (uprobe primary, XDP auxiliary) observe traffic and submit events via a ring buffer; the userspace daemon classifies events and triggers countermeasures.
 
 ## Table of Contents
 
@@ -348,56 +348,211 @@ Main thread (ring_buffer__poll)
 
 ## Security Model
 
-HTTPS-Guard implements a **hybrid security model** combining synchronous and asynchronous enforcement strategies.
+HTTPS-Guard combines two enforcement strategies that eBPF makes possible. It runs the second one as its primary detection path, and layers the first on top purely as an accelerator fed by the second's own decisions.
 
-### Two-Tier Strategy
+### Strategy 1: Synchronous Inline Enforcement
 
-**Tier 1 — Synchronous Enforcement (XDP only):**
-- Blocklist check happens in BPF before any inspection
-- Active blocklist entries → immediate XDP_DROP
-- Zero userspace round-trip, sub-microsecond latency
-- Limited to simple allow/deny rules (eBPF verifier constraints)
+The eBPF program decides and enforces a verdict inside the kernel hook itself, in the same instant it inspects the packet. No event reaches userspace on this path — the decision must be made in nanoseconds.
 
-**Tier 2 — Asynchronous Detection (Uprobe + XDP):**
-- All events submitted to ring buffer
-- Userspace daemon classifies events (unlimited complexity)
-- Complex pattern matching, anomaly detection, state machines
-- Enforcement via SOCK_DESTROY + blocklist updates (feeds Tier 1)
+```
+Policy Authoring (control plane)
+        │
+        ▼
+  Userspace engine pre-loads
+  policies into eBPF Maps
+  (e.g. blocklist IPs, allowed
+   TLS versions, rate limits)
+        │
+        ▼
+  ┌─────────────────────────────────────┐
+  │  eBPF hook (XDP/tc/kprobe)          │
+  │                                     │
+  │  while (processing packet/event) {  │
+  │     query eBPF map                  │
+  │     if (match) → XDP_DROP / -EPERM  │
+  │     else        → XDP_PASS / 0      │
+  │  }                                  │
+  └─────────────────────────────────────┘
+        │
+        ▼
+   Immediate action (drop/allow)
+   without any userspace round-trip
+```
 
-### Why This Approach?
+| Aspect | Property |
+|--------|----------|
+| Decision time | Sub-microsecond (single eBPF instruction) |
+| Blocking capability | Yes — `XDP_DROP`, `bpf_override_return`, etc. |
+| Policy complexity | Low — limited by the eBPF verifier (instruction count, loops, helpers) |
+| Use case | DDoS filtering, IP blocklisting, simple allow/deny rules |
 
-| Aspect | Synchronous (Tier 1) | Asynchronous (Tier 2) |
+The limits that matter here: the verifier rules out regex and deep protocol parsing, multi-stage attack correlation across packets is impractical inside a single hook invocation, and any policy that needs to *learn* (e.g. "this IP just became suspicious") still needs a userspace feedback loop to populate the map in the first place.
+
+### Strategy 2: Asynchronous Active Response
+
+The eBPF hook defers the decision: it submits an observation to a ring buffer and immediately returns a non-blocking verdict (`XDP_PASS` / `0`). A userspace daemon in its own process context picks up the event milliseconds later, classifies it, and executes a countermeasure.
+
+```
+                            ┌──────────────────────────────────────┐
+  eBPF hook                 │  eBPF hook                           │
+  observes event            │  (Uprobe / XDP)                      │
+      │                     │                                      │
+      │  cannot decide      │  1. Reserve ring buffer entry        │
+      │  (too complex)      │  2. Fill event fields                │
+      ▼                     │  3. bpf_ringbuf_submit()             │
+  ────┴─────────            │  4. return XDP_PASS / 0              │
+  Return PASS               └─────────────────┬────────────────────┘
+  immediately                                 │
+                                              │  asynchronous
+                                              ▼
+                            ┌──────────────────────────────────────┐
+                            │  Userspace daemon                    │
+                            │                                      │
+                            │  ring_buffer__poll() loop            │
+                            │    → on_event() callback             │
+                            │      → pattern_detector (complex     │
+                            │        rules, regex, state machine)  │
+                            │      → classifier                    │
+                            │      → countermeasure:               │
+                            │          • SOCK_DESTROY TCP conn     │
+                            │          • update eBPF blocklist     │
+                            │          • kill process (optional)   │
+                            │          • log / alert               │
+                            └──────────────────────────────────────┘
+```
+
+| Aspect | Property |
+|--------|----------|
+| Decision time | Milliseconds (userspace round-trip) |
+| Blocking capability | Indirectly — `SOCK_DESTROY`, eBPF map updates, or signals |
+| Policy complexity | Unlimited — full C++ stdlib, regex, ML, etc. |
+| Use case | Intrusion detection, anomaly scoring, multi-vector correlation |
+
+Why this wins for detection: full pattern matching and cross-connection state with no verifier pressure, plus a learning loop — if the daemon confirms a threat, it writes a block entry into the same eBPF map Strategy 1 reads, so the *next* packet from that source is dropped synchronously. It also fails safe: if the daemon crashes, the kernel hook still returns pass, so traffic keeps flowing instead of the enforcement layer taking the system down with it.
+
+### Why HTTPS-Guard Combines Both
+
+```
+Packet arrives on port 443
+       │
+       ▼
+  ┌────────────────────────────────┐
+  │ Tier 1: blocklist_check()      │  ← Synchronous (XDP only)
+  │  ├── IP active  → XDP_DROP     │
+  │  ├── IP expired → delete, PASS │
+  │  └── IP absent  → XDP_PASS     │
+  └──────────┬─────────────────────┘
+             │ (if PASS)
+             ▼
+  ┌────────────────────────────────┐
+  │ Tier 2: Uprobe + XDP detection │  ← Asynchronous
+  │  ├── SSL_write → ring buffer   │
+  │  ├── ClientHello → ring buffer │
+  │  ├── XDP: version viol → DROP  │
+  │  └── XDP_PASS (always uprobe)  │
+  └──────────┬─────────────────────┘
+             │
+             ▼
+  ┌────────────────────────────────┐
+  │ Userspace daemon               │
+  │  → classify event              │
+  │  → for uprobe events:          │
+  │    → ProcPeerResolver(pid)     │
+  │    → read /proc/<pid>/net/tcp  │
+  │    → get socket 4-tuple        │
+  │  → if actionable:              │
+  │    → BlockTcpAction(src,dst)   │
+  │    → SOCK_DESTROY connection   │
+  │    → BlocklistAddAction(src_ip)│
+  │    → writes expiry into BPF map│  ← Feeds Tier 1
+  └────────────────────────────────┘
+```
+
+| Aspect | Tier 1 (Synchronous) | Tier 2 (Asynchronous) |
 |--------|----------------------|-----------------------|
 | Decision latency | Microseconds | Milliseconds |
 | Policy complexity | Low (verifier-limited) | Unlimited (C++ stdlib) |
-| Detection capability | Simple rules | Complex patterns, correlation |
-| Failure mode | Drops packet | Logs + reactive enforcement |
-| HTTPS-Guard usage | Blocklist only | Primary detection path |
+| Failure mode | Drops the packet | Logs, then reacts |
+| HTTPS-Guard's use | Blocklist enforcement only | Primary detection path |
+| Enforcement action | `XDP_DROP` (proactive, XDP platforms only) | `SOCK_DESTROY` + blocklist write (reactive, all platforms) |
 
-### Platform-Adaptive Behavior
+Evidence in the source:
 
-**On x86 servers with XDP-capable NICs:**
-- Both uprobe and XDP loaded
-- XDP provides proactive TLS version violation dropping
-- Blocklist enables synchronous enforcement of repeat offenders
-- Uprobe provides PID-to-socket correlation for enforcement
+| Location | Evidence |
+|----------|----------|
+| `https_guard/https_guard.bpf.c:217-292` | Uprobe `SSL_write`: purely observational — reads `ssl->version` via `bpf_probe_read_user()` at offset 36, captures a payload snippet, submits `uprobe_event` (no event_type, no severity), returns 0 |
+| `https_guard/https_guard.bpf.c:370-518` | XDP: minimal classification — sets `is_violation` (1 if TLS < 1.2), includes socket info, submits `xdp_event`; returns `XDP_DROP` for violations and blocklist hits |
+| `https_guard/https_guard.bpf.c:56` | `blocklist_check(ip->saddr)` — must stay in BPF for line-rate; active entries drop before any inspection |
+| `actions/blocklist/blocklist.bpf.h:22-36` | `blocklist_check()` — drops active entries, prunes expired ones via `bpf_map_delete_elem()` |
+| `https_guard/events.h:23-34` | `enum hg_event_source` discriminator (`HG_SOURCE_UPROBE=1`, `HG_SOURCE_XDP=2`) — first field in every event struct |
+| `https_guard/https_guard_program.cpp:144-346` | `ringBufferHandler()` — the only place classification happens: reads the discriminator, applies anomaly detection, dispatches actions |
+| `actions/blocklist/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry, writes via `bpf_map_update_elem()`, the write Tier 1 later reads |
+| `actions/tcp/TcpDestroyer.cpp:69-182` | `TcpDestroyer::execute()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` for the exact TCP 4-tuple |
+| `https_guard/pattern_detector.hpp` | SQLi / path-traversal string matching — impossible under verifier limits, runs entirely in userspace |
 
-**On BMC platforms (ASpeed AST2600, QEMU SLIRP):**
-- XDP fails to load (no ndo_bpf, no generic XDP support)
-- Daemon gracefully falls back to uprobe-only mode
-- TLS violations detected reactively:
-  1. Uprobe fires on SSL_write()
-  2. Daemon reads /proc/<pid>/net/tcp
-  3. SOCK_DESTROY kills TCP connection
-  4. Source IP logged for follow-up
+Key design decisions this leads to:
 
-### Key Design Decisions
+1. **BPF is observational** — no `event_type`/`severity` fields exist in either BPF struct.
+2. **Userspace is intelligent** — all classification, anomaly detection, and policy live in `https_guard_program.cpp`.
+3. **Different structs per hook** — `uprobe_event` (176B) has no socket info; `xdp_event` (224B) does.
+4. **No CO-RE for userspace structs** — `ssl_st` is a userspace type, not in kernel BTF, hence `gen_ssl_offset.c`.
 
-1. **BPF is OBSERVATIONAL** - No classification, no event_type/severity in BPF
-2. **Userspace is INTELLIGENT** - All classification, anomaly detection, policy
-3. **Different structs per hook** - `uprobe_event` (176B) vs `xdp_event` (224B)
-4. **No CO-RE for userspace structs** - ssl_st is userspace, not in kernel BTF
-5. **Build-time offset detection** - gen_ssl_offset.c for ssl_st.version field
+### Platform-Adaptive Enforcement
+
+The uprobe attaches unconditionally and never fails. XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available:
+
+**x86 servers / QEMU TAP+BRIDGE with virtio-net** — both programs load. XDP proactively drops TLS violations at the wire, the uprobe still resolves PID→socket for enforcement, and the blocklist protects future connections from repeat offenders. Generic (SKB) XDP hooks `netif_receive_skb()` in software, so `virtio-net-device` attaches successfully even without native driver support.
+
+**AST2600 (johnblue) in bridge mode** — see [the top-level README](README.md#bridge-mode-recommended-for-xdp) for the TAP/bridge setup. The built-in `ftgmac100` may support native XDP if `CONFIG_XDP` is enabled in the kernel config; if not, the daemon falls back to uprobe-only below. Verified on the kernel actually shipped: `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_UPROBE_EVENTS=y`, but `CONFIG_XDP` absent — `ip link show eth0` shows no `xdp`/`prog/xdp` line, and the daemon logs `"https_guard: enforcement active via uprobe(SSL_write)"`.
+
+**QEMU SLIRP, or any platform without XDP** — native XDP fails (no `ndo_bpf`); generic XDP also fails (SLIRP has no real netdev). Both failures are logged but non-fatal. TLS violations are still caught, just reactively:
+
+```
+Process calls SSL_write(ssl, buf, num)
+       │
+       ▼
+  Uprobe fires on SSL_write
+       │
+       ├── Reads ssl->version (4-byte int at offset 36 of ssl_st
+       │     on ARM 32-bit OpenSSL 3.x) using bpf_probe_read_user()
+       │     → extracts lower 16 bits (e.g. 0x0303 = TLS 1.2)
+       │
+       ├── If version < 0x0303 (TLS 1.2):
+       │     → HG_EVENT_TLS_VERSION_VIOLATION, Severity: CRITICAL
+       │
+       └── Submits event to ring buffer (PID + TLS version, no socket info)
+       │
+       ▼
+  Userspace daemon receives event
+       │
+       ├── ProcPeerResolver::getTcpSockets(pid)
+       │     → reads /proc/<pid>/net/tcp, parses "AABBCCDD:PPPP"
+       │     → returns socket 4-tuple
+       │
+       ├── BlockTcpAction → TcpDestroyer::async_execute()
+       │     → SOCK_DESTROY via NETLINK_INET_DIAG
+       │
+       ├── BlocklistAddAction(src_ip, ttl)
+       │     → future XDP packets from this IP would be dropped, on platforms that have XDP
+       │
+       └── LogAction → Redfish event JSON line
+
+  NOTE: the ssl_st offset is architecture-specific — 36 bytes on ARM
+  32-bit (johnblue), 20 bytes on x86_64 with 8-byte pointers. If
+  detection fails on a new platform, enable the bpf_printk diagnostic
+  scanning code in gen_ssl_offset.c.
+```
+
+**Caveat when testing with `curl`:** OpenSSL 3.x removed TLS 1.0/1.1 support at compile time, so `--tlsv1.0`/`--tlsv1.1` are silently ignored — curl always negotiates TLS 1.3 regardless of the flag:
+
+```
+curl -4 --tlsv1.0 -v -ku root:0penBmc https://localhost/redfish/v1
+...
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / ...
+```
+
+The uprobe will read `0x0304` (TLS 1.3) for every curl connection on this platform; testing the actual TLS < 1.2 violation path requires a legacy TLS client.
 
 ## Configuration
 
@@ -477,314 +632,6 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 - All C++ source/headers under `https_guard/`, `actions/`, `ebpf/`
 - `scripts/gen_ssl_offset.c`
 
-## Security Strategy: Asynchronous Active Response
-
-This document describes the two fundamental strategies for implementing security enforcement with eBPF, and explains why HTTPS-Guard adopts the **Asynchronous Active Response** approach, with Uprobe as the primary detection path on BMC platforms.
-
-### Strategy 1: Synchronous Inline Enforcement ("The Immediate Return")
-
-In a synchronous inline model, the eBPF program itself **decides and enforces** a security policy within the kernel hook, returning a verdict before the operation completes. No event is sent to userspace for the decision path — the decision must be made in nanoseconds.
-
-#### How it works
-
-```
-Policy Authoring (control plane)
-        │
-        ▼
-  Userspace engine pre-loads
-  policies into eBPF Maps
-  (e.g. blocklist IPs, allowed
-   TLS versions, rate limits)
-        │
-        ▼
-  ┌─────────────────────────────────────┐
-  │  eBPF hook (XDP/tc/kprobe)          │
-  │                                     │
-  │  while (processing packet/event) {  │
-  │     query eBPF map                  │
-  │     if (match) → XDP_DROP / -EPERM  │
-  │     else        → XDP_PASS / 0      │
-  │  }                                  │
-  └─────────────────────────────────────┘
-        │
-        ▼
-   Immediate action (drop/allow)
-   without any userspace round-trip
-```
-
-#### Characteristics
-
-| Aspect | Property |
-|--------|----------|
-| Decision time | Sub-microsecond (single eBPF instruction) |
-| Blocking capability | Yes — `XDP_DROP`, `bpf_override_return`, etc. |
-| Policy complexity | Low — limited by eBPF verifier (max instructions, loops, helpers) |
-| Userspace involvement | Only at policy pre-load time |
-| Use case | DDoS filtering, IP blocklisting, simple allow/deny rules |
-
-#### Limitations
-
-- The eBPF verifier restricts program complexity — you cannot run regex, parse deeply nested protocols, or maintain complex state across connections without significant effort.
-- Multi-stage attack detection (e.g. "a probe followed by an exploit 5 seconds later") is impractical because the eBPF program must decide on a single packet/event in isolation.
-- Map-based policies must be pre-computed; dynamic learning (e.g. "this IP is now suspicious") requires a userspace feedback loop anyway.
-
-### Strategy 2: Asynchronous Active Response ("The Fast Action Pipeline")
-
-In an asynchronous model, the eBPF hook **defers** the decision to userspace. It emits an observation event via a ring buffer (or perf buffer) and immediately returns a non-blocking verdict (`XDP_PASS` / `0`). The userspace daemon, running in its own process context, receives the event milliseconds later, classifies it, and executes a countermeasure.
-
-#### How it works
-
-```
-                            ┌──────────────────────────────────────┐
-  eBPF hook                 │  eBPF hook                           │
-  observes event            │  (Uprobe / XDP)                      │
-      │                     │                                      │
-      │  cannot decide      │  1. Reserve ring buffer entry        │
-      │  (too complex)      │  2. Fill event fields                │
-      ▼                     │  3. bpf_ringbuf_submit()             │
-  ────┴─────────            │  4. return XDP_PASS / 0              │
-  Return PASS               └─────────────────┬────────────────────┘
-  immediately                                 │
-                                              │  asynchronous
-                                              ▼
-                            ┌──────────────────────────────────────┐
-                            │  Userspace daemon                    │
-                            │                                      │
-                            │  ring_buffer__poll() loop            │
-                            │    → on_event() callback             │
-                            │      → pattern_detector (complex     │
-                            │        rules, regex, state machine)  │
-                            │      → classifier                    │
-                            │      → countermeasure:               │
-                            │          • SOCK_DESTROY TCP conn     │
-                            │          • update eBPF blocklist     │
-                            │          • kill process (optional)   │
-                            │          • log / alert               │
-                            └──────────────────────────────────────┘
-```
-
-#### Characteristics
-
-| Aspect | Property |
-|--------|----------|
-| Decision time | Milliseconds (userspace round-trip) |
-| Blocking capability | Indirectly — the daemon can terminate TCP connections via SOCK_DESTROY, update eBPF maps to block future events, or send signals to processes |
-| Policy complexity | Unlimited — C++ code with full standard library, regex, machine learning, etc. |
-| Userspace involvement | Every event is classified by userspace |
-| Use case | Intrusion detection, anomaly scoring, multi-vector attack correlation |
-
-#### Advantages over synchronous enforcement
-
-1. **Complex threat detection** — Userspace can run full pattern matching (e.g. SQL injection signatures, path traversal), maintain cross-connection state, and correlate events from multiple eBPF hooks (uprobe + XDP in our case).
-
-2. **No eBPF verifier pressure** — The kernel hook is kept minimal; the heavy work is done in C++ where there are no instruction limits or helper restrictions.
-
-3. **Dynamic countermeasures** — The daemon can learn over time: if a source IP triggers multiple anomalies, the daemon can write a block entry into an eBPF map, and future packets from that IP will be dropped **synchronously** by the XDP program (a hybrid approach). The initial detection remains asynchronous.
-
-4. **Fail-safe by default** — If the daemon crashes, the eBPF hook still returns `XDP_PASS` / `0`, so the system continues operating. The kernel path never blocks userspace recovery.
-
-### Why HTTPS-Guard uses Strategy 2
-
-#### Evidence in the source code
-
-| Location | Evidence |
-|----------|----------|
-| `https_guard/https_guard.bpf.c:217-292` | Uprobe `SSL_write`: **PURELY OBSERVATIONAL** — reads ssl->version via `bpf_probe_read_user()` at offset 36, captures payload snippet, submits `uprobe_event` (no event_type, no severity), returns 0 |
-| `https_guard/https_guard.bpf.c:370-518` | XDP program: **MINIMAL CLASSIFICATION** — sets `is_violation` flag (1 if TLS < 1.2, 0 otherwise), includes socket info, submits `xdp_event`; returns `XDP_DROP` for violations and blocklist hits |
-| `https_guard/https_guard.bpf.c:56` | `blocklist_check(ip->saddr)` — hybrid enforcement: active blocklist entries trigger `XDP_DROP` before any inspection (must stay in BPF for line-rate) |
-| `actions/blocklist/blocklist.bpf.h:22-36` | `blocklist_check()` inline function — performs `XDP_DROP` for active blocklist entries; prunes expired entries via `bpf_map_delete_elem()` |
-| `https_guard/events.h:23-34` | `enum hg_event_source` — discriminator field (HG_SOURCE_UPROBE=1, HG_SOURCE_XDP=2) as first field in all event structs |
-| `https_guard/events.h:44-62` | `struct uprobe_event` — purely observational: timestamp, pid/tgid, tls_version, process, payload_snippet (NO event_type, NO severity) |
-| `https_guard/events.h:69-87` | `struct xdp_event` — minimal classification: adds is_violation flag, socket info (src/dst IP, port), source_ip string |
-| `https_guard/events.h:36-57` | `struct hg_event` — legacy struct kept for backward compatibility with RedfishEventMessage |
-| `https_guard/https_guard_program.cpp:144-346` | `ringBufferHandler()` — **USERSIDE CLASSIFICATION**: reads event_source discriminator, handles both uprobe_event and xdp_event, determines event_type/severity/message, applies anomaly detection, takes enforcement actions |
-| `https_guard/https_guard_program.cpp:177-188` | Uprobe event classification: checks tls_version < 0x0303 → Critical violation; else applies anomaly detection |
-| `https_guard/https_guard_program.cpp:196-226` | XDP event classification: checks is_violation flag → Critical; else checks payload → anomaly detection or informational |
-| `https_guard/https_guard_program.cpp:38-61` | `https_guard_ssl_write` uprobe attached first (PRIMARY); XDP attached second (optional) |
-| `https_guard/https_guard_program.cpp:245-282` | For uprobe events: calls `ProcPeerResolver::getTcpSockets(pid)` to read `/proc/<pid>/net/tcp` |
-| `https_guard/https_guard_program.cpp:253-281` | Issues `BlockTcpAction` with resolved socket 4-tuple → SOCK_DESTROY + `BlocklistAddAction` |
-| `https_guard/main.cpp:71` | `kDefaultBlocklistTtl = 5 minutes` — configurable blocklist TTL |
-| `actions/blocklist/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry and writes via `bpf_map_update_elem()` into the kernel BPF map |
-| `actions/tcp/TcpDestroyer.cpp:69-182` | `TcpDestroyer::execute()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` to tear down the exact TCP 4-tuple |
-| `actions/tcp/BlockTcpAction.cpp:29-57` | `BlockTcpAction::execute_async()` — constructs `TcpDestroyer` and offloads blocking call via `std::async` |
-| `https_guard/proc_peer_resolver.hpp` | Parses `/proc/<pid>/net/tcp` to extract socket 4-tuples for uprobe-originated events |
-| `https_guard/pattern_detector.hpp` | Complex string matching (SQL injection, path traversal) — impossible under eBPF verifier limits, runs in userspace |
-| `https-guard-event-bridge.sh` | Full shell-level dispatch to D-Bus, journal, or filesystem — decisions made entirely in userspace |
-
-### The pipeline is hybrid — asynchronous detection with synchronous enforcement (when XDP is available)
-
-HTTPS-Guard's eBPF programs implement a **two-tier** strategy when XDP is available:
-
-**Tier 1 — Synchronous enforcement (Strategy 1):** Before any packet inspection, the XDP hook calls `blocklist_check(ip->saddr)` which queries the shared BPF blocklist map. If the source IP has a non-expired entry, the packet is immediately dropped (`XDP_DROP`) with zero userspace round-trip. Expired entries are deleted opportunistically within the same BPF helper.
-
-**Tier 2 — Asynchronous detection (Strategy 2):** If the packet is not blocklisted, the XDP program proceeds with TLS ClientHello and HTTP anomaly inspection. Events are submitted via `bpf_ringbuf_submit()` and the hook returns either `XDP_DROP` (for version violations) or `XDP_PASS`. The uprobe hook on `SSL_write` always returns `0` (pass).
-
-```
-Packet arrives on port 443
-       │
-       ▼
-  ┌────────────────────────────────┐
-  │ Tier 1: blocklist_check()      │  ← Synchronous enforcement (XDP only)
-  │  ├── IP active  → XDP_DROP     │
-  │  ├── IP expired → delete, PASS │
-  │  └── IP absent  → XDP_PASS     │
-  └──────────┬─────────────────────┘
-             │ (if PASS)
-             ▼
-  ┌────────────────────────────────┐
-  │ Tier 2: Uprobe + XDP detection │  ← Asynchronous detection
-  │  ├── SSL_write → ring buffer   │
-  │  ├── ClientHello → ring buffer │
-  │  ├── XDP: version viol → DROP  │
-  │  └── XDP_PASS (always uprobe)  │
-  └──────────┬─────────────────────┘
-             │
-             ▼
-  ┌────────────────────────────────┐
-  │ Userspace daemon               │
-  │  → classify event              │
-  │  → for uprobe events:          │
-  │    → ProcPeerResolver(pid)     │
-  │    → read /proc/<pid>/net/tcp  │
-  │    → get socket 4-tuple        │
-  │  → if actionable:              │
-  │    → BlockTcpAction(src,dst)   │
-  │    → SOCK_DESTROY connection   │
-  │    → BlocklistAddAction(src_ip)│
-  │    → writes expiry into BPF map│  ← Feeds Tier 1
-  └────────────────────────────────┘
-```
-
-### Platform-Aware Enforcement
-
-HTTPS-Guard adapts to the capabilities of the underlying platform:
-
-**On platforms with XDP support (e.g., x86 servers with supported NICs):**
-- Both uprobe and XDP programs are loaded.
-- XDP provides proactive TLS version violation dropping (XDP_DROP).
-- The blocklist enables synchronous enforcement of future connections.
-- Uprobe provides TLS version detection and PID-to-socket correlation for enforcement.
-
-**On QEMU TAP+BRIDGE with virtio-net (x86_64/aarch64-virt only — NOT AST2600):**
-- The daemon tries native XDP first (XDP_FLAGS_UPDATE_IF_NOEXIST).
-- If native XDP fails (no driver ndo_bpf), it falls back to generic XDP (XDP_FLAGS_SKB_MODE).
-- Generic XDP hooks into `netif_receive_skb()` in software — no driver support needed.
-- virtio-net supports both modes, so XDP attaches successfully in SKB mode.
-- Expected daemon log: `"https_guard: XDP attached in generic (SKB) mode"`
-- Note: `virtio-net-pci`/`virtio-net-device` cannot be used on AST2600 (no PCIe/virtio bus).
-  For AST2600 bridge mode, the built-in ftgmac100 NIC is used instead via `-net nic,netdev=net0`.
-
-**On QEMU TAP+BRIDGE with AST2600 (johnblue) ftgmac100:**
-- See [the top-level README](../README.md#bridge-mode-recommended-for-xdp) for bridge setup.
-- The ftgmac100 may support native XDP if `CONFIG_XDP` is enabled in the kernel config.
-- If XDP loads: `"https_guard: XDP attached in native mode"` — full enforcement active.
-- If XDP is absent from kernel config: daemon falls back to uprobe-only mode (see below).
-
-**On QEMU SLIRP or platforms without XDP (e.g., ASpeed AST2600 without bridge mode):**
-- Native XDP fails (ftgmac100 has no ndo_bpf).
-- Generic XDP also fails (SLIRP has no real netdev; real ftgmac100 lacks generic XDP too).
-- Both failures are logged but non-fatal — the daemon continues with uprobe only.
-- TLS version violations are detected reactively: the uprobe fires after `SSL_write()`,
-  the daemon reads `/proc/<pid>/net/tcp` to find the socket, and issues SOCK_DESTROY
-  to kill the TCP connection. The source IP is logged for follow-up.
-- Verified: `ip link show eth0` shows no `xdp` or `prog/xdp` line on these platforms.
-
-### How Uprobe-Only Enforcement Works
-
-When the XDP program is not available (as on ASpeed AST2600), the enforcement flow is:
-
-```
-Process calls SSL_write(ssl, buf, num)
-       │
-       ▼
-  Uprobe fires on SSL_write
-       │
-       ├── Reads ssl->version (4-byte int at offset 36 of ssl_st
-       │     on ARM 32-bit OpenSSL 3.x) using bpf_probe_read_user()
-       │     → extracts lower 16 bits (e.g. 0x0303 = TLS 1.2)
-       │
-       ├── If version < 0x0303 (TLS 1.2):
-       │     → HG_EVENT_TLS_VERSION_VIOLATION
-       │     → Severity: CRITICAL
-       │
-       └── Submits event to ring buffer (with PID + TLS version, no socket info)
-       │
-       ▼
-  Userspace daemon receives event
-       │
-       ├── ProcPeerResolver::getTcpSockets(pid)
-       │     → reads /proc/<pid>/net/tcp
-       │     → parses hex address format "AABBCCDD:PPPP"
-       │     → returns socket 4-tuple (src_ip, dst_ip, src_port, dst_port)
-       │
-       ├── BlockTcpAction(src_ip, dst_ip, src_port, dst_port)
-       │     → TcpDestroyer::async_execute()
-       │     → SOCK_DESTROY via NETLINK_INET_DIAG
-       │     → Kernel tears down the TCP socket
-       │
-       ├── BlocklistAddAction(src_ip, ttl)
-       │     → Blocklist::add() → bpf_map_update_elem()
-       │     → Future XDP packets from this IP would be dropped
-       │
-       └── LogAction → Redfish event JSON line
-       │
-       NOTE: The ssl_st offset is architecture-specific. On ARM 32-bit
-       (johnblue) the version field is at offset 36. On x86_64 with
-       8-byte pointers it would be at offset 20. If detection fails on
-       a new platform, enable the bpf_printk diagnostic scanning code.
-```
-
-### The challenge: curl + OpenSSL 3.x always uses TLS 1.3
-
-Modern OpenSSL 3.x has removed support for TLS 1.0 and TLS 1.1 at compile time.
-The `--tlsv1.0` and `--tlsv1.1` flags are silently ignored — curl always negotiates
-TLS 1.3 regardless of the flag:
-
-```
-curl -4 --tlsv1.0 -v -ku root:0penBmc https://localhost/redfish/v1
-...
-* TLSv1.3 (OUT), TLS handshake, Client hello (1):
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / ...
-```
-
-This means the negotiated TLS version read by the uprobe will always be 0x0304
-(TLS 1.3) for all curl connections on this platform. To test actual TLS < 1.2
-detection, a legacy TLS client would be required.
-
-### Architecture vs. x86
-
-On a typical x86 Linux host with a supported NIC, HTTPS-Guard can load both the
-XDP program and the uprobe. In an OpenBMC QEMU environment or real BMC hardware
-with the ASpeed AST2600 ftgmac100 NIC, only the uprobe program functions. The
-daemon handles this seamlessly: XDP is treated as an optional auxiliary program,
-and the enforcement path adapts accordingly.
-
-### Validation on ASpeed AST2600
-
-The following has been verified on the target platform:
-
-- `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_UPROBE_EVENTS=y` ✅
-- `ip link show eth0` shows **no XDP program loaded** (no `xdp` or `prog/xdp` line)
-- `CONFIG_XDP` not present in kernel config
-- Daemon logs: `"https_guard: enforcement active via uprobe(SSL_write)"`
-- Uprobe fires on `SSL_write()` calls, events reach the ring buffer
-- The daemon correctly handles the absence of XDP without crashing
-
-### Summary
-
-| | Synchronous (Strategy 1) | Asynchronous (Strategy 2) |
-|---|---|---|
-| **Decision location** | eBPF kernel hook | Userspace daemon |
-| **Latency to action** | Microseconds | Milliseconds |
-| **Policy complexity** | Limited (verifier) | Unlimited (C++/Python/Go) |
-| **HTTPS-Guard choice** | ✅ (XDP blocklist enforcement, when available) | ✅ (primary detection pipeline) |
-| **Detection path** | XDP: wire-level packet inspection | Uprobe: ssl->version + PID→socket lookup |
-| **Enforcement** | XDP_DROP (proactive, on XDP platforms) | SOCK_DESTROY + blocklist (reactive, all platforms) |
-
----
-
-*HTTPS-Guard implements a hybrid security model: asynchronous anomaly detection via uprobe (primary) with synchronous blocklist enforcement via XDP (when available). On BMC platforms without XDP support, the uprobe path provides reactive enforcement through PID-to-socket correlation and SOCK_DESTROY. The userspace daemon classifies events, and for actionable threats (TLS version violations, confirmed attack signatures), reads the process TCP sockets from /proc/<pid>/net/tcp, kills the connection via NETLINK_INET_DIAG, and logs the event for Redfish EventService dispatch.*
-
 ## Development
 
-For top-level project overview, build instructions, and deployment guidance, see the root [README.md](../../README.md).
+For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md).

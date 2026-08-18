@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTPS-Guard Architecture</title>
+<meta name="description" content="How HTTPS-Guard's eBPF kernel probes, userspace daemon, and enforcement actions fit together.">
+<style>
+  :root {
+    --bg: #F4F6F7;
+    --surface: #FFFFFF;
+    --surface-2: #EAEEF0;
+    --ink: #12191C;
+    --muted: #5C6A70;
+    --border: #D7DEE1;
+    --accent-kernel: #0E7C86;
+    --accent-kernel-soft: rgba(14,124,134,0.09);
+    --accent-user: #5750D6;
+    --accent-user-soft: rgba(87,80,214,0.07);
+    --danger: #B8402E;
+    --danger-soft: rgba(184,64,46,0.10);
+    --warn: #93630F;
+    --warn-soft: rgba(156,107,31,0.12);
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --font-serif: "Source Serif Pro", "Iowan Old Style", Charter, Georgia, "Times New Roman", serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0D1315;
+      --surface: #131B1E;
+      --surface-2: #1A2327;
+      --ink: #E7ECEE;
+      --muted: #92A2A8;
+      --border: #283237;
+      --accent-kernel: #3FC2CC;
+      --accent-kernel-soft: rgba(63,194,204,0.12);
+      --accent-user: #A29CFA;
+      --accent-user-soft: rgba(162,156,250,0.11);
+      --danger: #E2664F;
+      --danger-soft: rgba(226,102,79,0.14);
+      --warn: #E0B15C;
+      --warn-soft: rgba(224,177,92,0.14);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-serif);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, .mono { font-family: var(--font-mono); }
+
+  a { color: var(--accent-kernel); text-decoration-thickness: 1px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent-user); outline-offset: 2px; }
+
+  .page {
+    display: grid;
+    grid-template-columns: 232px minmax(0, 1fr);
+    gap: 3rem;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 3.25rem 1.5rem 6rem;
+  }
+  @media (max-width: 900px) {
+    .page { grid-template-columns: 1fr; padding-top: 2.25rem; }
+  }
+
+  /* ---- header ---- */
+  .masthead { grid-column: 1 / -1; margin-bottom: 0.5rem; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.9rem;
+  }
+  h1 {
+    font-size: clamp(2rem, 4vw, 2.7rem);
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    margin: 0 0 0.6rem;
+    text-wrap: balance;
+  }
+  .subtitle {
+    font-family: var(--font-serif);
+    font-size: 1.15rem;
+    color: var(--muted);
+    max-width: 46rem;
+    margin: 0 0 1.4rem;
+    text-wrap: pretty;
+  }
+  .tags { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 2rem; padding: 0; list-style: none; }
+  .tags li {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.03em;
+    color: var(--accent-kernel);
+    background: var(--accent-kernel-soft);
+    border: 1px solid color-mix(in srgb, var(--accent-kernel) 35%, transparent);
+    border-radius: 999px;
+    padding: 0.3rem 0.7rem;
+  }
+  .masthead hr { border: none; border-top: 1px solid var(--border); margin: 0; }
+
+  /* ---- nav ---- */
+  nav.toc { position: sticky; top: 2.5rem; align-self: start; }
+  nav.toc .toc-label {
+    font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 0.75rem;
+  }
+  nav.toc ol { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--border); }
+  nav.toc li { margin: 0; }
+  nav.toc a {
+    display: block; font-family: var(--font-mono); font-size: 0.86rem;
+    color: var(--ink); text-decoration: none; padding: 0.4rem 0 0.4rem 0.9rem;
+    border-left: 2px solid transparent; margin-left: -1px;
+  }
+  nav.toc a:hover { color: var(--accent-kernel); border-left-color: var(--accent-kernel); }
+  @media (max-width: 900px) {
+    nav.toc { position: static; margin-bottom: 1rem; }
+    nav.toc ol { display: flex; flex-wrap: wrap; gap: 0 1rem; border-left: none; }
+    nav.toc a { padding: 0.25rem 0; border-left: none; }
+  }
+
+  /* ---- main content ---- */
+  main { min-width: 0; }
+  section { margin: 0 0 3.5rem; }
+  section h2 {
+    font-size: 1.4rem; font-weight: 700; margin: 0 0 1.1rem;
+    display: flex; align-items: baseline; gap: 0.6rem;
+  }
+  section h2 .num { color: var(--accent-kernel); font-size: 0.95rem; }
+  h3 { font-family: var(--font-mono); font-size: 1.02rem; margin: 1.6rem 0 0.7rem; }
+  .prose { max-width: 42rem; }
+  .prose p { margin: 0 0 1rem; }
+  .prose ul, .prose ol { max-width: 42rem; padding-left: 1.3rem; }
+  .prose li { margin-bottom: 0.4rem; }
+  strong { font-weight: 700; }
+  code { font-family: var(--font-mono); font-size: 0.88em; background: var(--surface-2); padding: 0.08em 0.35em; border-radius: 4px; }
+
+  /* ---- code / tree panels ---- */
+  .panel {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow-x: auto;
+    margin: 1.2rem 0;
+  }
+  .panel pre {
+    margin: 0; padding: 1.1rem 1.3rem;
+    font-family: var(--font-mono); font-size: 0.84rem; line-height: 1.6;
+    color: var(--ink); white-space: pre;
+  }
+  .panel-label {
+    font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted);
+    padding: 0.6rem 1.3rem 0; display: block;
+  }
+
+  /* ---- tables ---- */
+  .table-wrap { overflow-x: auto; margin: 1.2rem 0; }
+  table { border-collapse: collapse; width: 100%; min-width: 480px; font-size: 0.92rem; }
+  caption { text-align: left; font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.6rem; }
+  th, td { text-align: left; padding: 0.55rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  thead th { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.03em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--ink); }
+  tbody tr:last-child td { border-bottom: none; }
+  td .mono, th .mono { font-size: 0.9em; }
+  .num-cell { font-variant-numeric: tabular-nums; }
+
+  .pill-tag {
+    display: inline-block; font-family: var(--font-mono); font-size: 0.72rem;
+    padding: 0.1rem 0.55rem; border-radius: 999px; white-space: nowrap;
+  }
+  .pill-tag.crit { color: var(--danger); background: var(--danger-soft); border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent); }
+  .pill-tag.warn { color: var(--warn); background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); }
+  .pill-tag.ok { color: var(--accent-kernel); background: var(--accent-kernel-soft); border: 1px solid color-mix(in srgb, var(--accent-kernel) 40%, transparent); }
+
+  /* ---- diagrams ---- */
+  figure.diagram { margin: 1.8rem 0 2rem; }
+  figure.diagram .diagram-frame {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1rem; overflow-x: auto;
+  }
+  figure.diagram svg { width: 100%; height: auto; display: block; min-width: 560px; }
+  figcaption {
+    font-family: var(--font-mono); font-size: 0.82rem; color: var(--muted);
+    margin-top: 0.7rem; line-height: 1.55;
+  }
+
+  .dg-zone { stroke-width: 1.25; stroke-dasharray: 5 4; }
+  .dg-zone-kernel { fill: var(--accent-kernel-soft); stroke: var(--accent-kernel); }
+  .dg-zone-user { fill: var(--accent-user-soft); stroke: var(--accent-user); }
+  .dg-zone-label { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase; }
+  .dg-zone-label-kernel { fill: var(--accent-kernel); }
+  .dg-zone-label-user { fill: var(--accent-user); }
+
+  .dg-box { fill: var(--surface); stroke: var(--border); stroke-width: 1.4; }
+  .dg-box-kernel { stroke: var(--accent-kernel); }
+  .dg-box-user { stroke: var(--accent-user); }
+  .dg-box-warn { stroke: var(--warn); }
+
+  .dg-pill { stroke-width: 1.4; }
+  .dg-pill-neutral { fill: var(--surface-2); stroke: var(--border); }
+  .dg-pill-danger { fill: var(--danger-soft); stroke: var(--danger); }
+  .dg-pill-warn { fill: var(--warn-soft); stroke: var(--warn); }
+
+  .dg-title { fill: var(--ink); font-family: var(--font-mono); font-weight: 700; font-size: 13px; }
+  .dg-label { fill: var(--ink); font-family: var(--font-mono); font-size: 11.5px; }
+  .dg-sub { fill: var(--muted); font-family: var(--font-mono); font-size: 10.5px; }
+  .dg-edge-label { fill: var(--muted); font-family: var(--font-mono); font-size: 10.5px; }
+  .dg-branch-label { fill: var(--muted); font-family: var(--font-mono); font-size: 10.5px; font-style: italic; }
+
+  .dg-edge { fill: none; stroke-width: 1.5; }
+  .dg-edge-kernel { stroke: var(--accent-kernel); }
+  .dg-edge-user { stroke: var(--accent-user); }
+  .dg-edge-neutral { stroke: var(--muted); }
+  .dg-edge-dashed { stroke-dasharray: 5 4; }
+
+  footer {
+    grid-column: 1 / -1; margin-top: 1rem; padding-top: 1.75rem;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono); font-size: 0.82rem; color: var(--muted);
+  }
+  footer a { color: var(--accent-user); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Design Document &middot; meta-https-guard</p>
+    <h1>HTTPS-Guard</h1>
+    <p class="subtitle">An eBPF-based network security layer for OpenBMC: kernel-space probes observe TLS and HTTP traffic, a userspace daemon decides what to do about it, and the two halves feed back into each other.</p>
+    <ul class="tags">
+      <li>Uprobe</li><li>XDP</li><li>Ring Buffer</li><li>SOCK_DESTROY</li><li>Redfish EventService</li><li>OpenBMC / BitBake</li>
+    </ul>
+    <hr>
+  </header>
+
+  <nav class="toc" aria-label="Table of contents">
+    <p class="toc-label">Contents</p>
+    <ol>
+      <li><a href="#overview">&sect;1 Overview</a></li>
+      <li><a href="#architecture">&sect;2 Architecture</a></li>
+      <li><a href="#pipeline">&sect;3 Detect &rarr; Classify &rarr; Dispatch</a></li>
+      <li><a href="#security-model">&sect;4 Two-Tier Security Model</a></li>
+      <li><a href="#platform">&sect;5 Platform-Adaptive Enforcement</a></li>
+      <li><a href="#source">&sect;6 Source Layout</a></li>
+      <li><a href="#more">&sect;7 Where to Go Next</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <section id="overview">
+      <h2><span class="num">&sect;1</span> Overview</h2>
+      <div class="prose">
+        <p>HTTPS-Guard detects TLS version downgrades and suspicious HTTP payloads on an OpenBMC device, then acts on what it sees &mdash; tearing down the offending TCP connection and blocking the source IP. It does this by splitting the work across a hard boundary: <strong>the kernel only observes, userspace only decides.</strong></p>
+        <p>Two eBPF programs sit in the kernel. A <strong>uprobe</strong> on OpenSSL's <code>SSL_write()</code> is the primary sensor and works on every platform, including BMCs with no XDP support. An <strong>XDP</strong> program is an optional accelerator: where the NIC allows it, it inspects the TLS ClientHello at the wire and can drop known-bad traffic before it costs a single userspace round-trip.</p>
+        <p>Everything else &mdash; classifying an event, matching attack signatures, deciding to kill a connection &mdash; happens in a C++ daemon (<code>https-guardd</code>) that polls a shared ring buffer. This split matters for one concrete reason: an eBPF program is verifier-limited and cannot run arbitrary logic, while the daemon can use the full C++ standard library. Pushing intelligence to userspace is what lets the detector grow more sophisticated without ever touching the kernel program.</p>
+        <ul>
+          <li><strong>Hybrid enforcement</strong> &mdash; synchronous <code>XDP_DROP</code> for already-known offenders, asynchronous classification for everything new.</li>
+          <li><strong>Learns forward</strong> &mdash; a threat the daemon catches asynchronously is written into the same BPF map XDP checks synchronously, so the next packet from that source is dropped in microseconds.</li>
+          <li><strong>Degrades gracefully</strong> &mdash; on hardware without XDP (e.g. the AST2600 in SLIRP mode), the daemon falls back to uprobe-only reactive enforcement instead of failing.</li>
+          <li><strong>Speaks Redfish</strong> &mdash; every decision is logged as a JSON event and bridged to D-Bus, the systemd journal, and bmcweb's EventService.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2><span class="num">&sect;2</span> Architecture</h2>
+      <div class="prose">
+        <p>The diagram below is the whole system in one picture: two kernel probes feed a shared ring buffer, the daemon classifies what comes out of it, and three independent actions handle the response. The important detail is the loop at the right edge &mdash; <code>BlocklistAddAction</code> writes back into the exact BPF map that XDP's synchronous check reads, which is how an asynchronous detection becomes a synchronous defense for the next packet.</p>
+      </div>
+      <figure class="diagram">
+        <div class="diagram-frame">
+          <svg viewBox="0 0 900 700" role="img" aria-label="Kernel-space Uprobe and XDP programs submit events into a shared ring buffer. The userspace daemon polls it, classifies each event, runs pattern detection and PID-to-socket resolution, then dispatches Log, BlockTcp, and BlocklistAdd actions. BlocklistAddAction writes back into the kernel's XDP blocklist map, closing the loop back to the synchronous XDP_DROP check; LogAction feeds an event bridge that forwards to D-Bus, journal, and the Redfish log.">
+            <defs>
+              <marker id="arrowKernel" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-kernel)"/>
+              </marker>
+              <marker id="arrowUser" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-user)"/>
+              </marker>
+              <marker id="arrowNeutral" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+              </marker>
+            </defs>
+
+            <!-- kernel zone -->
+            <rect class="dg-zone dg-zone-kernel" x="20" y="16" width="780" height="280" rx="14"/>
+            <text class="dg-zone-label dg-zone-label-kernel" x="40" y="40">Kernel Space</text>
+
+            <rect class="dg-box dg-box-kernel" x="50" y="56" width="230" height="76" rx="10"/>
+            <text class="dg-title" x="165" y="80" text-anchor="middle">Uprobe</text>
+            <text class="dg-label" x="165" y="99" text-anchor="middle">SSL_write()</text>
+            <text class="dg-sub" x="165" y="116" text-anchor="middle">reads ssl&rarr;version + payload</text>
+
+            <rect class="dg-box dg-box-kernel" x="50" y="152" width="230" height="76" rx="10"/>
+            <text class="dg-title" x="165" y="176" text-anchor="middle">XDP</text>
+            <text class="dg-label" x="165" y="195" text-anchor="middle">blocklist_check() &middot; ClientHello</text>
+            <text class="dg-sub" x="165" y="212" text-anchor="middle">sets is_violation flag</text>
+
+            <line class="dg-edge dg-edge-kernel" x1="165" y1="228" x2="165" y2="248" marker-end="url(#arrowKernel)"/>
+            <rect class="dg-pill dg-pill-neutral" x="50" y="248" width="230" height="34" rx="17"/>
+            <text class="dg-label" x="165" y="269" text-anchor="middle">XDP_DROP / PASS &mdash; sync, &micro;s</text>
+
+            <rect class="dg-box" x="520" y="96" width="250" height="112" rx="10"/>
+            <text class="dg-title" x="645" y="126" text-anchor="middle">Ring Buffer</text>
+            <text class="dg-label" x="645" y="147" text-anchor="middle">uprobe_event / xdp_event</text>
+            <text class="dg-sub" x="645" y="164" text-anchor="middle">bpf_ringbuf_submit()</text>
+
+            <path class="dg-edge dg-edge-kernel" d="M280,94 L520,126" marker-end="url(#arrowKernel)"/>
+            <text class="dg-edge-label" x="330" y="98">submit: uprobe_event</text>
+            <path class="dg-edge dg-edge-kernel" d="M280,190 L520,150" marker-end="url(#arrowKernel)"/>
+            <text class="dg-edge-label" x="330" y="186">submit: xdp_event (if not dropped)</text>
+
+            <!-- transition -->
+            <path class="dg-edge dg-edge-neutral" d="M645,208 L645,290 L155,290 L155,356" marker-end="url(#arrowNeutral)"/>
+            <text class="dg-edge-label" x="420" y="284">ring_buffer__poll() every 200ms</text>
+
+            <!-- userspace zone -->
+            <rect class="dg-zone dg-zone-user" x="20" y="316" width="780" height="250" rx="14"/>
+            <text class="dg-zone-label dg-zone-label-user" x="40" y="340">Userspace &middot; https-guardd</text>
+
+            <rect class="dg-box dg-box-user" x="50" y="356" width="210" height="70" rx="10"/>
+            <text class="dg-title" x="155" y="384" text-anchor="middle">Classify</text>
+            <text class="dg-sub" x="155" y="402" text-anchor="middle">event_type + severity</text>
+            <text class="dg-sub" x="155" y="416" text-anchor="middle">tls_version &lt; 0x0303 &rarr; Critical</text>
+
+            <path class="dg-edge dg-edge-user" d="M260,391 L290,391" marker-end="url(#arrowUser)"/>
+            <rect class="dg-box dg-box-user" x="290" y="356" width="220" height="70" rx="10"/>
+            <text class="dg-title" x="400" y="384" text-anchor="middle">Pattern Detector</text>
+            <text class="dg-sub" x="400" y="402" text-anchor="middle">payload anomaly rules</text>
+            <text class="dg-sub" x="400" y="416" text-anchor="middle">SQLi &middot; path traversal</text>
+
+            <path class="dg-edge dg-edge-user" d="M510,391 L540,391" marker-end="url(#arrowUser)"/>
+            <rect class="dg-box dg-box-user" x="540" y="356" width="230" height="70" rx="10"/>
+            <text class="dg-title" x="655" y="384" text-anchor="middle">ProcPeerResolver</text>
+            <text class="dg-sub" x="655" y="402" text-anchor="middle">/proc/&lt;pid&gt;/net/tcp</text>
+            <text class="dg-sub" x="655" y="416" text-anchor="middle">uprobe events &rarr; 4-tuple</text>
+
+            <!-- fan-out bus into actions -->
+            <path class="dg-edge dg-edge-user" d="M655,426 L655,446 L155,446" />
+            <line class="dg-edge dg-edge-user" x1="155" y1="446" x2="155" y2="456" marker-end="url(#arrowUser)"/>
+            <line class="dg-edge dg-edge-user" x1="400" y1="446" x2="400" y2="456" marker-end="url(#arrowUser)"/>
+            <line class="dg-edge dg-edge-user" x1="655" y1="446" x2="655" y2="456" marker-end="url(#arrowUser)"/>
+            <text class="dg-edge-label" x="360" y="440">ActionLoop dispatch &mdash; async (Boost.Asio)</text>
+
+            <rect class="dg-box" x="50" y="456" width="210" height="70" rx="10"/>
+            <text class="dg-title" x="155" y="484" text-anchor="middle">LogAction</text>
+            <text class="dg-sub" x="155" y="502" text-anchor="middle">always</text>
+            <text class="dg-sub" x="155" y="516" text-anchor="middle">JSON line &rarr; event log</text>
+
+            <rect class="dg-box" x="290" y="456" width="220" height="70" rx="10"/>
+            <text class="dg-title" x="400" y="484" text-anchor="middle">BlockTcpAction</text>
+            <text class="dg-sub" x="400" y="502" text-anchor="middle">if actionable</text>
+            <text class="dg-sub" x="400" y="516" text-anchor="middle">SOCK_DESTROY via Netlink</text>
+
+            <rect class="dg-box" x="540" y="456" width="230" height="70" rx="10"/>
+            <text class="dg-title" x="655" y="484" text-anchor="middle">BlocklistAddAction</text>
+            <text class="dg-sub" x="655" y="502" text-anchor="middle">if actionable</text>
+            <text class="dg-sub" x="655" y="516" text-anchor="middle">bpf_map_update_elem()</text>
+
+            <!-- exit: event bridge -->
+            <path class="dg-edge dg-edge-neutral" d="M155,526 L215,590" marker-end="url(#arrowNeutral)"/>
+            <rect class="dg-pill dg-pill-neutral" x="40" y="590" width="350" height="50" rx="10"/>
+            <text class="dg-title" x="215" y="611" text-anchor="middle">Event Bridge (shell)</text>
+            <text class="dg-sub" x="215" y="628" text-anchor="middle">&rarr; D-Bus &middot; journal &middot; /var/log/redfish</text>
+
+            <!-- feedback loop -->
+            <path class="dg-edge dg-edge-kernel dg-edge-dashed" d="M770,491 L815,491 L815,190 L280,190" marker-end="url(#arrowKernel)"/>
+            <text class="dg-edge-label" x="822" y="345" transform="rotate(-90 822 345)" text-anchor="middle">feeds Tier 1 blocklist map</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 1 &mdash; The full event pipeline. The dashed line on the right is the feedback loop: a threat the daemon confirms asynchronously gets written into the same map XDP checks synchronously, so the <em>next</em> packet from that source is dropped in the kernel.</figcaption>
+      </figure>
+    </section>
+
+    <section id="pipeline">
+      <h2><span class="num">&sect;3</span> Detect &rarr; Classify &rarr; Dispatch</h2>
+      <div class="prose">
+        <p>The two kernel probes see different things and submit different structs &mdash; there is no shared "event" type, because the uprobe has no access to socket info and the XDP program has no access to the OpenSSL session. The daemon tells them apart by an <code>event_source</code> discriminator that is always the struct's first field.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Event structs at a glance</caption>
+          <thead><tr><th>Field</th><th class="mono">uprobe_event</th><th class="mono">xdp_event</th></tr></thead>
+          <tbody>
+            <tr><td>Source</td><td class="mono">HG_SOURCE_UPROBE</td><td class="mono">HG_SOURCE_XDP</td></tr>
+            <tr><td>TLS version</td><td>from <code>ssl-&gt;version</code> via <code>bpf_probe_read_user()</code></td><td>from parsed ClientHello</td></tr>
+            <tr><td>Socket info</td><td class="mono">&mdash; not available</td><td>src/dst IP, src/dst port</td></tr>
+            <tr><td>Pre-classification</td><td class="mono">none (purely observational)</td><td><code>is_violation</code> flag only</td></tr>
+            <tr><td>Payload snippet</td><td>up to 127 bytes</td><td>up to 127 bytes</td></tr>
+            <tr><td>Size</td><td class="num-cell">~176 bytes</td><td class="num-cell">~224 bytes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="prose">Classification happens entirely in <code>https_guard_program.cpp</code>, after the discriminator is read:</p>
+      <div class="panel">
+        <span class="panel-label">https_guard_program.cpp &mdash; simplified</span>
+        <pre>if (tls_version &lt; 0x0303) {                 // TLS &lt; 1.2
+    event_type = TLS_VERSION_VIOLATION;      // Critical, actionable
+} else if (pattern_detector.suspicious(payload)) {
+    event_type = HTTP_ANOMALY_DETECTED;      // Warning
+} else {
+    event_type = HTTP_PAYLOAD_OBSERVED;      // Informational
+}</pre>
+      </div>
+      <div class="prose">
+        <p>An <code>uprobe_event</code> carries no socket info, so an actionable classification triggers <code>ProcPeerResolver::getTcpSockets(pid)</code> first &mdash; it parses <code>/proc/&lt;pid&gt;/net/tcp</code> to recover the 4-tuple before <code>BlockTcpAction</code> can call <code>SOCK_DESTROY</code>. An <code>xdp_event</code> already has the 4-tuple, so it skips that step entirely.</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Redfish event severities emitted downstream</caption>
+          <thead><tr><th>Message ID</th><th>Severity</th><th>Trigger</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">HttpsTlsVersionViolation</td><td><span class="pill-tag crit">Critical</span></td><td>TLS &lt; 1.2 negotiated</td></tr>
+            <tr><td class="mono">HttpsPayloadAnomalyDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Attack signature in HTTP payload</td></tr>
+            <tr><td class="mono">HttpsTrafficObserved</td><td><span class="pill-tag ok">OK</span></td><td>Normal traffic, logged for visibility</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="security-model">
+      <h2><span class="num">&sect;4</span> Two-Tier Security Model</h2>
+      <div class="prose">
+        <p>These aren't two competing designs &mdash; they're two tiers of the same system, and the connection between them is the point. Tier 1 can only enforce what it already knows; Tier 2 is what teaches it something new.</p>
+      </div>
+      <figure class="diagram">
+        <div class="diagram-frame">
+          <svg viewBox="0 0 860 400" role="img" aria-label="Side by side comparison: Tier 1 synchronous XDP path checks a blocklist map and drops or passes a packet in microseconds. Tier 2 asynchronous path takes a ring buffer event, classifies it in the daemon, and issues a countermeasure in milliseconds. A dashed feedback arrow runs from Tier 2's countermeasure back into Tier 1's blocklist check, showing that async detections become sync defenses.">
+            <defs>
+              <marker id="arrowKernel2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-kernel)"/>
+              </marker>
+              <marker id="arrowUser2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-user)"/>
+              </marker>
+            </defs>
+
+            <rect class="dg-zone dg-zone-kernel" x="20" y="50" width="380" height="300" rx="14"/>
+            <text class="dg-zone-label dg-zone-label-kernel" x="40" y="74">Tier 1 &middot; Synchronous (XDP)</text>
+
+            <rect class="dg-box dg-box-kernel" x="50" y="94" width="320" height="56" rx="10"/>
+            <text class="dg-title" x="210" y="127" text-anchor="middle">Packet arrives on :443</text>
+
+            <line class="dg-edge dg-edge-kernel" x1="210" y1="150" x2="210" y2="180" marker-end="url(#arrowKernel2)"/>
+            <rect class="dg-box dg-box-kernel" x="50" y="180" width="320" height="56" rx="10"/>
+            <text class="dg-title" x="210" y="213" text-anchor="middle">blocklist_check(src_ip)</text>
+
+            <path class="dg-edge dg-edge-kernel" d="M170,236 L125,276" marker-end="url(#arrowKernel2)"/>
+            <path class="dg-edge dg-edge-kernel" d="M250,236 L295,276" marker-end="url(#arrowKernel2)"/>
+            <rect class="dg-pill dg-pill-danger" x="50" y="276" width="150" height="44" rx="10"/>
+            <text class="dg-title" x="125" y="303" text-anchor="middle">XDP_DROP</text>
+            <rect class="dg-pill dg-pill-neutral" x="220" y="276" width="150" height="44" rx="10"/>
+            <text class="dg-title" x="295" y="303" text-anchor="middle">XDP_PASS</text>
+            <text class="dg-edge-label" x="210" y="344" text-anchor="middle">decision time: microseconds</text>
+
+            <rect class="dg-zone dg-zone-user" x="460" y="50" width="380" height="300" rx="14"/>
+            <text class="dg-zone-label dg-zone-label-user" x="480" y="74">Tier 2 &middot; Asynchronous (Uprobe + XDP)</text>
+
+            <rect class="dg-box dg-box-user" x="490" y="94" width="320" height="56" rx="10"/>
+            <text class="dg-title" x="650" y="127" text-anchor="middle">Ring buffer event</text>
+
+            <line class="dg-edge dg-edge-user" x1="650" y1="150" x2="650" y2="180" marker-end="url(#arrowUser2)"/>
+            <rect class="dg-box dg-box-user" x="490" y="180" width="320" height="56" rx="10"/>
+            <text class="dg-title" x="650" y="213" text-anchor="middle">Daemon: classify + pattern match</text>
+
+            <line class="dg-edge dg-edge-user" x1="650" y1="236" x2="650" y2="266" marker-end="url(#arrowUser2)"/>
+            <rect class="dg-box dg-box-user" x="490" y="266" width="320" height="56" rx="10"/>
+            <text class="dg-title" x="650" y="292" text-anchor="middle">Countermeasure:</text>
+            <text class="dg-title" x="650" y="309" text-anchor="middle">SOCK_DESTROY + blocklist add</text>
+            <text class="dg-edge-label" x="650" y="344" text-anchor="middle">decision time: milliseconds</text>
+
+            <path class="dg-edge dg-edge-kernel dg-edge-dashed" d="M490,294 C 420,294 420,208 370,208" marker-end="url(#arrowKernel2)"/>
+            <text class="dg-branch-label" x="426" y="252">writes expiry</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 2 &mdash; Tier 1 can only drop what it already knows about; Tier 2 is the only path that can teach it something new. The dashed arrow is <code>BlocklistAddAction</code> writing into the map <code>blocklist_check()</code> reads.</figcaption>
+      </figure>
+      <div class="table-wrap">
+        <table>
+          <caption>Tradeoffs</caption>
+          <thead><tr><th>Aspect</th><th>Tier 1 &mdash; Synchronous</th><th>Tier 2 &mdash; Asynchronous</th></tr></thead>
+          <tbody>
+            <tr><td>Policy complexity</td><td>Low &mdash; eBPF verifier limited</td><td>Unlimited &mdash; full C++ stdlib</td></tr>
+            <tr><td>Failure mode</td><td>Drops the packet</td><td>Logs, then reacts</td></tr>
+            <tr><td>Used for</td><td>Blocklist enforcement only</td><td>Primary detection path</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="platform">
+      <h2><span class="num">&sect;5</span> Platform-Adaptive Enforcement</h2>
+      <div class="prose">
+        <p>XDP requires a real netdev &mdash; SLIRP-mode QEMU and some real NICs don't offer one. Rather than treating that as a startup failure, the daemon attaches the uprobe unconditionally (it never fails) and treats XDP as optional, trying native attach first and falling back in order.</p>
+      </div>
+      <figure class="diagram">
+        <div class="diagram-frame">
+          <svg viewBox="0 0 720 680" role="img" aria-label="Decision flow: the daemon always attaches the uprobe, then tries native XDP attach; if that fails it tries generic SKB-mode XDP; if that also fails it falls back to uprobe-only. Both XDP-attach outcomes converge on full enforcement with proactive drop and reactive SOCK_DESTROY. The uprobe-only outcome leads to reactive-only enforcement via /proc lookup, which is what happens on the AST2600 and QEMU SLIRP.">
+            <defs>
+              <marker id="arrowN3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+              </marker>
+              <marker id="arrowK3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent-kernel)"/>
+              </marker>
+              <marker id="arrowW3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--warn)"/>
+              </marker>
+            </defs>
+
+            <rect class="dg-pill dg-pill-neutral" x="210" y="16" width="220" height="40" rx="20"/>
+            <text class="dg-title" x="320" y="41" text-anchor="middle">Daemon startup</text>
+
+            <line class="dg-edge dg-edge-neutral" x1="320" y1="56" x2="320" y2="88" marker-end="url(#arrowN3)"/>
+            <rect class="dg-box" x="160" y="88" width="320" height="60" rx="10"/>
+            <text class="dg-title" x="320" y="114" text-anchor="middle">Attach uprobe on SSL_write()</text>
+            <text class="dg-sub" x="320" y="132" text-anchor="middle">always succeeds</text>
+
+            <line class="dg-edge dg-edge-neutral" x1="320" y1="148" x2="320" y2="155" marker-end="url(#arrowN3)"/>
+            <polygon class="dg-box" points="230,210 320,155 410,210 320,265"/>
+            <text class="dg-label" x="320" y="207" text-anchor="middle">Native XDP</text>
+            <text class="dg-label" x="320" y="220" text-anchor="middle">attach OK?</text>
+
+            <path class="dg-edge dg-edge-kernel" d="M410,210 L440,205" marker-end="url(#arrowK3)"/>
+            <text class="dg-branch-label" x="405" y="196">yes</text>
+            <rect class="dg-box dg-box-kernel" x="440" y="182" width="200" height="56" rx="10"/>
+            <text class="dg-title" x="540" y="205" text-anchor="middle">Native XDP</text>
+            <text class="dg-sub" x="540" y="222" text-anchor="middle">attached</text>
+
+            <path class="dg-edge dg-edge-neutral" d="M320,265 L320,305" marker-end="url(#arrowN3)"/>
+            <text class="dg-branch-label" x="332" y="288">no</text>
+            <polygon class="dg-box" points="230,360 320,305 410,360 320,415"/>
+            <text class="dg-label" x="320" y="357" text-anchor="middle">Generic (SKB)</text>
+            <text class="dg-label" x="320" y="370" text-anchor="middle">XDP OK?</text>
+
+            <path class="dg-edge dg-edge-kernel" d="M410,360 L440,355" marker-end="url(#arrowK3)"/>
+            <text class="dg-branch-label" x="405" y="346">yes</text>
+            <rect class="dg-box dg-box-kernel" x="440" y="332" width="210" height="56" rx="10"/>
+            <text class="dg-title" x="545" y="355" text-anchor="middle">Generic XDP</text>
+            <text class="dg-sub" x="545" y="372" text-anchor="middle">attached (SKB mode)</text>
+
+            <path class="dg-edge dg-edge-neutral" d="M320,415 L320,445" marker-end="url(#arrowN3)"/>
+            <text class="dg-branch-label" x="332" y="435">no</text>
+            <rect class="dg-box dg-box-warn" x="210" y="445" width="220" height="60" rx="10"/>
+            <text class="dg-title" x="320" y="469" text-anchor="middle">Uprobe-only fallback</text>
+            <text class="dg-sub" x="320" y="486" text-anchor="middle">AST2600 &middot; QEMU SLIRP</text>
+
+            <path class="dg-edge dg-edge-kernel" d="M540,238 L560,560" marker-end="url(#arrowK3)"/>
+            <path class="dg-edge dg-edge-kernel" d="M545,388 L560,560" marker-end="url(#arrowK3)"/>
+            <rect class="dg-pill dg-pill-neutral" x="420" y="560" width="260" height="60" rx="12"/>
+            <text class="dg-title" x="550" y="584" text-anchor="middle">Full enforcement</text>
+            <text class="dg-sub" x="550" y="601" text-anchor="middle">proactive DROP + reactive SOCK_DESTROY</text>
+
+            <path class="dg-edge dg-edge-warn" d="M320,505 L320,560" marker-end="url(#arrowW3)" style="stroke:var(--warn)"/>
+            <rect class="dg-pill dg-pill-warn" x="60" y="560" width="280" height="60" rx="12"/>
+            <text class="dg-title" x="200" y="584" text-anchor="middle">Reactive enforcement only</text>
+            <text class="dg-sub" x="200" y="601" text-anchor="middle">SOCK_DESTROY via /proc lookup</text>
+          </svg>
+        </div>
+        <figcaption>Fig. 3 &mdash; The uprobe path is never optional; XDP is attempted twice and quietly skipped if the platform can't offer it. No branch is a failure state &mdash; the AST2600 branch is an expected, supported configuration.</figcaption>
+      </figure>
+      <div class="table-wrap">
+        <table>
+          <caption>Verified platform support</caption>
+          <thead><tr><th>Platform</th><th>NIC</th><th>Uprobe</th><th>XDP native</th><th>XDP generic</th></tr></thead>
+          <tbody>
+            <tr><td>ASpeed AST2600 (johnblue), bridge mode</td><td class="mono">ftgmac100</td><td>&#10003;</td><td>&#10003;*</td><td>&mdash;</td></tr>
+            <tr><td>QEMU SLIRP (default)</td><td class="mono">ftgmac100 (emulated)</td><td>&#10003;</td><td>&mdash;</td><td>&mdash;</td></tr>
+            <tr><td>QEMU TAP+BRIDGE</td><td class="mono">virtio-net-*</td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td></tr>
+            <tr><td>x86_64 (native)</td><td class="mono">ixgbe, mlx5, &hellip;</td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="prose" style="font-size:0.85rem; color:var(--muted);">* Requires bridge mode &mdash; SLIRP gives the AST2600's ftgmac100 no real netdev to attach to.</p>
+    </section>
+
+    <section id="source">
+      <h2><span class="num">&sect;6</span> Source Layout</h2>
+      <div class="prose">
+        <p>The layer follows the same kernel/userspace split as the runtime: eBPF and enforcement code live under one recipe, with the machine, kernel, and bmcweb integration layered around it.</p>
+      </div>
+      <div class="panel">
+        <span class="panel-label">meta-https-guard/</span>
+        <pre>meta-https-guard/
+├── conf/machine/johnblue.conf        # QEMU AST2600 machine definition
+├── recipes-https-guard/https-guard/
+│   ├── https-guard-openbmc.bb        # BitBake recipe (PACKAGECONFIG, install)
+│   └── files/
+│       ├── https_guard/              # eBPF programs (.bpf.c) + C++ daemon
+│       ├── actions/                  # LogAction, BlockTcpAction, BlocklistAddAction
+│       └── ebpf/                     # BPF load/attach RAII wrapper
+├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
+├── recipes-bmcweb/bmcweb/            # OemSecurityEvent Redfish message registry
+├── scripts/qemu-setup-tap.sh         # Host bridge/TAP setup for XDP testing
+└── manifest/main.xml</pre>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Component roles</caption>
+          <thead><tr><th>Component</th><th>Path</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td>eBPF programs</td><td class="mono">https_guard.bpf.c</td><td>Uprobe captures TLS version + payload; XDP inspects ClientHello and enforces the blocklist</td></tr>
+            <tr><td>C++ daemon</td><td class="mono">https_guard/</td><td>Loads the BPF object, polls the ring buffer, classifies events, resolves PID&rarr;socket</td></tr>
+            <tr><td>Enforcement actions</td><td class="mono">actions/</td><td>Three async countermeasures dispatched by <code>ActionLoop</code></td></tr>
+            <tr><td>BPF wrapper</td><td class="mono">ebpf/</td><td>RAII wrapper for program load / attach / detach</td></tr>
+            <tr><td>Event bridge</td><td class="mono">https-guard-event-bridge.sh</td><td>Tails the event log, forwards to D-Bus and/or the Redfish filesystem log</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="more">
+      <h2><span class="num">&sect;7</span> Where to Go Next</h2>
+      <div class="prose">
+        <ul>
+          <li><a href="README.md">README.md</a> &mdash; build steps, QEMU bridge/SLIRP setup, deployment, and Redfish subscription walkthrough.</li>
+          <li><a href="DESIGN.md">DESIGN.md</a> &mdash; the per-file reference this document distills: full struct layouts, the BitBake build flow, and the synchronous-vs-asynchronous strategy write-up in depth.</li>
+          <li><a href="scripts/listener/">scripts/listener/</a> &mdash; a minimal HTTPS receiver for testing Redfish EventService push end-to-end.</li>
+        </ul>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    HTTPS-Guard &middot; meta-https-guard layer for OpenBMC
+  </footer>
+
+</div>
+</body>
+</html>

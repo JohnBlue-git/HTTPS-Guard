@@ -30,8 +30,13 @@ httpd = HTTPServer(server_address, Handler)
 
 # SSL Setup
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-# Since we generated separate files in Step 1:
-context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
+# Resolved relative to this script, not the caller's cwd, so listener.py
+# can be invoked from anywhere as long as Step 1 generated the files here.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+context.load_cert_chain(
+    certfile=os.path.join(SCRIPT_DIR, "cert.pem"),
+    keyfile=os.path.join(SCRIPT_DIR, "key.pem"),
+)
 
 httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
