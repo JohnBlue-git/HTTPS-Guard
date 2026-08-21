@@ -59,7 +59,7 @@ files/
 │   │   ├── hg_event.hpp                    # Common parsed-event representation (no classification fields)
 │   │   └── Verdict.hpp                     # {severity, message_id, message, actionable} — a detector's output
 │   ├── tls_version/
-│   │   ├── TlsVersionDetector.hpp          # Flags TLS < 1.2, or any hook-provided tls_violation_hint
+│   │   ├── TlsVersionDetector.hpp          # Flags TLS < 1.2, or a hook's tlsViolationHint()
 │   │   └── tls_version.hpp                 # TlsVersion: numeric code → display string
 │   └── payload_anomaly/
 │       └── PayloadAnomalyDetector.hpp       # SQLi / path-traversal substring rules
@@ -304,6 +304,8 @@ requirement here rather than a style preference.
 
 Per-hook specifics — exactly what each `parseEvent()` extracts, and each hook's own attach fallback — live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
 
+To actually *fire* each of these rules and see which message ID it produces, see [README.md § Exercising the Detections](README.md#exercising-the-detections); `DESIGN.html` § 4 has the class-relationship diagrams, the capability matrix and the ownership table.
+
 ### ActionLoop - Async Dispatcher
 
 Decouples event callback processing from I/O using Boost.Asio:
@@ -460,7 +462,7 @@ Packet arrives on port 443
 
 Key design decisions this leads to:
 
-1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `hg_event.tls_violation_hint`, not baked into any detector's logic.
+1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `ITlsTrafficInfo::tlsViolationHint()`, not baked into any detector's logic.
 2. **Userspace is intelligent** — all classification lives behind `IDetector`, all hook-attach/parse logic behind `IHookModule`; neither knows about the other.
 3. **Different structs per hook** — `uprobe_event` has no socket info; `xdp_event` does (available from packet headers, unlike from uprobe context).
 4. **No CO-RE for userspace structs** — `ssl_st` is a userspace type, not in kernel BTF, hence `gen_ssl_offset.c`.

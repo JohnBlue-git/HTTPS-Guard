@@ -1,11 +1,23 @@
 # Known limitations
 
-What this tool does **not** do, and what has **not** been proven. Collected
-here because the per-ticket notes under `.scratch/` are working records, not
-something an operator or a future maintainer will read.
+What this tool does **not** do — the constraints that come from the platform,
+the capture mechanism, or the enforcement model, and which no amount of testing
+will change. Collected here because the per-ticket notes under `.scratch/` are
+working records, not something an operator or a future maintainer will read.
 
 Every entry below is established, not speculative — each was either measured,
 traced to kernel source, or observed failing on real hardware.
+
+**Two related things live in [README.md](README.md) instead, deliberately —
+they belong next to the commands they qualify, and duplicating them here would
+guarantee the two copies drift apart:**
+
+- **How to trigger each detection**, and which Redfish message ID each
+  produces → [Exercising the Detections](README.md#exercising-the-detections)
+- **Which rules have been driven end-to-end on hardware** and which are only
+  unit-tested, plus the QEMU/SLIRP traps that decide which is which →
+  [Verification status](README.md#verification-status) and
+  [Test-environment caveats](README.md#test-environment-caveats)
 
 ---
 
@@ -83,32 +95,15 @@ still gated on a spoofable `comm` check and should not be enabled as-is.
   teardown fails with `-ENOENT` from `sock_diag` before the 4-tuple is even
   examined, which reads misleadingly like "no such socket".
 
-## What has not been verified live
+## Measurement gaps
 
-Unit tests cover these; live confirmation on hardware does not. That is a
-weaker claim and is recorded as such rather than folded into "verified".
-
-- **`TlsVersionDetector`** — needs a client that actually negotiates below
-  TLS 1.2. Never exercised end to end.
-- **`CertAccessDetector`** — needs the LSM hook, which cannot attach on ARM32
-  (above).
-- **Connection-rate true positive at the shipped threshold.** QEMU SLIRP will
-  not propagate a rapid connect/close burst to the guest (the highest
-  reachable from the host was ~456 in 6s, just under the 500 default), so the
-  end-to-end test used a lowered threshold. The mechanism was verified; the
-  specific default was not exceeded in testing.
-- **`RenegotiationDetector`** — every attempt to drive TLS handshakes through
-  the QEMU SLIRP port-forward failed to complete, because holding connections
-  open to reach the condition saturates the same forward. Unit-tested, and its
-  counter increments from the live-verified ClientHello path, but never
-  confirmed end to end.
 - **`DetectLoop`'s throughput improvement is reasoned, not measured.** Lazy
-  `/proc` enrichment is proven by unit test to run only when asked, and the
-  work it removed from the poll thread is known, but no before/after latency
-  or drop-rate numbers were taken. Its *scheduling* properties — bounded
-  admission, arrival order, and the sweep surviving a backlog — are covered by
-  `tests/detectloop/`, which is a separate binary with a documented build
-  command rather than part of `https_guard_tests`; see its README for why.
+  `/proc` enrichment is proven by unit test to run only when asked, and the work
+  it removed from the poll thread is known, but no before/after latency or
+  drop-rate numbers were taken. Its *scheduling* properties — bounded
+  admission, arrival order, and the sweep surviving a backlog — *are* covered,
+  by `tests/detectloop/`; that is a separate binary with a documented build
+  command rather than part of `https_guard_tests`, and its README says why.
 
 ## Observability
 
@@ -122,25 +117,7 @@ weaker claim and is recorded as such rather than folded into "verified".
   is a one-line fix that has deliberately not been made, to keep it out of an
   unrelated change.
 
-## Testing environment caveats
+---
 
-- QEMU SLIRP terminates and re-originates TCP, so rapid connect/close bursts
-  from the host do not reach the guest as SYNs. Use completed connections when
-  exercising anything that counts them.
-- The target image has neither `bpftool` nor an `ip` that can detach XDP, so a
-  leaked XDP attachment historically needed a reboot to clear. Attachments are
-  now `bpf_link`-owned and released by the kernel on process exit, including on
-  `SIGKILL`.
-- Traffic generated *from* the guest to `127.0.0.1` never traverses XDP. Tests
-  for wire-level detection must originate outside the guest.
-- **Check which QEMU you are talking to.** A stale instance from an earlier
-  session holds its port, so `runqemu` silently bumps the new one (2222 → 2223,
-  4433 → 4434) and SSH on 2222 answers from an old image. This produced a
-  confident but entirely wrong reading of a fresh build's behaviour once.
-  Confirm the image timestamp in the `runqemu` command line, not just that SSH
-  responds.
-- Holding as few as five connections open through SLIRP hostfwd saturates the
-  forward and breaks SSH on that same forward. "SSH dropped" is therefore not
-  evidence that a source was blocklisted — the two are indistinguishable from
-  outside. Read the journal instead; this was initially misdiagnosed the other
-  way round.
+*Per-detection trigger recipes, live-verification status, and the QEMU/SLIRP
+testing traps are in [README.md](README.md#exercising-the-detections).*

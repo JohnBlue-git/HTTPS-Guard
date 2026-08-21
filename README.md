@@ -14,6 +14,11 @@ HTTPS-Guard is an eBPF-based network security observability and enforcement tool
   - [Port Forwarding Limitations](#port-forwarding-limitations)
 - [Deployment](#deployment)
 - [Monitoring Redfish Events](#monitoring-redfish-events)
+- [Exercising the Detections](#exercising-the-detections)
+  - [The trigger helper](#the-trigger-helper)
+  - [Which rules enforce, and why that matters](#which-rules-enforce-and-why-that-matters)
+  - [Verification status](#verification-status)
+  - [Test-environment caveats](#test-environment-caveats)
 - [Platform Support](#platform-support)
 - [Troubleshooting](#troubleshooting)
 
@@ -398,11 +403,21 @@ Note: `MessageId` uses exactly 4 dot-separated fields (`RegistryName.Major.Minor
 
 ### Event Message IDs
 
-| Message ID | Severity | Description |
-|------------|----------|-------------|
-| `OemSecurityEvent.1.0.HttpsTlsVersionViolation` | Critical | TLS version < 1.2 detected |
-| `OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected` | Warning | Attack signature in HTTP payload |
-| `OemSecurityEvent.1.0.HttpsTrafficObserved` | OK | Normal HTTPS traffic observed |
+All nine, and which detection rule emits each. "Enforces" means the verdict is
+`actionable`, which triggers the blocklist and — where a full 4-tuple is known —
+a TCP teardown. See [Which rules enforce, and why that matters](#which-rules-enforce-and-why-that-matters).
+
+| Message ID (`OemSecurityEvent.1.0.` +) | Severity | Emitted by | Fed by | Enforces |
+|---|---|---|---|---|
+| `HttpsTlsVersionViolation` | Critical | `TlsVersionDetector` | uprobe + XDP | **yes** |
+| `HttpsPayloadAnomalyDetected` | Warning | `PayloadAnomalyDetector` | uprobe + XDP | **yes** |
+| `HttpsConnectionRateViolation` | Warning | `ConnRateDetector` | XDP counters | **yes** |
+| `HttpsSlowlorisDetected` | Warning | `SlowlorisDetector` | XDP counters | **yes** |
+| `HttpsTlsRenegotiationStorm` | Warning | `RenegotiationDetector` | XDP counters | **yes** |
+| `HttpsWeakCipherSuiteDetected` | Warning | `CipherSuiteDetector` | XDP | no — alert only |
+| `HttpsSniAnomalyDetected` | Warning | `SniDetector` | XDP | no — alert only |
+| `HttpsCertificateAccessViolation` | Critical | `CertAccessDetector` | BPF-LSM | no |
+| `HttpsTrafficObserved` | OK | none — inline fallback when no rule matches | any | no |
 
 ### Subscribe to Events via Redfish
 
@@ -526,6 +541,307 @@ busctl call xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry \
   xyz.openbmc_project.Logging.Entry Create \
   'says' '{"Severity": "xyz.openbmc_project.Logging.Entry.Critical", "Message": "Test event"}'
 ```
+
+## Exercising the Detections
+
+Nine event types, and how to make each one fire. Every recipe below was run
+against a real QEMU boot; where one could **not** be driven to completion, that
+is stated rather than left implied.
+
+Two things to get right before any of this works:
+
+1. **XDP-fed rules need traffic from outside the guest.** A packet the BMC
+   sends to its own `127.0.0.1` never traverses XDP. Run those cases from the
+   host, against the forwarded port.
+2. **The uprobe-fed rules are the opposite** — they fire on *any* process on
+   the box calling `SSL_write`/`SSL_read`, so `openssl s_client` to
+   `127.0.0.1:443` from inside the guest works fine.
+
+> ### Enforcing a rule against yourself will lock you out
+>
+> The blocklist is keyed on **source address across every port**, not just
+> 443. If you trigger an enforcing rule from the machine you are administering
+> the BMC from, you lose SSH and Redfish for the full blocklist TTL (300s by
+> default). This is not hypothetical — it is what happens, every time, and it
+> is measured below. Trigger enforcing rules from a *third* host, or accept the
+> outage.
+
+### Quick reference
+
+| Rule → Message ID | How to trigger it | Enforces | Verified live? |
+|---|---|---|---|
+| `HttpsPayloadAnomalyDetected` | Send an attack signature through TLS (§ [Payload anomaly](#payload-anomaly)) | **yes** | ✅ yes |
+| `HttpsTlsVersionViolation` | Crafted ClientHello with `legacy_version` < 0x0303 (§ [Legacy TLS](#legacy-tls-version)) | **yes** | ✅ yes, XDP path |
+| `HttpsWeakCipherSuiteDetected` | Crafted ClientHello offering RC4/3DES/NULL (§ [Weak cipher suite](#weak-cipher-suite)) | no | ✅ yes |
+| `HttpsSniAnomalyDetected` | Malformed SNI, or a mismatch against `HTTPS_GUARD_EXPECTED_SNI` (§ [SNI anomaly](#sni-anomaly)) | no | ✅ yes, both paths |
+| `HttpsTrafficObserved` | Any clean HTTPS request — the no-rule-matched fallback | no | ✅ yes |
+| `HttpsConnectionRateViolation` | More than `HTTPS_GUARD_RATE_THRESHOLD` connections per 10s (§ [Volumetric](#volumetric-rate-slowloris-renegotiation)) | **yes** | ⚠ mechanism only |
+| `HttpsSlowlorisDetected` | Hold more than `HTTPS_GUARD_SLOWLORIS_THRESHOLD` connections open | **yes** | ⚠ lowered threshold |
+| `HttpsTlsRenegotiationStorm` | More than `HTTPS_GUARD_RENEG_THRESHOLD` handshakes per 10s | **yes** | ❌ no |
+| `HttpsCertificateAccessViolation` | Read the HTTPS private key as any process other than `bmcweb` | no | ❌ cannot attach on ARM32 |
+
+`⚠` and `❌` are explained under [Verification status](#verification-status) —
+they are limits of the test environment and the platform, not of the rules.
+
+### The trigger helper
+
+`scripts/trigger/send_client_hello.py` builds TLS ClientHellos by hand,
+because the three ClientHello-fed rules **cannot be driven with a normal
+client**: OpenSSL 3.x refuses to offer RC4 or TLS 1.0 at all, and
+`curl --tlsv1.0` is silently ignored. It sends one record and closes, which is
+all XDP needs — no handshake ever completes.
+
+```bash
+# From the HOST, not the guest.
+scripts/trigger/send_client_hello.py --list
+
+# SLIRP: use the forwarded HTTPS port that runqemu printed (often 4433/4434)
+scripts/trigger/send_client_hello.py weak_rc4 --port 4434
+
+# Bridge mode: go straight at the guest
+scripts/trigger/send_client_hello.py weak_rc4 --host 192.168.100.2 --port 443
+```
+
+Wait for the daemon to finish attaching before sending anything — startup takes
+~16s on QEMU, and a case sent before `enforcement active via N of M hook(s)`
+appears in the journal is simply lost:
+
+```bash
+journalctl -u https-guard-daemon -f | grep -m1 "enforcement active"
+```
+
+### Payload anomaly
+
+`PayloadAnomalyDetector` matches eight case-insensitive substrings in the
+plaintext passing through `SSL_write`/`SSL_read`: `../..`, `union select`,
+`or 1=1`, `drop table`, `/etc/passwd`, `%2e%2e%2f`, `cmd.exe`, `wget http`.
+
+Run inside the guest. The `sleep` matters: enforcement tears down a *live*
+socket, so a request that has already closed gives nothing to act on.
+
+```bash
+(printf 'GET /etc/passwd HTTP/1.1\r\nHost: localhost\r\n\r\n'; sleep 30) \
+  | openssl s_client -connect 127.0.0.1:443 -quiet -ign_eof
+```
+
+```
+https_guard: uprobe event received: process='openssl' (PID 521), direction=write, tls_version=772
+BlocklistAddAction: blocklisted 127.0.0.1 for 300s reason=Attack signature ... rule '/etc/passwd'
+BlockTcpAction: destroyed TCP connection 127.0.0.1:42570 -> 127.0.0.1:443
+```
+
+`openssl` exits **103** (connection aborted) — that is the client observing its
+own teardown, and is the real confirmation. A "SOCK_DESTROY succeeded" log line
+alone would not be.
+
+**Signatures past the first 127 bytes are not seen.** The BPF side copies at
+most 127 bytes per call, so put the signature in the request path or an early
+header, not a late one.
+
+Expect a *second* event from the same request: the `SSL_read` uprobe sees
+bmcweb receiving the same bytes. That one usually declines to enforce
+("no connection could be attributed") — see
+[Attribution](LIMITATIONS.md#attribution-and-enforcement).
+
+### Legacy TLS version
+
+**Enforcing.** This will blocklist the sender.
+
+```bash
+scripts/trigger/send_client_hello.py legacy_tls10 --port 4434
+```
+
+```
+xdp event received: tls_version=769, is_violation=1, cipher_suites=1/1, sni='bmc.example.com'
+pushing LogAction for severity=Critical
+BlocklistAddAction: blocklisted 10.0.2.2 for 300s reason=... insecure TLS version (TLS 1.0)
+BlockTcpAction: destroyed TCP connection 10.0.2.15:443 -> 10.0.2.2:59690
+```
+
+Measured: SSH from that host died **immediately** and came back after **271s**
+of a 300s TTL. Nothing needs doing to recover — wait it out.
+
+The **uprobe** path for this rule cannot be driven on this image at all: it
+reads the *negotiated* version out of the `SSL` object, and OpenSSL 3.x will
+not negotiate below TLS 1.2. Only the XDP path is reachable.
+
+`legacy_version` is also **not** proof of the negotiated version — a TLS 1.3
+client sets it to 0x0303 and signals the real version in an extension this hook
+does not parse. It catches genuinely old clients, which have no such fallback.
+
+### Weak cipher suite
+
+Alert-only, so this is safe to run against your own host.
+
+```bash
+scripts/trigger/send_client_hello.py weak_rc4  --port 4434   # RC4 among modern suites
+scripts/trigger/send_client_hello.py weak_3des --port 4434   # 3DES
+scripts/trigger/send_client_hello.py weak_null --port 4434   # NULL encryption
+scripts/trigger/send_client_hello.py clean     --port 4434   # control: expect HttpsTrafficObserved
+```
+
+The table covers NULL encryption, EXPORT-grade, RC4, single-DES, 3DES and
+anonymous key exchange (22 code points, see
+`detections/cipher_suite/weak_cipher_suites.hpp`). Capture is capped at 32
+suites; the true offered count is reported separately (`cipher_suites=3/3`) so a
+short list is distinguishable from a clipped one.
+
+### SNI anomaly
+
+Alert-only. Two independent paths, and **both are verified**.
+
+Malformed SNI fires unconditionally — no configuration needed:
+
+```bash
+scripts/trigger/send_client_hello.py bad_sni       --port 4434   # unknown name_type
+scripts/trigger/send_client_hello.py truncated_sni --port 4434   # declared length > record
+```
+
+Hostname mismatch fires **only** when an expected name is configured:
+
+```bash
+# on the BMC
+sed -i 's/^HTTPS_GUARD_EXPECTED_SNI=$/HTTPS_GUARD_EXPECTED_SNI=bmc.example.com/' \
+  /etc/default/https-guard
+systemctl restart https-guard-daemon
+# confirm it took: journalctl should say "expected SNI: bmc.example.com",
+# not "(unset — mismatch checking disabled)"
+```
+
+```bash
+scripts/trigger/send_client_hello.py other_sni --port 4434
+```
+
+```
+Warning | HttpsSniAnomalyDetected | SNI anomaly from 10.0.2.2: SNI hostname
+'attacker.example.net' does not match the expected 'bmc.example.com'.
+```
+
+A truncated hostname is flagged malformed rather than compared, so a clipped
+name can never masquerade as a mismatch — or as a match.
+
+### Volumetric: rate, Slowloris, renegotiation
+
+**All three enforce.** All three read per-source counters that the XDP program
+maintains, swept every 2s; none has a ring-buffer event of its own. The window
+is fixed at **10s** at build time — only the thresholds are configurable:
+
+```bash
+HTTPS_GUARD_RATE_THRESHOLD=500       # SYNs per 10s per source     (0 = rule off)
+HTTPS_GUARD_SLOWLORIS_THRESHOLD=100  # connections held open       (0 = rule off)
+HTTPS_GUARD_RENEG_THRESHOLD=200      # ClientHellos per 10s        (0 = rule off)
+```
+
+Lower the relevant threshold in `/etc/default/https-guard` and restart, or you
+will not reach it through QEMU (see below).
+
+```bash
+# connection rate — completed connections, not a SYN burst
+python3 - <<'EOF'
+import socket, time
+for _ in range(150):
+    try:
+        socket.create_connection(("127.0.0.1", 4434), timeout=2).close()
+    except OSError:
+        pass
+    time.sleep(0.02)
+EOF
+```
+
+That produced `per-source counters: 1 source(s); busiest 151 attempts` — 150
+connections plus the SSH session, which is a useful sanity check that the
+counter is keyed the way you think it is.
+
+For Slowloris, hold connections open instead of closing them. For a
+renegotiation storm, send repeated ClientHellos on new connections
+(`send_client_hello.py clean` in a loop).
+
+**Reading the counter line is harder than it should be.** It goes to
+`std::cout`, which journald makes block-buffered, so it arrives in ~4KB batches
+minutes late. `systemctl restart https-guard-daemon` flushes it. Every other
+diagnostic uses `std::cerr` and appears immediately — so the *absence* of a
+recent counters line means nothing. Recorded in
+[LIMITATIONS.md](LIMITATIONS.md#observability).
+
+Note `process=` is meaningless for XDP-sourced events (`swapper/0`,
+`systemd-journal`, whatever was on-CPU when the packet arrived) — XDP runs in
+interrupt context with no owning process. Only uprobe events carry a real PID.
+
+### Certificate access
+
+`CertAccessDetector` fires when any process whose `/proc/<pid>/exe` is not
+`/usr/bin/bmcweb` opens `/etc/ssl/certs/https/server.pem`:
+
+```bash
+cat /etc/ssl/certs/https/server.pem > /dev/null
+```
+
+**This cannot fire on the AST2600 target.** `BPF_PROG_TYPE_LSM` attach needs a
+BPF trampoline, which ARM32 has never implemented, so the hook does not attach
+at all — the journal says so plainly:
+
+```
+libbpf: prog 'https_guard_cert_open': failed to attach: -ENOTSUPP
+https_guard: failed to attach LSM cert-access-guard (non-fatal): Unknown error 524
+https_guard: enforcement active via 2 of 3 hook(s)
+```
+
+`2 of 3` is the expected healthy state on this platform, not a fault. Full
+reasoning in [LIMITATIONS.md](LIMITATIONS.md#platform-the-certificate-guard-cannot-enforce-on-arm32).
+
+### Which rules enforce, and why that matters
+
+The distinction is deliberate, and getting it wrong has already caused an
+outage during development:
+
+- **`cipher_suite` and `sni` alert only.** They fire on a handshake bmcweb
+  refuses anyway, so the offer itself does no damage. They were briefly made
+  actionable and immediately locked an operator out of SSH; that incident is
+  why they are not.
+- **`conn_rate`, `slowloris` and `renegotiation` enforce**, because they
+  describe *ongoing harm* — slots being occupied, asymmetric load being
+  generated — and an alert that does not stop it is close to useless. That makes
+  their thresholds safety-critical rather than tuning details.
+- **`cert_access` does not enforce** because there is no connection to act on.
+
+### Verification status
+
+What has actually been driven end-to-end on hardware, versus what only unit
+tests cover. The weaker claim is recorded as the weaker claim.
+
+| | Status |
+|---|---|
+| `PayloadAnomalyDetector` | ✅ verified live, both enforcement halves |
+| `TlsVersionDetector` | ✅ verified live via XDP. The uprobe path is unreachable on this image — OpenSSL 3.x will not negotiate below TLS 1.2 |
+| `CipherSuiteDetector` | ✅ verified live |
+| `SniDetector` | ✅ verified live — malformed *and* hostname-mismatch |
+| `SlowlorisDetector` | ⚠ verified live at a **lowered** threshold (5 connections against a limit of 3). Not at the shipped default of 100 |
+| `ConnRateDetector` | ⚠ mechanism verified; the shipped default of 500/10s was never exceeded, because SLIRP will not propagate a fast enough burst (~456 in 6s was the ceiling) |
+| `RenegotiationDetector` | ❌ never confirmed end to end. Driving handshakes needs connections held open, and that saturates the same SLIRP forward. Unit-tested, and its counter increments from the live-verified ClientHello path |
+| `CertAccessDetector` | ❌ unreachable on ARM32 — see above |
+
+### Test-environment caveats
+
+Every one of these cost real debugging time before being understood.
+
+- **QEMU SLIRP terminates and re-originates TCP.** A rapid connect/close burst
+  from the host does not arrive at the guest as SYNs. Use *completed*
+  connections when exercising anything that counts them.
+- **Holding as few as five connections through a SLIRP hostfwd saturates the
+  forward and kills SSH on it.** So "SSH dropped" is *not* evidence that a
+  source was blocklisted — the two are indistinguishable from outside. Read the
+  journal, not the symptom. This was initially misdiagnosed the other way round.
+- **Guest-originated loopback traffic never traverses XDP.** Wire-level cases
+  must originate outside the guest.
+- **Check which QEMU you are talking to.** A stale instance from an earlier
+  session keeps its port, so `runqemu` silently bumps the new one (2222 → 2223,
+  4433 → 4434) and SSH on 2222 answers from a hours-old image. Confirm the image
+  timestamp in the `runqemu` command line, not just that SSH responds. This
+  produced a confident and entirely wrong reading of a fresh build once.
+- **The target image has no `bpftool`, and its BusyBox `ip` cannot detach XDP.**
+  A leaked XDP attachment used to need a reboot; attachments are now
+  `bpf_link`-owned and released by the kernel on process exit, including on
+  `SIGKILL`.
 
 ## Platform Support
 

@@ -74,7 +74,7 @@ TCP payload, first bytes:
 is_violation = (tls_ver < 0x0303) ? 1 : 0;
 ```
 
-This line-rate decision is why `xdp_event` carries an `is_violation` field when `uprobe_event` doesn't — it's surfaced to userspace as `hg_event.tls_violation_hint` (see `detections/CLAUDE.md` for why that field exists and the bug it prevents). Everything else — message text, severity naming, whether to blocklist — is still decided entirely in userspace by `TlsVersionDetector`, same as the uprobe path.
+This line-rate decision is why `xdp_event` carries an `is_violation` field when `uprobe_event` doesn't — it's surfaced to userspace as `ITlsTrafficInfo::tlsViolationHint()` (see `detections/CLAUDE.md` for why that capability method exists and the bug it prevents). Everything else — message text, severity naming, whether to blocklist — is still decided entirely in userspace by `TlsVersionDetector`, same as the uprobe path.
 
 ## How to defend (enforcement)
 
@@ -94,7 +94,7 @@ ClientHello arrives, tls_ver < 0x0303
                           │  (asynchronously, milliseconds later)
                           ▼
        Userspace: XdpTlsProgram::parseEvent() → hg_event
-       (tls_violation_hint = true, local/remote addresses and ports already
+       (tlsViolationHint() = true, local/remote addresses and ports already
         known — XDP sees the packet headers directly, unlike the
         uprobe path which needs ProcPeerResolver)
                           │
