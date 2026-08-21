@@ -30,6 +30,7 @@
  * header so the same code that runs here can be unit-tested host-side —
  * see parse_client_hello.h's own header comment. */
 #include "parse_client_hello.h"
+#include "conn_rate.bpf.h"
 
 /* Hybrid enforcement: see actions/blocklist/blocklist.bpf.h.  The
  * early-return XDP_DROP check lives entirely in this header so the
@@ -167,6 +168,21 @@ int https_guard_xdp(struct xdp_md *ctx)
     if (tcp_hdr_len < sizeof(*tcp))
         return XDP_PASS;
 
+    /* Record connection attempts before the port filter below. A port scan
+     * targets ports other than 443 by definition, so counting after that
+     * filter would make the thing we want to detect invisible.
+     *
+     * SYN without ACK is the connection-attempt signal: it counts each new
+     * attempt once, rather than every packet of an established session, so a
+     * single busy download cannot look like a flood. */
+    if (tcp->syn && !tcp->ack) {
+        conn_rate_record(ip->saddr, HG_CONN_ATTEMPT);
+    } else if (tcp->fin || tcp->rst) {
+        /* Pairs with the SYN above to maintain the held-open level that
+         * Slowloris detection reads. */
+        conn_rate_record(ip->saddr, HG_CONN_CLOSED);
+    }
+
     /* Only care about port 443 (HTTPS) */
     if (bpf_ntohs(tcp->dest) != 443 && bpf_ntohs(tcp->source) != 443) {
         bpf_printk("xdp: skip - not port 443 (src=%d dst=%d)\n",
@@ -195,6 +211,12 @@ int https_guard_xdp(struct xdp_md *ctx)
 
     /* Check for TLS ClientHello: ContentType = 0x16 */
     if (tcp_payload[0] == 0x16) {
+        /* Counted per source per window, for renegotiation-storm detection.
+         * Recorded for any handshake record, not only a ClientHello: a
+         * renegotiation storm is characterised by repeated handshakes, and
+         * distinguishing message types here would cost a parse before the
+         * bounds checks below have been made. */
+        conn_rate_record(ip->saddr, HG_CONN_HELLO);
         struct xdp_event *evt;
 
         evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);

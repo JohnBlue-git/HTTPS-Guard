@@ -5,6 +5,7 @@
 
 #include "parse_uprobe_event.hpp"
 #include "uprobe_hg_event.hpp"
+#include "xdp_hg_event.hpp"
 
 using namespace https_guard;
 
@@ -206,4 +207,19 @@ TEST_CASE("an event with no resolver reports unresolved rather than crashing")
     UprobeEvent evt;
     CHECK(evt.peer_resolver == nullptr);
     CHECK(evt.ensurePeerResolved() == false);
+}
+
+TEST_CASE("an event that already knows its address needs no resolver to be enforceable")
+{
+    // Pins the regression that silently disabled enforcement for XDP and
+    // connection-rate events: both fill remote_ip_v4 directly and carry no
+    // resolver, so gating enforcement on ensurePeerResolved() returning true
+    // skipped them entirely.
+    XdpEvent evt;
+    evt.remote_ip_v4 = 0x0100000A;   // came from the packet headers
+    evt.local_ip_v4  = 0x0F00000A;
+
+    CHECK(evt.peer_resolver == nullptr);
+    CHECK(evt.ensurePeerResolved() == false);   // nothing to resolve...
+    CHECK(evt.remote_ip_v4 != 0);               // ...but the address is there
 }

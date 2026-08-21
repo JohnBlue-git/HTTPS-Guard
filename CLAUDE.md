@@ -4,7 +4,7 @@ An eBPF-based network security tool for OpenBMC. It hooks into bmcweb's TLS traf
 
 **Pipeline: Detect → Classify → Dispatch.** The source tree under `recipes-https-guard/https-guard/files/` is organized around exactly those three stages — `programs/` attaches BPF hooks and parses raw events, `detections/` decides whether a parsed event is a violation, `actions/` carries out the response. Each has its own `CLAUDE.md`; start there before editing anything inside.
 
-Full architecture, event struct layouts, and the security-model rationale: [DESIGN.md](DESIGN.md). Build/QEMU/deployment instructions: [README.md](README.md). Per-hook detection rationale with diagrams: `programs/ssl_uprobe/DESIGN.md`, `programs/xdp_tls/DESIGN.md`, and `programs/lsm_cert_guard/DESIGN.md`.
+Known gaps, unverified claims and testing caveats: [LIMITATIONS.md](LIMITATIONS.md) — worth reading before trusting any detection or enforcement claim. Full architecture, event struct layouts, and the security-model rationale: [DESIGN.md](DESIGN.md). Build/QEMU/deployment instructions: [README.md](README.md). Per-hook detection rationale with diagrams: `programs/ssl_uprobe/DESIGN.md`, `programs/xdp_tls/DESIGN.md`, and `programs/lsm_cert_guard/DESIGN.md`.
 
 **Working here:**
 - BPF-side code (`.bpf.c`/`.bpf.h`) is observational only for `ssl_uprobe`/`xdp_tls` — they capture raw fields and a line-rate hint at most (`xdp_tls`'s `is_violation`); all classification lives behind `IDetector` in `detections/`. `lsm_cert_guard` is the one exception with a real (if currently unreachable — see its `DESIGN.md`) in-kernel deny branch, since a file-open decision has no equivalent to "classify asynchronously, act on future traffic" the way network events do.

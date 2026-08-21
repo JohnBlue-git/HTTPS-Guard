@@ -25,8 +25,8 @@ bmcweb serves the entire Redfish management API — sensor readings, power contr
 │      → hook fires identically — the uprobe doesn't know     │
 │        or care which process it is (comm is self-reported   │
 │        and spoofable; nothing here verifies identity —      │
-│        that's the whole point of the planned BPF-LSM        │
-│        cert-access guard, a *much* stronger mechanism)      │
+│        that's what programs/lsm_cert_guard/ addresses —     │
+│        though only as an alert on ARM32; see its DESIGN.md)  │
 └─────────────────────────────────────────────────────────────┘
 ```
 

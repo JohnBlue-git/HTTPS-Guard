@@ -40,5 +40,8 @@ typedef unsigned long long uint64_t;
 enum hg_event_source {
     HG_SOURCE_UPROBE         = 1,
     HG_SOURCE_XDP             = 2,
-    HG_SOURCE_LSM_CERT_GUARD  = 3
+    HG_SOURCE_LSM_CERT_GUARD  = 3,
+    /* Synthesised in userspace by ConnRateSweeper from the BPF counter map,
+     * not parsed from a ring-buffer record -- no hook module claims it. */
+    HG_SOURCE_CONN_RATE       = 4
 };

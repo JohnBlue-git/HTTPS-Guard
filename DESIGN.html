@@ -306,13 +306,13 @@
 
             <rect class="dg-box dg-box-kernel" x="50" y="56" width="230" height="76" rx="10"/>
             <text class="dg-title" x="165" y="80" text-anchor="middle">Uprobe</text>
-            <text class="dg-label" x="165" y="99" text-anchor="middle">SSL_write()</text>
-            <text class="dg-sub" x="165" y="116" text-anchor="middle">reads ssl&rarr;version + payload</text>
+            <text class="dg-label" x="165" y="99" text-anchor="middle">SSL_write() &middot; SSL_read()</text>
+            <text class="dg-sub" x="165" y="116" text-anchor="middle">ssl&rarr;version + plaintext, both ways</text>
 
             <rect class="dg-box dg-box-kernel" x="50" y="152" width="230" height="76" rx="10"/>
             <text class="dg-title" x="165" y="176" text-anchor="middle">XDP</text>
             <text class="dg-label" x="165" y="195" text-anchor="middle">blocklist_check() &middot; ClientHello</text>
-            <text class="dg-sub" x="165" y="212" text-anchor="middle">sets is_violation flag</text>
+            <text class="dg-sub" x="165" y="212" text-anchor="middle">is_violation + per-source counters</text>
 
             <line class="dg-edge dg-edge-kernel" x1="165" y1="228" x2="165" y2="248" marker-end="url(#arrowKernel)"/>
             <rect class="dg-pill dg-pill-neutral" x="50" y="248" width="230" height="34" rx="17"/>
@@ -343,7 +343,7 @@
 
             <path class="dg-edge dg-edge-user" d="M260,391 L290,391" marker-end="url(#arrowUser)"/>
             <rect class="dg-box dg-box-user" x="290" y="356" width="220" height="70" rx="10"/>
-            <text class="dg-title" x="400" y="384" text-anchor="middle">Pattern Detector</text>
+            <text class="dg-title" x="400" y="384" text-anchor="middle">Detector rules</text>
             <text class="dg-sub" x="400" y="402" text-anchor="middle">payload anomaly rules</text>
             <text class="dg-sub" x="400" y="416" text-anchor="middle">SQLi &middot; path traversal</text>
 
@@ -386,7 +386,7 @@
             <text class="dg-edge-label" x="822" y="345" transform="rotate(-90 822 345)" text-anchor="middle">feeds Tier 1 blocklist map</text>
           </svg>
         </div>
-        <figcaption>Fig. 1 &mdash; The full event pipeline. The dashed line on the right is the feedback loop: a threat the daemon confirms asynchronously gets written into the same map XDP checks synchronously, so the <em>next</em> packet from that source is dropped in the kernel.</figcaption>
+        <figcaption>Fig. 1 &mdash; The full event pipeline. The dashed line on the right is the feedback loop: a threat the daemon confirms asynchronously gets written into the same map XDP checks synchronously, so the <em>next</em> packet from that source is dropped in the kernel. <br><br>Two things the diagram simplifies. A third hook, <code>lsm_cert_guard</code>, watches access to the HTTPS private key via BPF-LSM; it is omitted here because it <em>cannot attach at all</em> on this project's ARM32 target, so it contributes alerts rather than a live path &mdash; see <a href="LIMITATIONS.md">LIMITATIONS.md</a>. And classification no longer happens in the ring-buffer callback: that callback copies the record and returns, while a <code>DetectLoop</code> &mdash; a Boost.Asio <code>io_context</code>, built the same way <code>ActionLoop</code> is &mdash; does the parsing, classification and dispatch, because a slow callback lets the ring buffer fill and a full ring buffer silently drops events.</figcaption>
       </figure>
     </section>
 
@@ -409,30 +409,48 @@
           </tbody>
         </table>
       </div>
-      <p class="prose">Classification happens entirely in <code>https_guard_program.cpp</code>, after the discriminator is read:</p>
+      <p class="prose">Classification runs on <code>DetectLoop</code>'s Boost.Asio loop, not in the ring-buffer callback &mdash; that callback only copies the record and posts it, because a slow callback lets the ring buffer fill and a full ring buffer silently drops events. Each rule is a pure function of one event:</p>
       <div class="panel">
-        <span class="panel-label">https_guard_program.cpp &mdash; simplified</span>
-        <pre>if (tls_version &lt; 0x0303) {                 // TLS &lt; 1.2
-    event_type = TLS_VERSION_VIOLATION;      // Critical, actionable
-} else if (pattern_detector.suspicious(payload)) {
-    event_type = HTTP_ANOMALY_DETECTED;      // Warning
-} else {
-    event_type = HTTP_PAYLOAD_OBSERVED;      // Informational
-}</pre>
+        <span class="panel-label">detections/core/DetectLoop.cpp &mdash; simplified</span>
+        <pre>// Rules for this event source, in order; first match wins.
+for (const auto&amp; rule : detectors_[source]) {
+    if (auto v = rule-&gt;evaluate(evt)) { verdict = *v; break; }
+}
+// No match: an inline "OK / traffic observed" verdict.
+
+if (verdict.actionable) {
+    evt.ensurePeerResolved();          // the /proc walk, only here
+    if (evt.remote_ip_v4 != 0) {
+        if (have_full_tuple) push(BlockTcpAction{...});
+        push(BlocklistAddAction{evt.remote_ip_v4, ttl});
+    }
+}
+push(LogAction{...});                  // always</pre>
       </div>
       <div class="prose">
-        <p>An <code>uprobe_event</code> carries no socket info, so an actionable classification triggers <code>ProcPeerResolver::getTcpSockets(pid)</code> first &mdash; it parses <code>/proc/&lt;pid&gt;/net/tcp</code> to recover the 4-tuple before <code>BlockTcpAction</code> can call <code>SOCK_DESTROY</code>. An <code>xdp_event</code> already has the 4-tuple, so it skips that step entirely.</p>
+        <p>Two properties of that loop are easy to lose in a rewrite and worth stating. Admission is bounded by an explicit in-flight count, because <code>post()</code> is an unbounded queue and on a ~1GB BMC an OOM &mdash; which takes <em>all</em> detection with it &mdash; is a far worse outcome than one dropped event; the policy is drop-the-newest, so what remains is a coherent prefix of history rather than a hole in the middle. And the loop runs two threads with the connection-rate sweep timer deliberately <em>off</em> the record strand: a single-threaded loop starves that timer by FIFO fairness alone, since it queues behind every record already posted. Measured against a deliberate backlog, one thread produced zero sweeps in nine seconds where two produced one every two.</p>
+        <p>A rule reaches hook-specific data through a <em>capability interface</em> rather than off a shared struct, so a certificate-access event is not obliged to carry a TLS version or a cipher-suite list. An event that cannot supply a capability is declined rather than misread.</p>
+        <p>A <code>uprobe_event</code> carries no socket info, so the 4-tuple is recovered from <code>/proc</code> &mdash; but lazily, only once a verdict is actionable, since that walk is the most expensive step in the pipeline and most events never reach it. It also fails closed: a process owning several established connections cannot be attributed to one, and enforcement declines rather than guessing. An <code>xdp_event</code> already has the tuple from the packet headers.</p>
       </div>
       <div class="table-wrap">
         <table>
-          <caption>Redfish event severities emitted downstream</caption>
-          <thead><tr><th>Message ID</th><th>Severity</th><th>Trigger</th></tr></thead>
+          <caption>Redfish events emitted downstream, and which ones enforce</caption>
+          <thead><tr><th>Message ID</th><th>Severity</th><th>Trigger</th><th>Enforces?</th></tr></thead>
           <tbody>
-            <tr><td class="mono">HttpsTlsVersionViolation</td><td><span class="pill-tag crit">Critical</span></td><td>TLS &lt; 1.2 negotiated</td></tr>
-            <tr><td class="mono">HttpsPayloadAnomalyDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Attack signature in HTTP payload</td></tr>
-            <tr><td class="mono">HttpsTrafficObserved</td><td><span class="pill-tag ok">OK</span></td><td>Normal traffic, logged for visibility</td></tr>
+            <tr><td class="mono">HttpsTlsVersionViolation</td><td><span class="pill-tag crit">Critical</span></td><td>TLS &lt; 1.2 offered or negotiated</td><td>yes</td></tr>
+            <tr><td class="mono">HttpsPayloadAnomalyDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Attack signature in plaintext</td><td>yes</td></tr>
+            <tr><td class="mono">HttpsWeakCipherSuiteDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Weak suite offered in a ClientHello</td><td>no &mdash; alert only</td></tr>
+            <tr><td class="mono">HttpsSniAnomalyDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Malformed SNI, or a configured mismatch</td><td>no &mdash; alert only</td></tr>
+            <tr><td class="mono">HttpsCertificateAccessViolation</td><td><span class="pill-tag crit">Critical</span></td><td>Unrecognised process opened the HTTPS key</td><td>no</td></tr>
+            <tr><td class="mono">HttpsConnectionRateViolation</td><td><span class="pill-tag warn">Warning</span></td><td>Connection attempts per source over the window</td><td>yes</td></tr>
+            <tr><td class="mono">HttpsSlowlorisDetected</td><td><span class="pill-tag warn">Warning</span></td><td>Too many connections held open by one source</td><td>yes</td></tr>
+            <tr><td class="mono">HttpsTlsRenegotiationStorm</td><td><span class="pill-tag warn">Warning</span></td><td>Handshake records per source over the window</td><td>yes</td></tr>
+            <tr><td class="mono">HttpsTrafficObserved</td><td><span class="pill-tag ok">OK</span></td><td>Normal traffic, logged for visibility</td><td>n/a</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="prose">
+        <p><strong>Why some rules enforce and others only alert.</strong> The blocklist applies to a source address on <em>every</em> port, so an actionable false positive removes all access to the BMC for the blocklist TTL. Cipher-suite and SNI findings describe an offer bmcweb refuses anyway, so alerting is proportionate &mdash; making them actionable locked an operator out of SSH during testing. The three per-source counting rules describe ongoing harm, so they enforce, which makes their thresholds safety-critical rather than tuning details.</p>
       </div>
     </section>
 
@@ -603,10 +621,19 @@
 ├── conf/machine/johnblue.conf        # QEMU AST2600 machine definition
 ├── recipes-https-guard/https-guard/
 │   ├── https-guard-openbmc.bb        # BitBake recipe (PACKAGECONFIG, install)
-│   └── files/
-│       ├── https_guard/              # eBPF programs (.bpf.c) + C++ daemon
-│       ├── actions/                  # LogAction, BlockTcpAction, BlocklistAddAction
-│       └── ebpf/                     # BPF load/attach RAII wrapper
+│   └── files/                        # Detect -> Classify -> Dispatch
+│       ├── programs/                 # Detect: one dir per hook
+│       │   ├── core/                 #   BPF wrapper, aggregator, composition root
+│       │   ├── ssl_uprobe/           #   ebpf/ + src/  (SSL_write and SSL_read)
+│       │   ├── xdp_tls/              #   ebpf/ + src/  (ClientHello, blocklist, counters)
+│       │   └── lsm_cert_guard/       #   ebpf/ + src/  (HTTPS key access)
+│       ├── detections/               # Classify: every rule, plus the engine
+│       │   ├── core/                 #   hg_event, Verdict, capabilities, DetectLoop
+│       │   └── &lt;rule&gt;/               #   tls_version, payload_anomaly, cipher_suite,
+│       │                             #   sni, cert_access, conn_rate, slowloris,
+│       │                             #   renegotiation
+│       ├── actions/                  # Dispatch: LogAction, BlockTcpAction, BlocklistAddAction
+│       └── tests/                    # doctest; no kernel, root or QEMU needed
 ├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
 ├── recipes-bmcweb/bmcweb/            # OemSecurityEvent Redfish message registry
 ├── scripts/qemu-setup-tap.sh         # Host bridge/TAP setup for XDP testing
@@ -617,10 +644,11 @@
           <caption>Component roles</caption>
           <thead><tr><th>Component</th><th>Path</th><th>Role</th></tr></thead>
           <tbody>
-            <tr><td>eBPF programs</td><td class="mono">https_guard.bpf.c</td><td>Uprobe captures TLS version + payload; XDP inspects ClientHello and enforces the blocklist</td></tr>
-            <tr><td>C++ daemon</td><td class="mono">https_guard/</td><td>Loads the BPF object, polls the ring buffer, classifies events, resolves PID&rarr;socket</td></tr>
+            <tr><td>eBPF programs</td><td class="mono">programs/&lt;hook&gt;/ebpf/</td><td>Uprobes capture TLS version + plaintext both directions; XDP inspects ClientHellos, enforces the blocklist and maintains per-source counters; BPF-LSM watches the HTTPS key</td></tr>
+            <tr><td>Hook modules</td><td class="mono">programs/&lt;hook&gt;/src/</td><td>Attach the BPF programs and parse their raw records into events. No classification here</td></tr>
+            <tr><td>Rules + engine</td><td class="mono">detections/</td><td>Eight pure <code>IDetector</code> rules, the capability interfaces they bind to, and <code>DetectLoop</code> &mdash; the Boost.Asio loop owning parse &rarr; classify &rarr; dispatch</td></tr>
             <tr><td>Enforcement actions</td><td class="mono">actions/</td><td>Three async countermeasures dispatched by <code>ActionLoop</code></td></tr>
-            <tr><td>BPF wrapper</td><td class="mono">ebpf/</td><td>RAII wrapper for program load / attach / detach</td></tr>
+            <tr><td>BPF wrapper</td><td class="mono">programs/core/BpfProgram</td><td>RAII wrapper for program load / attach / detach</td></tr>
             <tr><td>Event bridge</td><td class="mono">https-guard-event-bridge.sh</td><td>Tails the event log, forwards to D-Bus and/or the Redfish filesystem log</td></tr>
           </tbody>
         </table>

@@ -4,6 +4,7 @@
 
 #include "HttpGuardProgram.hpp"
 #include "blocklist/Blocklist.hpp"
+#include "conn_rate.bpf.h"
 
 namespace https_guard {
 
@@ -53,6 +54,14 @@ bool HttpGuardProgram::attachProgram() noexcept
     return true;
 }
 
+void HttpGuardProgram::enableRateSweeps(ConnRateSweeper::Thresholds thresholds) noexcept
+{
+    /* getMapFd returns < 0 if the map isn't present -- which is the case when
+     * the BPF object was built without the rate counter. ConnRateSweeper
+     * treats that, and a zero threshold, as "disabled". */
+    detect_loop_.enableRateSweeps(getMapFd(HTTPS_GUARD_CONN_RATE_MAP_NAME), thresholds);
+}
+
 ring_buffer_sample_fn HttpGuardProgram::getRingBufferHandler() noexcept
 {
     return &HttpGuardProgram::ringBufferCallback;
@@ -63,7 +72,7 @@ int HttpGuardProgram::ringBufferHandler(void* data, size_t size) noexcept
     /* Deliberately the whole body. The sample pointer is only valid for the
      * duration of this callback, so submit() copies the bytes; everything
      * else -- parse, /proc enrichment, classification, action dispatch --
-     * happens on the DetectLoop worker.
+     * happens on DetectLoop's Boost.Asio loop.
      *
      * This used to do all of that inline, which meant libbpf's poll thread
      * sat through a several-hundred-line /proc parse per uprobe event. A

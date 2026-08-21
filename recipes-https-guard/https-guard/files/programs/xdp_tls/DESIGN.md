@@ -125,6 +125,39 @@ For a **plaintext-HTTP-on-443** event, `is_violation` is always 0 — there's no
 - **Raw event struct:** `struct xdp_event` in `xdp_tls_event.h` — carries full socket 4-tuple and `is_violation`, unlike `uprobe_event`.
 - **Shared state:** `blocklist_check()` / the `src_blocklist` BPF map, defined in `../../actions/blocklist/blocklist.bpf.h` and `#include`d here — this is the one dependency `programs/` has on `actions/`, because the blocklist map is genuinely an enforcement-layer concern shared across hooks, not owned by either.
 
+## Per-source counters (rate, Slowloris, renegotiation)
+
+This hook also maintains the state that three userspace rules read. It is the
+natural place for it: the counting is per-packet, and it happens at the same
+point in the packet path where `blocklist_check()` already asks "is this
+source already a problem".
+
+`ebpf/conn_rate.bpf.h` holds an `LRU_HASH` keyed on source address —
+**LRU rather than a plain hash deliberately**, because a plain hash keyed on
+source *is itself* a DoS vector: a spoofed-source flood fills it and then
+inserts start failing. LRU bounds the memory and evicts the least recently
+seen source, which under a distributed flood is the entry least worth keeping.
+
+Three counters per source, updated from two points in the program:
+
+```
+inbound SYN (no ACK), before the port-443 filter
+    ├─ syn_count   += 1      WINDOWED  → connection-rate rule
+    └─ open_conns  += 1      LEVEL     → Slowloris rule
+
+FIN or RST
+    └─ open_conns  -= 1      LEVEL     (floored at zero)
+
+TLS handshake record (ContentType 0x16)
+    └─ hello_count += 1      WINDOWED  → renegotiation rule
+```
+
+Three things about that are deliberate:
+
+- **SYNs are counted before the port filter.** A port scan targets ports other than 443 by definition, so counting after the filter would make the thing we want to detect invisible.
+- **`open_conns` survives the window roll.** It is a level, not a rate: Slowloris works by occupying slots and then going quiet, so a windowed count would show an active attacker as idle. It is floored at zero because closes can legitimately outnumber observed SYNs (connections predating the entry, or a FIN *and* an RST for one connection), and a negative level would read as innocent forever after.
+- **This BPF code draws no conclusion and drops nothing.** It only counts. The thresholds live in userspace, where a mistuned value cannot drop legitimate traffic at line rate, and where the sweep can be observed and tuned. `../../detections/conn_rate/ConnRateSweeper` reads the map on a timer and synthesises one event per rule per offending source. Enforcement then follows the ordinary path — blocklist the source, and Tier 1 above drops the remainder at line rate.
+
 ## Known limitations
 
 **Attach success under QEMU SLIRP is unverified as a hard rule.** This hook is documented (in `README.md`) as unable to attach under SLIRP networking (no real netdev, so neither native nor generic XDP should have anything to hook). A live boot on this project's own kernel showed the native attach call succeeding anyway. Whether the actual `XDP_DROP` enforcement path fires correctly in that state was not independently confirmed — treat it as needing verification on whatever kernel you're actually deploying to, not a fixed platform fact either way.
@@ -135,4 +168,8 @@ For a **plaintext-HTTP-on-443** event, `is_violation` is always 0 — there's no
 
 **Captured ClientHello detail is capped.** At most `HG_MAX_CIPHER_SUITES` (32) suites and `HG_SNI_LEN - 1` (63) hostname bytes land in the event; `cipher_suites_offered` reports the true count so a detector can tell truncation from a genuinely short list, and a partially-captured hostname sets `sni_malformed` so it can't be compared as if complete (that specific gap was a real bypass — a truncated `bmc.evil.com` reading as `bmc` — caught by test before shipping).
 
-**No rate-based detection.** Connection-rate abuse, SYN floods, and port scanning need per-source-IP state over a time window (an `LRU_HASH` map keyed on source IP, most naturally checked at the same point `blocklist_check()` already runs) — planned as a separate ticket, since it's a different kind of mechanism (stateful counting) from anything this hook does today.
+**The rate window is fixed at build time.** `HTTPS_GUARD_CONN_RATE_WINDOW_SEC` (10s) is compiled in, because it decides how much memory a burst can occupy and how the counters reset. Only the *count* thresholds are configurable. Changing the window needs a rebuild — a real limitation, not an oversight.
+
+**The counters only see this interface.** They are maintained in the XDP path, so traffic that never traverses the monitored NIC — anything over loopback, including the BMC connecting to itself — is not counted at all.
+
+**Clients behind one NAT address share a budget.** All three counters are keyed on source address, so several busy administrators or a monitoring system behind one address look like one abusive source. This is why the thresholds ship deliberately high and why the config file says so.

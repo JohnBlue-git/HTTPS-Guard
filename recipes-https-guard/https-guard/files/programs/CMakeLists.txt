@@ -170,6 +170,7 @@ if(HTTPS_GUARD_BUILD_BPF)
             ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe_event.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls_event.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/conn_rate.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/ebpf/lsm_cert_guard_event.h
             ${CMAKE_SOURCE_DIR}/actions/blocklist/blocklist.bpf.h

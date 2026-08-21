@@ -5,7 +5,7 @@ The actual C++/eBPF source for the `https-guard-openbmc` BitBake recipe (`../htt
 - **`programs/`** — Detect. Attaches BPF hooks, parses raw events. See `programs/CLAUDE.md`.
 - **`detections/`** — Classify. Pure rules deciding whether a parsed event is a violation. See `detections/CLAUDE.md`.
 - **`actions/`** — Dispatch. Async countermeasures (log, kill connection, blocklist). See `actions/CLAUDE.md`.
-- **`tests/`** — doctest unit tests for `detections/`. No kernel/BPF/root/QEMU dependency; builds host-side only (`HTTPS_GUARD_BUILD_TESTS`, defaults off when cross-compiling).
+- **`tests/`** — doctest unit tests for `detections/`. No kernel/BPF/root/QEMU dependency; builds host-side only (`HTTPS_GUARD_BUILD_TESTS`, defaults off when cross-compiling). `tests/detectloop/` is deliberately *outside* that binary: it tests `DetectLoop`'s scheduling (bounded admission, arrival order, the sweep surviving a backlog) and so must compile `DetectLoop.cpp`, which pulls in the actions and libbpf. See its `README.md`.
 - **`scripts/gen_ssl_offset.c`** — host tool that determines `ssl_st.version`'s offset at build time (OpenSSL 3.x made the struct opaque).
 - **`service/`** — systemd units and their shell wrappers.
 

@@ -19,7 +19,7 @@ class hg_event;
  * and invoked through `hg_event::ensurePeerResolved()`, which memoises so
  * repeated asks cost nothing.
  *
- * Implementations must be safe to call from the DetectLoop worker thread and
+ * Implementations must be safe to call from DetectLoop's threads and
  * must not throw — they are reached from a `noexcept` path.
  */
 class IPeerResolver {

@@ -11,6 +11,12 @@
 #include "uprobe_hg_event.hpp"
 #include "xdp_hg_event.hpp"
 #include "cert_access_hg_event.hpp"
+#include "ConnRateEvent.hpp"
+#include "ConnRateDetector.hpp"
+#include "SlowlorisEvent.hpp"
+#include "SlowlorisDetector.hpp"
+#include "RenegotiationEvent.hpp"
+#include "RenegotiationDetector.hpp"
 #include "CipherSuiteDetector.hpp"
 #include "SniDetector.hpp"
 
@@ -347,4 +353,179 @@ TEST_CASE("an XDP event supplies both capabilities, so both families apply")
     CipherSuiteDetector cipher;
     CHECK(tls.evaluate(evt).has_value() == true);
     CHECK(cipher.evaluate(evt).has_value() == true);
+}
+
+// --- ConnRateDetector (ticket 05) ---------------------------------------
+//
+// The counting itself lives in BPF, so what is testable here is the
+// threshold decision and the message. These use ConnRateEvent directly,
+// exactly as ConnRateSweeper synthesises it.
+
+TEST_CASE("ConnRateDetector flags a source over the configured threshold")
+{
+    ConnRateEvent evt;
+    evt.attempt_count  = 250;
+    evt.window_seconds = 10;
+    evt.rate_threshold = 200;
+    evt.source_ip      = "10.0.0.9";
+
+    ConnRateDetector detector;
+    const auto verdict = detector.evaluate(evt);
+
+    REQUIRE(verdict.has_value());
+    CHECK(verdict->severity == "Warning");
+    CHECK(verdict->message_id == "OemSecurityEvent.1.0.HttpsConnectionRateViolation");
+    // Actionable, unlike the cipher-suite and SNI rules: a flood is ongoing
+    // harm, so an alert that doesn't stop it is of little use.
+    CHECK(verdict->actionable == true);
+    CHECK(verdict->message.find("250") != std::string::npos);
+    CHECK(verdict->message.find("200") != std::string::npos);
+    CHECK(verdict->message.find("10.0.0.9") != std::string::npos);
+}
+
+TEST_CASE("ConnRateDetector boundary: exactly at the threshold counts as over")
+{
+    ConnRateEvent evt;
+    evt.attempt_count  = 200;
+    evt.window_seconds = 10;
+    evt.rate_threshold = 200;
+
+    ConnRateDetector detector;
+    CHECK(detector.evaluate(evt).has_value() == true);
+}
+
+TEST_CASE("ConnRateDetector boundary: one below the threshold is not flagged")
+{
+    ConnRateEvent evt;
+    evt.attempt_count  = 199;
+    evt.window_seconds = 10;
+    evt.rate_threshold = 200;
+
+    ConnRateDetector detector;
+    CHECK(detector.evaluate(evt).has_value() == false);
+}
+
+TEST_CASE("ConnRateDetector: a zero threshold means disabled, never 'everything violates'")
+{
+    // The daemon uses 0 to mean "not configured". Treating that as a
+    // threshold everything exceeds would blocklist every source that ever
+    // connects, so this is the most consequential boundary in the class.
+    ConnRateEvent evt;
+    evt.attempt_count  = 5000;
+    evt.window_seconds = 10;
+    evt.rate_threshold = 0;
+
+    ConnRateDetector detector;
+    CHECK(detector.evaluate(evt).has_value() == false);
+}
+
+TEST_CASE("ConnRateDetector declines events that carry no rate information")
+{
+    UprobeEvent evt;
+    evt.tls_version = 0x0304;
+
+    ConnRateDetector detector;
+    CHECK(detector.evaluate(evt).has_value() == false);
+}
+
+// --- SlowlorisDetector / RenegotiationDetector (ticket 06) --------------
+//
+// Both rules need cross-event state, and neither detector holds any: the
+// counting lives in a BPF map and is aggregated before it gets here. That is
+// what lets these tests be plain value assertions with no kernel involved --
+// the property the architecture decision was made to preserve.
+
+TEST_CASE("SlowlorisDetector flags a source holding too many connections open")
+{
+    SlowlorisEvent evt;
+    evt.open_connections = 150;
+    evt.slowloris_threshold = 100;
+    evt.source_ip = "10.0.0.9";
+
+    SlowlorisDetector detector;
+    const auto verdict = detector.evaluate(evt);
+
+    REQUIRE(verdict.has_value());
+    CHECK(verdict->severity == "Warning");
+    CHECK(verdict->message_id == "OemSecurityEvent.1.0.HttpsSlowlorisDetected");
+    CHECK(verdict->actionable == true);
+    CHECK(verdict->message.find("150") != std::string::npos);
+}
+
+TEST_CASE("SlowlorisDetector boundary: N triggers, N-1 does not")
+{
+    SlowlorisDetector detector;
+
+    SlowlorisEvent at;
+    at.open_connections = 100;
+    at.slowloris_threshold = 100;
+    CHECK(detector.evaluate(at).has_value() == true);
+
+    SlowlorisEvent below;
+    below.open_connections = 99;
+    below.slowloris_threshold = 100;
+    CHECK(detector.evaluate(below).has_value() == false);
+}
+
+TEST_CASE("SlowlorisDetector: zero threshold means disabled")
+{
+    SlowlorisEvent evt;
+    evt.open_connections = 100000;
+    evt.slowloris_threshold = 0;
+
+    SlowlorisDetector detector;
+    CHECK(detector.evaluate(evt).has_value() == false);
+}
+
+TEST_CASE("RenegotiationDetector flags a handshake storm")
+{
+    RenegotiationEvent evt;
+    evt.handshake_count = 250;
+    evt.window_seconds  = 10;
+    evt.reneg_threshold = 200;
+    evt.source_ip = "10.0.0.9";
+
+    RenegotiationDetector detector;
+    const auto verdict = detector.evaluate(evt);
+
+    REQUIRE(verdict.has_value());
+    CHECK(verdict->message_id == "OemSecurityEvent.1.0.HttpsTlsRenegotiationStorm");
+    CHECK(verdict->actionable == true);
+    CHECK(verdict->message.find("250") != std::string::npos);
+}
+
+TEST_CASE("RenegotiationDetector boundary: N within window triggers, N-1 does not")
+{
+    RenegotiationDetector detector;
+
+    RenegotiationEvent at;
+    at.handshake_count = 200; at.window_seconds = 10; at.reneg_threshold = 200;
+    CHECK(detector.evaluate(at).has_value() == true);
+
+    RenegotiationEvent below;
+    below.handshake_count = 199; below.window_seconds = 10; below.reneg_threshold = 200;
+    CHECK(detector.evaluate(below).has_value() == false);
+}
+
+TEST_CASE("the three per-source rules do not poach each other's events")
+{
+    // All three are registered under one event source, so first-match-wins
+    // relies on each event carrying only its own capability.
+    ConnRateEvent rate;   rate.attempt_count = 999;  rate.rate_threshold = 1;
+    SlowlorisEvent slow;  slow.open_connections = 999; slow.slowloris_threshold = 1;
+    RenegotiationEvent rn; rn.handshake_count = 999;  rn.reneg_threshold = 1;
+
+    ConnRateDetector d_rate;
+    SlowlorisDetector d_slow;
+    RenegotiationDetector d_reneg;
+
+    CHECK(d_rate.evaluate(rate).has_value()  == true);
+    CHECK(d_slow.evaluate(rate).has_value()  == false);
+    CHECK(d_reneg.evaluate(rate).has_value() == false);
+
+    CHECK(d_slow.evaluate(slow).has_value()  == true);
+    CHECK(d_rate.evaluate(slow).has_value()  == false);
+
+    CHECK(d_reneg.evaluate(rn).has_value()   == true);
+    CHECK(d_rate.evaluate(rn).has_value()    == false);
 }

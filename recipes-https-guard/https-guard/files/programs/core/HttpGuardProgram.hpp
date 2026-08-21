@@ -36,6 +36,13 @@ public:
                      std::string output_path,
                      DetectorRegistry detectors) noexcept;
 
+    /**
+     * Starts connection-rate sweeping. Must be called after loadFilter(),
+     * since the counter map only exists once the object is loaded. A zero
+     * threshold leaves it disabled.
+     */
+    void enableRateSweeps(ConnRateSweeper::Thresholds thresholds) noexcept;
+
 protected:
     bool attachProgram() noexcept override;
     ring_buffer_sample_fn getRingBufferHandler() noexcept override;
@@ -44,7 +51,7 @@ private:
     /**
      * Copies the record and hands it to detect_loop_ -- nothing more. All
      * parsing, /proc access, classification and action construction happen
-     * on the DetectLoop worker, because libbpf needs this callback back
+     * on DetectLoop's Boost.Asio loop, because libbpf needs this callback back
      * promptly: a slow callback lets the ring buffer fill, and a full ring
      * buffer drops events silently.
      */

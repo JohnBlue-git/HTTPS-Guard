@@ -74,6 +74,7 @@ SRC_URI = " \
     file://programs/xdp_tls/ebpf/xdp_tls.bpf.h \
     file://programs/xdp_tls/ebpf/xdp_tls_event.h \
     file://programs/xdp_tls/ebpf/parse_client_hello.h \
+    file://programs/xdp_tls/ebpf/conn_rate.bpf.h \
     file://programs/xdp_tls/src/XdpTlsProgram.hpp \
     file://programs/xdp_tls/src/xdp_hg_event.hpp \
     file://programs/xdp_tls/src/XdpTlsProgram.cpp \
@@ -88,6 +89,9 @@ SRC_URI = " \
     file://detections/core/ITlsTrafficInfo.hpp \
     file://detections/core/IClientHelloInfo.hpp \
     file://detections/core/ICertAccessInfo.hpp \
+    file://detections/core/IConnectionRateInfo.hpp \
+    file://detections/core/ISlowlorisInfo.hpp \
+    file://detections/core/IRenegotiationInfo.hpp \
     file://detections/core/hg_event_source.h \
     file://detections/core/IHookModule.hpp \
     file://detections/core/DetectLoop.hpp \
@@ -99,6 +103,14 @@ SRC_URI = " \
     file://detections/tls_version/tls_version.hpp \
     file://detections/payload_anomaly/PayloadAnomalyDetector.hpp \
     file://detections/cert_access/CertAccessDetector.hpp \
+    file://detections/conn_rate/ConnRateEvent.hpp \
+    file://detections/conn_rate/ConnRateDetector.hpp \
+    file://detections/conn_rate/ConnRateSweeper.hpp \
+    file://detections/conn_rate/ConnRateSweeper.cpp \
+    file://detections/slowloris/SlowlorisEvent.hpp \
+    file://detections/slowloris/SlowlorisDetector.hpp \
+    file://detections/renegotiation/RenegotiationEvent.hpp \
+    file://detections/renegotiation/RenegotiationDetector.hpp \
     file://detections/cipher_suite/CipherSuiteDetector.hpp \
     file://detections/cipher_suite/weak_cipher_suites.hpp \
     file://detections/sni/SniDetector.hpp \
@@ -123,6 +135,8 @@ SRC_URI = " \
     file://tests/test_detectors.cpp \
     file://tests/test_uprobe_parsing.cpp \
     file://tests/test_client_hello_parsing.cpp \
+    file://tests/detectloop/detectloop_harness.cpp \
+    file://tests/detectloop/README.md \
 "
 
 S = "${UNPACKDIR}"

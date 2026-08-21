@@ -63,16 +63,28 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │              https-guardd daemon                         │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │ ring_buffer__poll()                                │  │  │
+│  │  │ poll thread: ring_buffer__poll()                   │  │  │
+│  │  │   → copy record, post, return (nothing else)       │  │  │
+│  │  ├──────────────── thread boundary ───────────────────┤  │  │
+│  │  │ DetectLoop (Boost.Asio io_context, 2 threads):     │  │  │
 │  │  │   → find owning IHookModule, parseEvent()          │  │  │
-│  │  │     → PID→socket (ProcPeerResolver, uprobe only)   │  │  │
 │  │  │   → run detectors_[source] → Verdict               │  │  │
-│  │  │     • TlsVersionDetector (< TLS 1.2)                │  │  │
-│  │  │     • PayloadAnomalyDetector (SQLi/traversal)       │  │  │
-│  │  │   → Enforcement actions (if actionable):           │  │  │
-│  │  │       • LogAction (file write, always)             │  │  │
-│  │  │       • BlockTcpAction (SOCK_DESTROY)              │  │  │
+│  │  │     • TlsVersionDetector    (< TLS 1.2)            │  │  │
+│  │  │     • PayloadAnomalyDetector (SQLi/traversal)      │  │  │
+│  │  │     • CipherSuiteDetector   (weak suites, alert)   │  │  │
+│  │  │     • SniDetector           (malformed, alert)     │  │  │
+│  │  │     • CertAccessDetector    (HTTPS key opened)     │  │  │
+│  │  │     • ConnRateDetector      (SYNs/window)          │  │  │
+│  │  │     • SlowlorisDetector     (conns held open)      │  │  │
+│  │  │     • RenegotiationDetector (handshakes/window)    │  │  │
+│  │  │   → if actionable: resolve peer (lazily, uprobe)   │  │  │
+│  │  │       • BlockTcpAction (SOCK_DESTROY, full tuple)  │  │  │
 │  │  │       • BlocklistAddAction (BPF map update)        │  │  │
+│  │  │   → LogAction (file write, always)                 │  │  │
+│  │  ├────────────────────────────────────────────────────┤  │  │
+│  │  │ every 2s: ConnRateSweeper reads the per-source     │  │  │
+│  │  │   counter map and synthesises rate / Slowloris /   │  │  │
+│  │  │   renegotiation events for the same pipeline       │  │  │
 │  │  └────────────────────────────────────────────────────┘  │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                          │                                     │
@@ -110,13 +122,15 @@ The source under `files/` is organized around the **Detect → Classify → Disp
 
 | Component | Path | Role |
 |-----------|------|------|
-| **Detect** | `programs/` | Attaches BPF hooks and parses their raw events. `ssl_uprobe/` (uprobe on `SSL_write()`, PRIMARY) and `xdp_tls/` (XDP ClientHello inspection + blocklist enforcement, AUXILIARY) each implement the `IHookModule` interface; `core/` holds the generic BPF lifecycle wrapper and the orchestrator (`HttpGuardProgram`) that dispatches between them |
-| **Classify** | `detections/` | Pure classification rules behind `IDetector`: `tls_version/` (TLS-version-violation check) and `payload_anomaly/` (SQLi/path-traversal signatures), run through a registry keyed by which hook produced the event |
+| **Detect** | `programs/` | Attaches BPF hooks and parses their raw events. Three hooks implement `IHookModule`: `ssl_uprobe/` (uprobes on `SSL_write()` **and** `SSL_read()`, PRIMARY), `xdp_tls/` (ClientHello inspection, blocklist enforcement, and the per-source connection counters, AUXILIARY), and `lsm_cert_guard/` (BPF-LSM on the HTTPS key — cannot attach on ARM32, see [LIMITATIONS.md](LIMITATIONS.md)). Each hook splits into `ebpf/` and `src/`; `core/` holds the BPF lifecycle wrapper and `HttpGuardProgram`, whose callback now only copies and enqueues |
+| **Classify** | `detections/` | Every classification rule behind `IDetector`, plus `core/DetectLoop` — the worker thread that owns parse → classify → dispatch. Eight rules: `tls_version/`, `payload_anomaly/`, `cipher_suite/`, `sni/`, `cert_access/`, `conn_rate/`, `slowloris/`, `renegotiation/`. Hook-specific event data is reached through capability interfaces in `core/`, so no rule depends on a hook. The three counting rules are stateful without any stateful detector — their state lives in a BPF map that `ConnRateSweeper` aggregates |
 | **Dispatch** | `actions/` | Three async countermeasures run through `ActionLoop`: `log/` (file write), `tcp/` (SOCK_DESTROY via Netlink), `blocklist/` (BPF map update) |
-| **Tests** | `tests/` | doctest-based unit tests for the `detections/` layer — no kernel/BPF/root/QEMU dependency |
+| **Tests** | `tests/` | doctest-based unit tests for the `detections/` layer and the real parsers — no kernel/BPF/root/QEMU dependency |
 | **Event bridge** | `service/https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
-> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md). Per-hook detection rationale and diagrams live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
+**Which rules enforce:** the blocklist applies to a source address on *every* port, so an actionable false positive removes all access to the BMC for the blocklist TTL. TLS-version, payload-anomaly and the three counting rules enforce; cipher-suite, SNI and certificate-access alert only. The reasoning is in `detections/CLAUDE.md`, and it is worth reading before changing a rule's `actionable` flag.
+
+> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md). Per-hook detection rationale and diagrams live in `programs/ssl_uprobe/DESIGN.md`, `programs/xdp_tls/DESIGN.md` and `programs/lsm_cert_guard/DESIGN.md`. Known gaps and unverified claims: [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Building HTTPS-Guard
 

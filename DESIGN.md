@@ -148,28 +148,35 @@ class IHookModule {
 public:
     virtual bool attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept = 0;
     virtual hg_event_source eventSource() const noexcept = 0;
-    virtual std::optional<hg_event> parseEvent(const void* data, size_t size) const noexcept = 0;
+    virtual std::unique_ptr<hg_event> parseEvent(const void* data, size_t size) const noexcept = 0;
 };
 ```
 
-A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into the shared `hg_event` representation. It never classifies (that's `detections/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
+A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into an event. It never classifies (that's the rules in `detections/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
 
-Two hooks exist today, each documented in depth in its own `DESIGN.md`:
+`parseEvent()` returns an owning pointer rather than a value because the concrete type it builds carries hook-specific data behind capability interfaces; copying it as an `hg_event` would slice that away, so `hg_event` is non-copyable and the compiler rejects the mistake.
+
+Three hooks exist, each documented in depth in its own `DESIGN.md`:
 
 | Hook | Role | Deep dive |
 |------|------|-----------|
-| `ssl_uprobe` | PRIMARY — uprobe on OpenSSL `SSL_write()` | [programs/ssl_uprobe/DESIGN.md](recipes-https-guard/https-guard/files/programs/ssl_uprobe/DESIGN.md) |
-| `xdp_tls` | AUXILIARY — XDP on the NIC RX path | [programs/xdp_tls/DESIGN.md](recipes-https-guard/https-guard/files/programs/xdp_tls/DESIGN.md) |
+| `ssl_uprobe` | PRIMARY — uprobes on OpenSSL `SSL_write()` **and** `SSL_read()` | [programs/ssl_uprobe/DESIGN.md](recipes-https-guard/https-guard/files/programs/ssl_uprobe/DESIGN.md) |
+| `xdp_tls` | AUXILIARY — XDP on the NIC RX path; also maintains the per-source counters the rate/Slowloris/renegotiation rules read | [programs/xdp_tls/DESIGN.md](recipes-https-guard/https-guard/files/programs/xdp_tls/DESIGN.md) |
+| `lsm_cert_guard` | AUXILIARY — BPF-LSM on `file_open`, filtered to the HTTPS key. **Cannot attach on this project's ARM32 target at all** (no BPF trampoline), so it is alert-only there | [programs/lsm_cert_guard/DESIGN.md](recipes-https-guard/https-guard/files/programs/lsm_cert_guard/DESIGN.md) |
+
+Each hook directory splits into `ebpf/` (the `SEC(...)` program and its raw event struct) and `src/` (the `IHookModule` implementation and its helpers). Classification rules are never inside a hook — see `detections/CLAUDE.md` for why.
 
 ### `https_guard.bpf.c` — the aggregator
 
-Both hooks' BPF program bodies live in their own `<hook>.bpf.h`, but clang only ever compiles one translation unit: `programs/core/https_guard.bpf.c`. It declares the shared ring buffer map and the `enum hg_event_source` discriminator, then `#include`s each hook's header — so the result is a single BPF object with one ring buffer, one blocklist map, and one load/verify pass, regardless of how many hook headers get added.
+Every hook's BPF program body lives in its own `ebpf/<hook>.bpf.h`, but clang only ever compiles one translation unit: `programs/core/https_guard.bpf.c`. It declares the shared ring buffer map, then `#include`s each hook's header — so the result is a single BPF object with one ring buffer, one blocklist map, one per-source counter map, and one load/verify pass, regardless of how many hook headers get added.
 
-### `HttpGuardProgram` — the orchestrator
+### `HttpGuardProgram` — attach and hand off
 
-The sole `BpfProgram` subclass. It holds a `vector<unique_ptr<IHookModule>>` and a `DetectorRegistry` (`unordered_map<hg_event_source, vector<unique_ptr<IDetector>>>`), both constructed and injected by `main.cpp` — it never constructs a concrete hook or detector itself. `attachProgram()` loops over the hooks calling `attach()`, requiring at least one to succeed; the ring-buffer callback reads the raw `event_source` discriminator, finds the hook whose `eventSource()` matches, calls its `parseEvent()`, then runs that source's registered detectors in order and dispatches on the resulting `Verdict`.
+The sole `BpfProgram` subclass. It holds the `vector<unique_ptr<IHookModule>>` and owns a `DetectLoop`, both fed from `main.cpp` — it never constructs a concrete hook or detector itself. `attachProgram()` loops over the hooks calling `attach()`, requiring at least one to succeed.
 
-Because everything is expressed through `IHookModule`/`IDetector`, adding a new hook (e.g. the planned BPF-LSM certificate-access guard) or a new detection rule never requires touching `HttpGuardProgram` — only `main.cpp`'s composition root grows by a line.
+Its ring-buffer callback is three lines: **copy the record, enqueue it, return.** All parsing, `/proc` enrichment, classification and action dispatch happen on the `DetectLoop` worker instead. libbpf needs that callback back promptly — a slow callback lets the ring buffer fill, and a full ring buffer silently drops events, which is a missed detection rather than merely added latency.
+
+Because everything is expressed through `IHookModule`/`IDetector`, adding a hook or a rule never requires touching `HttpGuardProgram` or `DetectLoop` — only `main.cpp`'s composition root grows by a line.
 
 ## The Classify Layer: `detections/`
 
@@ -189,16 +196,30 @@ public:
 };
 ```
 
-A detector is a pure, synchronous function: given an already-parsed event, decide whether its rule matches and, if so, produce the `Verdict` to act on. No I/O, no BPF/socket access, no knowledge of which hook produced the event. `evaluate()` takes `hg_event` by `const&` and never mutates it — `hg_event` stays purely "what was observed," `Verdict` is purely "what a detector decided," and the two are never conflated.
+A detector is a pure, synchronous function: given an already-parsed event, decide whether its rule matches and, if so, produce the `Verdict` to act on. No I/O, no BPF/socket access, no knowledge of which hook produced the event, and **no state of its own** — including the three rules that are inherently stateful, whose counters live in a BPF map and are aggregated before a detector ever sees them.
 
-### The registry
+`hg_event` carries only what every event has. Hook-specific data is reached through small **capability interfaces** (`ITlsTrafficInfo`, `IClientHelloInfo`, `ICertAccessInfo`, `IConnectionRateInfo`, `ISlowlorisInfo`, `IRenegotiationInfo`), which the concrete per-hook event types implement. A rule depends on the capability it needs, so a certificate-access event does not have to pretend it has a TLS version, and adding a hook cannot widen a type every other hook depends on.
 
-`HttpGuardProgram::DetectorRegistry` maps each `hg_event_source` to an ordered list of detectors. Both existing sources run the same two rules today, in the same priority order:
+### The registry and the rules
 
-1. **`TlsVersionDetector`** — flags a negotiated version below TLS 1.2. `tls_version == 0` alone means "not observed" (the uprobe never resolves `ssl->version` before a violation) and is not itself a violation — *unless* the producing hook already determined otherwise via `hg_event.tls_violation_hint` (only `xdp_tls` sets this, since its BPF side already classifies `is_violation` from the wire — see its own `DESIGN.md`). Without that hint, a hook-agnostic zero-check would wrongly treat a genuinely-parsed `0x0000` `legacy_version` as "no data" instead of a violation — this exact bug shipped once and was caught by `/code-review`; the hint field exists specifically to prevent it recurring.
-2. **`PayloadAnomalyDetector`** — SQLi / path-traversal / known attack-signature substrings in `payload_snippet`, case-insensitive.
+`DetectLoop::DetectorRegistry` maps each `hg_event_source` to an ordered list of rules; the loop runs a source's list in order and stops at the first match. No match falls back to an `OK` / `HttpsTrafficObserved` verdict built inline — not by a detector, since there is nothing to detect in that case.
 
-The orchestrator runs a source's list in order and stops at the first match; no match falls back to an `OK` / `HttpsTrafficObserved` verdict built inline in `HttpGuardProgram`, not by a detector (there is nothing to detect in that case).
+| Rule | Sources | Enforces? |
+|---|---|---|
+| `TlsVersionDetector` — negotiated/offered version below TLS 1.2 | uprobe, XDP | yes |
+| `PayloadAnomalyDetector` — SQLi / path-traversal / attack-signature substrings, case-insensitive | uprobe, XDP | yes |
+| `CipherSuiteDetector` — weak offered suites (NULL, EXPORT, RC4, 3DES, anon KEX) | XDP | no — alert only |
+| `SniDetector` — malformed SNI always; hostname mismatch only when configured | XDP | no — alert only |
+| `CertAccessDetector` — unrecognised process opened the HTTPS key | LSM | no |
+| `ConnRateDetector` — connection attempts per source per window | synthesised | yes |
+| `SlowlorisDetector` — connections held open per source | synthesised | yes |
+| `RenegotiationDetector` — TLS handshake records per source per window | synthesised | yes |
+
+**Why some rules enforce and others only alert** is the most important thing on this page. The blocklist applies to a source address on *every* port, so an actionable false positive removes all access to the BMC for the blocklist TTL. Cipher-suite and SNI findings describe an offer bmcweb refuses anyway — no damage done, so alerting is proportionate; making them actionable locked an operator out of SSH during testing. The three per-source counting rules describe *ongoing* harm, so they enforce, which makes their thresholds safety-critical rather than tuning details.
+
+`ITlsTrafficInfo::tlsViolationHint()` exists to prevent one specific bug: a genuinely-parsed `legacy_version` of `0x0000` is a real violation on the wire, whereas `tlsVersion() == 0` from the uprobe only means "never observed". `UprobeEvent` returns a hard `false`; `XdpEvent` returns its BPF-computed flag. Collapsing those two zeros shipped once and was caught by review, not by the implementer.
+
+The three synthesised rules have no hook: their counters are maintained in BPF by `xdp_tls` and turned into events by `detections/conn_rate/ConnRateSweeper`, which the loop runs on a timer. That is how stateful detection is done here without any stateful detector — see `detections/CLAUDE.md`.
 
 ## The Dispatch Layer: `actions/`
 
@@ -208,40 +229,78 @@ Unchanged in shape by the `programs`/`detections` split — still three single-r
 - **`BlockTcpAction`** — `SOCK_DESTROY` via `NETLINK_INET_DIAG` for the exact 4-tuple (`TcpDestroyer`).
 - **`BlocklistAddAction`** — writes an expiry into the shared BPF blocklist map, which `xdp_tls`'s synchronous `blocklist_check()` reads on every subsequent packet.
 
-The last two only fire when a `Verdict::actionable` is true and `hg_event::remote_ip_v4` is non-zero (uprobe events need `ProcPeerResolver` to have found a socket first; `xdp_tls` events always carry it from the packet headers).
+The last two only fire when a `Verdict::actionable` is true and the event has a peer address. For uprobe events that address comes from `ProcPeerResolver`, resolved lazily at this point and only if it can be attributed unambiguously; XDP events carry it from the packet headers, and synthesised counter events from the map key. `BlockTcpAction` additionally requires a *full* 4-tuple — a verdict attributed to an address rather than a connection (a rate or Slowloris finding) has no socket to tear down, and asking netlink to destroy a zero tuple only produces a misleading failure.
+
+Note that gating on "do we have an address" rather than "did resolution run" matters: events that already know their own address carry no resolver, and conflating the two once disabled enforcement for every XDP and synthesised verdict while looking like it worked.
 
 ## Event Processing Pipeline
 
 ### Ring Buffer → Classification → Enforcement
 
 ```
-BPF Event (ring buffer)
-    │
-    ▼
-HttpGuardProgram::ringBufferHandler()
-    │
-    ├─ Read the raw uint32_t event_source discriminator
-    │
-    ├─ Find the IHookModule whose eventSource() matches
-    │   └─ (none found → log + skip)
-    │
-    ├─ hookModule->parseEvent(data, size) -> optional<hg_event>
-    │   └─ nullopt (undersized/malformed) → skip
-    │
-    ├─ Run detectors_[event_source] in order, stop at first match
-    │   ├─ TlsVersionDetector::evaluate(evt)      -> optional<Verdict>
-    │   └─ PayloadAnomalyDetector::evaluate(evt)  -> optional<Verdict>
-    │   └─ (no match → inline "OK / traffic observed" Verdict)
-    │
-    ├─ if Verdict::actionable && evt.remote_ip_v4 != 0:
-    │   ├─ BlockTcpAction(local_ip, remote_ip, local_port, remote_port)
-    │   │   └─ TcpDestroyer::execute() → SOCK_DESTROY via NETLINK_INET_DIAG
-    │   └─ BlocklistAddAction(src_ip, ttl)
-    │       └─ Blocklist::add() → bpf_map_update_elem()
-    │
-    └─ LogAction (always, regardless of severity)
-        └─ RedfishEventMessage(evt, verdict) → JSON → event log file
+BPF Event (ring buffer)                          BPF per-source counters
+    │                                                     │
+    ▼                                                     │
+HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──────────────
+    │                                                     │
+    ├─ size-check, claim a slot (bounded; drop newest)     │
+    └─ DetectLoop::submit() → asio::post(record_strand_)   │
+           (returns immediately; nothing else happens here)│
+                     │                                    │
+════════════ thread boundary ═════════════════════════════ │ ════════════
+                     ▼                                    ▼
+   DetectLoop::handleRecord() ── io_context ──  steady_timer, every 2s:
+     (on record_strand_: serialized,             ConnRateSweeper reads the
+      arrival order preserved)                   counters and synthesises one
+                     │                           event per rule per offending
+                     │                           source.  NOT on the strand,
+                     │                           so a record backlog cannot
+                     │                           delay it.
+                     ▼                                    │
+        DetectLoop::classifyAndDispatch(evt, source) ◄─────┘
+                     │
+                     ├─ Find the IHookModule whose eventSource() matches
+                     │   └─ (none → log + skip; synthesised events skip this)
+                     │
+                     ├─ parseEvent(data, size) -> unique_ptr<hg_event>
+                     │   └─ nullptr (undersized/malformed) → skip
+                     │
+                     ├─ Run detectors_[source] in order, stop at first match
+                     │   └─ each casts to the capability it needs; an event
+                     │      without it declines rather than misreading
+                     │   └─ (no match → inline "OK / traffic observed")
+                     │
+                     ├─ if Verdict::actionable:
+                     │   ├─ ensurePeerResolved()   ← the /proc walk, only now
+                     │   ├─ if remote_ip_v4 != 0:
+                     │   │   ├─ BlockTcpAction   (only with a full 4-tuple:
+                     │   │   │   an address-only verdict has no socket to kill)
+                     │   │   └─ BlocklistAddAction(remote_ip, ttl)
+                     │   └─ else: log "declining to enforce"
+                     │
+                     └─ LogAction (always, regardless of severity)
 ```
+
+Three things in that diagram are load-bearing rather than incidental.
+
+The `/proc` walk behind `ensurePeerResolved()` runs **only** on the
+actionable path, because it is the most expensive step in the pipeline and
+the large majority of events never reach it.
+
+A per-item `try/catch` wraps each handler's body: everything below it
+allocates and the handlers are `noexcept`, so without that boundary a
+`bad_alloc` would be `std::terminate` rather than one dropped event.
+
+And the loop runs **two** threads with the sweep timer deliberately off the
+record strand. A single-threaded `io_context` starves the sweep by FIFO
+fairness alone — an expiring timer queues behind every record already
+posted, so a deep backlog delays it by (backlog × per-event cost), and
+against a fixed 10s counting window that can lose a flood entirely.
+Measured against a deliberate backlog: one thread produced **zero** sweeps
+in nine seconds, two produced one every two seconds. Running the sweep
+concurrently with a record is safe only because classification holds no
+shared mutable state, which makes detector statelessness a threading
+requirement here rather than a style preference.
 
 Per-hook specifics — exactly what each `parseEvent()` extracts, and each hook's own attach fallback — live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
 
@@ -250,9 +309,9 @@ Per-hook specifics — exactly what each `parseEvent()` extracts, and each hook'
 Decouples event callback processing from I/O using Boost.Asio:
 
 ```
-Main thread (ring_buffer__poll)
+DetectLoop worker thread
     │
-    └─ ringBufferHandler() callback
+    └─ classifyAndDispatch()
         ├─ pushAction(LogAction)          → ActionLoop queue
         ├─ pushAction(BlocklistAddAction) → ActionLoop queue
         └─ pushAction(BlockTcpAction)     → ActionLoop queue

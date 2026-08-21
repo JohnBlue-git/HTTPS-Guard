@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -20,6 +21,9 @@
 #include "TlsVersionDetector.hpp"
 #include "PayloadAnomalyDetector.hpp"
 #include "CertAccessDetector.hpp"
+#include "ConnRateDetector.hpp"
+#include "SlowlorisDetector.hpp"
+#include "RenegotiationDetector.hpp"
 #include "CipherSuiteDetector.hpp"
 #include "SniDetector.hpp"
 #include "SslUprobeProgram.hpp"
@@ -42,6 +46,9 @@ struct runtime_config {
     std::string openssl_lib_path;
     std::string output_path;
     std::string expected_sni;
+    std::uint32_t rate_threshold      = 0;  /* 0 disables that rule */
+    std::uint32_t slowloris_threshold = 0;
+    std::uint32_t reneg_threshold     = 0;
 };
 
 // Composition root: this is the one place that knows about every concrete
@@ -73,6 +80,20 @@ https_guard::HttpGuardProgram::DetectorRegistry buildDetectorRegistry(
     std::vector<std::unique_ptr<https_guard::IDetector>> certAccessRules;
     certAccessRules.push_back(std::make_unique<https_guard::CertAccessDetector>());
     registry[HG_SOURCE_LSM_CERT_GUARD] = std::move(certAccessRules);
+
+    // Connection-rate events have no hook module: they are synthesised in
+    // userspace by ConnRateSweeper from the BPF counter map, then run through
+    // this same registry. See conn_rate.bpf.h for why the decision is not
+    // made in BPF.
+    // All three per-source rules share this source: the sweeper synthesises a
+    // different concrete event per rule, each carrying only its own
+    // capability, so first-match-wins picks the right one -- the others see an
+    // event without their capability and decline.
+    std::vector<std::unique_ptr<https_guard::IDetector>> perSourceRules;
+    perSourceRules.push_back(std::make_unique<https_guard::ConnRateDetector>());
+    perSourceRules.push_back(std::make_unique<https_guard::SlowlorisDetector>());
+    perSourceRules.push_back(std::make_unique<https_guard::RenegotiationDetector>());
+    registry[HG_SOURCE_CONN_RATE] = std::move(perSourceRules);
 
     return registry;
 }
@@ -120,6 +141,18 @@ int main(int argc, char** argv)
     if (argc > 5) {
         cfg.expected_sni = argv[5];
     }
+    // Optional: connection-rate threshold. 0 (and anything unparseable)
+    // leaves rate detection off, which is the safe default given a crossing
+    // is actionable and blocklists the source on every port.
+    if (argc > 6) {
+        cfg.rate_threshold = static_cast<std::uint32_t>(std::strtoul(argv[6], nullptr, 10));
+    }
+    if (argc > 7) {
+        cfg.slowloris_threshold = static_cast<std::uint32_t>(std::strtoul(argv[7], nullptr, 10));
+    }
+    if (argc > 8) {
+        cfg.reneg_threshold = static_cast<std::uint32_t>(std::strtoul(argv[8], nullptr, 10));
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -143,6 +176,11 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* After load, so the counter map exists to be swept. A zero threshold
+     * leaves this inert. */
+    program.enableRateSweeps(https_guard::ConnRateSweeper::Thresholds{
+        cfg.rate_threshold, cfg.slowloris_threshold, cfg.reneg_threshold});
+
     std::cerr << "HTTPS-Guard daemon started\n"
               << "  interface: " << cfg.iface << "\n"
               << "  ssl lib:   " << cfg.openssl_lib_path << "\n"
@@ -151,6 +189,11 @@ int main(int argc, char** argv)
               << "  expected SNI: "
               << (cfg.expected_sni.empty() ? "(unset — mismatch checking disabled)"
                                            : cfg.expected_sni)
+              << "\n"
+              << "  rate threshold: "
+              << (cfg.rate_threshold == 0
+                      ? std::string("(unset — connection-rate detection disabled)")
+                      : std::to_string(cfg.rate_threshold))
               << "\n";
 
     while (!g_stop) {

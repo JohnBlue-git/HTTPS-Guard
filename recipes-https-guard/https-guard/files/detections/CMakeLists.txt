@@ -1,7 +1,7 @@
 # Classify layer: the detection rules behind IDetector, the shared pipeline
 # vocabulary they and the hooks both speak (hg_event, Verdict,
 # hg_event_source, IHookModule, IPeerResolver), and DetectLoop -- the engine
-# that drives parse -> classify -> dispatch on its own thread.
+# that drives parse -> classify -> dispatch on its own Boost.Asio loop.
 #
 # DetectLoop lives here rather than under programs/ because it belongs to the
 # detection concern, not to any hook: it holds the detector registry, decides
@@ -22,6 +22,7 @@
 
 add_library(detections_lib OBJECT
     core/DetectLoop.cpp
+    conn_rate/ConnRateSweeper.cpp
 )
 
 target_include_directories(detections_lib
@@ -35,6 +36,13 @@ target_include_directories(detections_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/cipher_suite
     ${CMAKE_CURRENT_SOURCE_DIR}/sni
     ${CMAKE_CURRENT_SOURCE_DIR}/cert_access
+    ${CMAKE_CURRENT_SOURCE_DIR}/conn_rate
+    ${CMAKE_CURRENT_SOURCE_DIR}/slowloris
+    ${CMAKE_CURRENT_SOURCE_DIR}/renegotiation
+    # ConnRateSweeper reads the BPF counter map directly, and the map's
+    # layout header lives with the BPF program that maintains it.
+    ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
+    ${LIBBPF_INCLUDE_DIRS}
     ${nlohmann_json_INCLUDE_DIRS}
     ${BOOST_INCLUDE_DIR}
 )
