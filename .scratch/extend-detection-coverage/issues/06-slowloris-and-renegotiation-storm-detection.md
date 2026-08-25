@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Extend the OEM security event message registry
 
-**Status:** done — renegotiation rule not verified live (see Verification)
+**Status:** done — both rules now verified live at lowered thresholds; slowloris only intermittently reproducible through SLIRP (see Verification)
 
 - [x] **Resolve the stateful-detector question first.** Every existing `IDetector::evaluate` is `const` and touches nothing but the one `hg_event` it's given — that's what makes it trivially unit-testable and safe to run inline in the ring-buffer callback. Slowloris and renegotiation-storm detection both need to remember something *across* events (connection duration; ClientHello count per source over a window). Decide, and write down the reasoning: does `IDetector` grow a stateful variant (a non-`const evaluate`, or an internal mutable cache guarded appropriately for the daemon's threading model), or does a new, explicitly-stateful sibling interface exist alongside it so the existing contract's purity guarantee isn't quietly broken for every detector? Check the answer against `detectors/CLAUDE.md`'s stated intent for `IDetector` before committing to it.
 - [x] Connection-duration tracking (for Slowloris) is implemented using whatever mechanism the resolved architecture calls for, keyed per-connection (source IP + port, at minimum)
@@ -106,12 +106,24 @@ with `HttpsSlowlorisDetected` in the Redfish log. `BlockTcpAction` was
 correctly skipped — a Slowloris verdict is attributed to an address, not a
 single socket — so no misleading `SOCK_DESTROY failed` line was emitted.
 
-**Renegotiation storm: NOT verified live.** Every attempt to drive handshakes
-through the SLIRP port-forward failed to complete, because holding
-connections open to generate the Slowloris condition saturates the same
-forward. The rule is unit-tested and its counter is incremented from the
-existing, live-verified ClientHello path, but no end-to-end confirmation
-exists. Recorded in `LIMITATIONS.md` rather than implied to be tested.
+**Update — slowloris not reliably reproducible through SLIRP.** A later
+re-measurement in the same SLIRP setup could *not* reproduce the 5-held-open
+result above: holding 3 connections gave `open_conns=1`, and holding 8 gave
+`open_conns=0` with just 1 SYN reaching the guest. SLIRP does not forward held
+host connections to the guest consistently, so how many arrive is
+environment/timing/version-dependent. The original run happened, but treat
+SLIRP slowloris as unreliable — a real netdev or bridged/TAP network is the
+dependable way to exercise it.
+
+**Renegotiation storm: verified live at a lowered threshold.** The original
+attempt failed because it tried to drive handshakes by holding connections
+open (which saturates the forward). The insight that fixed it: a renegotiation
+storm is many handshakes on *one* connection, so the trigger now sends its
+`0x16` records down a single kept-alive socket. bmcweb RSTs the malformed
+stream after ~3 records, so one connection delivers ~3 countable records
+regardless of `--count` — enough to cross a threshold of 2, which fired with
+full enforcement and a measured 326s lockout (never the shipped 200). Still
+unit-tested besides. The SLIRP ceiling is recorded in `LIMITATIONS.md`.
 
 **Environment finding worth keeping:** holding as few as five connections
 open through QEMU SLIRP hostfwd saturates the forward and breaks SSH on the

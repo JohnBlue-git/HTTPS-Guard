@@ -27,9 +27,10 @@ Decided rather than asked. The ordering principle: **make the detection we alrea
 | done | 20 | `split-hooks-and-detectors` 01–04; `extend-detection-coverage` 01, 02, 03, 04, 05, 06, 07, 08, 09, 11, 12, 13, 14, 15, 16 |
 | remaining | 0 | — all tickets closed |
 
-Three "done" entries carry caveats worth knowing before trusting them:
+Four "done" entries carry caveats worth knowing before trusting them:
 
 - **03** — one criterion is unverifiable on this hardware, not merely undone: ARM32 has no BPF trampoline, so the LSM hook cannot attach at all and there is nothing there to observe declining to deny.
+- **06** — both new rules are verified live only at *lowered* thresholds, never the shipped defaults. Renegotiation fires (one-connection trigger, ~3 records vs a limit of 2). Slowloris is not reliably reproducible through a SLIRP hostfwd — an earlier run reached 5 held connections but a re-measurement saw only ~1 of 3–8 arrive at the guest; it needs a real netdev / bridged network to exercise dependably.
 - **13** — all original criteria met, but four follow-up questions were appended after the QEMU run. bmcweb's own fds during a live request were unix-domain/listening sockets, so uprobe-path enforcement may never resolve. Fail-closed is working; whether `/proc` is the right mechanism at all is now open.
 - **16** — done and verified, but its tests live in `tests/detectloop/` with a documented build command rather than in the CMake test target, because `DetectLoop.cpp` cannot be built by a test binary that is deliberately free of kernel dependencies. Wiring it into CMake is a real follow-up.
 

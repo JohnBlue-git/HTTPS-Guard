@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <chrono>
+#include <cstdint>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -14,18 +15,12 @@
 #include <memory>
 #include <string>
 
+#include "BpfProgram.hpp"
+#include "DetectLoop.hpp"
 #include "HttpGuardProgram.hpp"
 #include "hg_event_source.h"
 #include "core/ActionLoop.hpp"
 #include "log/LogAction.hpp"
-#include "TlsVersionDetector.hpp"
-#include "PayloadAnomalyDetector.hpp"
-#include "CertAccessDetector.hpp"
-#include "ConnRateDetector.hpp"
-#include "SlowlorisDetector.hpp"
-#include "RenegotiationDetector.hpp"
-#include "CipherSuiteDetector.hpp"
-#include "SniDetector.hpp"
 #include "SslUprobeProgram.hpp"
 #include "XdpTlsProgram.hpp"
 #include "LsmCertGuardProgram.hpp"
@@ -52,63 +47,21 @@ struct runtime_config {
 };
 
 // Composition root: this is the one place that knows about every concrete
-// detector. Ordering within each source's vector is the priority order —
-// first match wins — so the more severe/specific rules come first.
-https_guard::HttpGuardProgram::DetectorRegistry buildDetectorRegistry(
+// hook module. HttpGuardProgram only ever sees them through BpfProgram —
+// adding a new hook means adding one line here, not touching
+// HttpGuardProgram's attach or dispatch logic.
+//
+// Each hook owns the detections it can feed and submits them with every record,
+// so a new *detection* means one new directory under detections/ and one entry
+// in that hook's list — not a change here and not a registry.
+std::vector<std::unique_ptr<https_guard::BpfProgram>> buildHookModules(
+    const std::string& openssl_lib_path, unsigned int ifindex,
     const std::string& expected_sni)
 {
-    auto sharedRules = [](std::vector<std::unique_ptr<https_guard::IDetector>>& rules) {
-        rules.push_back(std::make_unique<https_guard::TlsVersionDetector>());
-        rules.push_back(std::make_unique<https_guard::PayloadAnomalyDetector>());
-    };
-
-    https_guard::HttpGuardProgram::DetectorRegistry registry;
-
-    std::vector<std::unique_ptr<https_guard::IDetector>> uprobeRules;
-    sharedRules(uprobeRules);
-    registry[HG_SOURCE_UPROBE] = std::move(uprobeRules);
-
-    // XDP additionally gets the ClientHello-derived rules: only this hook
-    // sees ClientHello bytes at all, so registering them elsewhere would
-    // just evaluate permanently-empty fields.
-    std::vector<std::unique_ptr<https_guard::IDetector>> xdpRules;
-    sharedRules(xdpRules);
-    xdpRules.push_back(std::make_unique<https_guard::CipherSuiteDetector>());
-    xdpRules.push_back(std::make_unique<https_guard::SniDetector>(expected_sni));
-    registry[HG_SOURCE_XDP] = std::move(xdpRules);
-
-    std::vector<std::unique_ptr<https_guard::IDetector>> certAccessRules;
-    certAccessRules.push_back(std::make_unique<https_guard::CertAccessDetector>());
-    registry[HG_SOURCE_LSM_CERT_GUARD] = std::move(certAccessRules);
-
-    // Connection-rate events have no hook module: they are synthesised in
-    // userspace by ConnRateSweeper from the BPF counter map, then run through
-    // this same registry. See conn_rate.bpf.h for why the decision is not
-    // made in BPF.
-    // All three per-source rules share this source: the sweeper synthesises a
-    // different concrete event per rule, each carrying only its own
-    // capability, so first-match-wins picks the right one -- the others see an
-    // event without their capability and decline.
-    std::vector<std::unique_ptr<https_guard::IDetector>> perSourceRules;
-    perSourceRules.push_back(std::make_unique<https_guard::ConnRateDetector>());
-    perSourceRules.push_back(std::make_unique<https_guard::SlowlorisDetector>());
-    perSourceRules.push_back(std::make_unique<https_guard::RenegotiationDetector>());
-    registry[HG_SOURCE_CONN_RATE] = std::move(perSourceRules);
-
-    return registry;
-}
-
-// Composition root: this is the one place that knows about every concrete
-// hook module. HttpGuardProgram only ever sees them through IHookModule —
-// adding a new hook (e.g. an LSM cert-access guard) means adding one line
-// here, not touching HttpGuardProgram's attach or dispatch logic.
-std::vector<std::unique_ptr<https_guard::IHookModule>> buildHookModules(
-    const std::string& openssl_lib_path, unsigned int ifindex)
-{
-    std::vector<std::unique_ptr<https_guard::IHookModule>> hooks;
+    std::vector<std::unique_ptr<https_guard::BpfProgram>> hooks;
     hooks.push_back(std::make_unique<https_guard::SslUprobeProgram>(openssl_lib_path));
-    hooks.push_back(std::make_unique<https_guard::XdpTlsProgram>(ifindex));
-    hooks.push_back(std::make_unique<https_guard::LsmCertGuardProgram>());
+    hooks.push_back(std::make_unique<https_guard::XdpTlsProgram>(ifindex, expected_sni));
+    hooks.push_back(std::make_unique<https_guard::LsmCertGuardProgram>("/usr/bin/bmcweb"));
     return hooks;
 }
 
@@ -164,13 +117,24 @@ int main(int argc, char** argv)
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
+    /* The program owns the hooks, the BPF object and the ring buffer. Each hook
+     * owns its own detections; nothing here needs to know what they are. */
     https_guard::HttpGuardProgram program(
         cfg.bpf_object_path,
+        buildHookModules(cfg.openssl_lib_path,
+                         if_nametoindex(cfg.iface.c_str()),
+                         cfg.expected_sni));
+
+    /* Configure the pipeline before anything can feed it. The loop is a
+     * singleton whose threads are already running by now, and it refuses (and
+     * counts) records submitted before this point -- but polling only starts
+     * below, so nothing can arrive early in practice. */
+    https_guard::DetectLoop& detect_loop = https_guard::DetectLoop::getInstance();
+    detect_loop.configure(
         action_loop,
-        buildHookModules(cfg.openssl_lib_path, if_nametoindex(cfg.iface.c_str())),
         std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl),
-        cfg.output_path,
-        buildDetectorRegistry(cfg.expected_sni));
+        cfg.output_path);
+
     if (!program.loadFilter()) {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;
@@ -206,5 +170,9 @@ int main(int argc, char** argv)
         }
     }
 
+    /* Stop the pipeline explicitly, while the BPF object and the hooks it owns
+     * are still alive. Leaving it to static destruction would run the worker
+     * threads' teardown after main's locals are gone. */
+    detect_loop.stop();
     return 0;
 }

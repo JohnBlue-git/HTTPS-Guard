@@ -3,9 +3,7 @@
 #include <optional>
 #include <string>
 
-#include "IDetector.hpp"
-#include "hg_event.hpp"
-#include "ICertAccessInfo.hpp"
+#include "CertAccessEvent.hpp"
 #include "Verdict.hpp"
 
 namespace https_guard {
@@ -24,28 +22,23 @@ namespace https_guard {
  * didn't, in shadow mode — synchronously in the BPF hook itself, before
  * this detector ever ran.
  */
-class CertAccessDetector final : public IDetector {
+class CertAccessDetector {
 public:
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const CertAccessEvent& evt) const
     {
-        const auto* cert = dynamic_cast<const ICertAccessInfo*>(&evt);
-        if (cert == nullptr) {
-            return std::nullopt;  // not a certificate-access event
-        }
-
-        if (!cert->identityMismatch()) {
+        if (!evt.identity_mismatch) {
             return std::nullopt;
         }
 
         Verdict verdict;
         verdict.severity   = "Critical";
         verdict.message_id = "OemSecurityEvent.1.0.HttpsCertificateAccessViolation";
-        verdict.message    = "Security violation: process '" + evt.process +
-                             "' (PID " + std::to_string(evt.pid) +
-                             ", real executable '" + cert->realExePath() +
-                             "', cgroup " + std::to_string(cert->cgroupId()) +
+        verdict.message    = "Security violation: process '" + evt.meta.process +
+                             "' (PID " + std::to_string(evt.meta.pid) +
+                             ", real executable '" + evt.real_exe_path +
+                             "', cgroup " + std::to_string(evt.cgroup_id) +
                              ") accessed the BMC's HTTPS certificate/key file; expected only bmcweb to do so." +
-                             (cert->shadowMode()
+                             (evt.shadow_mode
                                   ? " Shadow mode: access was observed but not blocked."
                                   : " Access was denied.");
         verdict.actionable = false;

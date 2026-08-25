@@ -43,6 +43,37 @@ unrecognised process read the HTTPS private key; it cannot prevent it. On a
 platform with trampoline support the hook attaches, but its deny branch is
 still gated on a spoofable `comm` check and should not be enabled as-is.
 
+## Tooling: no `bpftool` on the target, and it will not build for ARM32
+
+The image ships **no `bpftool`**, deliberately. The stock recipe cannot build
+for this machine, and the one operational need it would serve is already met by
+the daemon's design — so installing it was considered and declined, not
+overlooked.
+
+- **It is architecture-gated out.** `meta-oe`'s `bpftool.bb` declares
+  `COMPATIBLE_HOST = "(x86_64|aarch64|riscv64).*-linux"`. The AST2600 is
+  32-bit ARMv7 (`DEFAULTTUNE = "armv7ahf-vfpv4d16"`), so BitBake skips the
+  recipe for the `johnblue` machine as incompatible. Installing it would mean a
+  `.bbappend` forcing `COMPATIBLE_HOST` to include `arm`; the upstream
+  exclusion signals that ARM32 is unvalidated, so that override risks a
+  cross-compile failure, and even a working binary could not back the features
+  that depend on the JIT (e.g. dumping jited code) — the ARM32 BPF JIT is
+  incomplete, the same gap that stops the certificate guard attaching (above).
+- **The need it would meet is already gone.** The historical reason to want it
+  on-target was to detach a leaked XDP program after a crash, because BusyBox's
+  `ip` cannot. That is no longer necessary: the daemon's XDP attachment is
+  `bpf_link`-owned, so the kernel releases it automatically when the process
+  exits, including on `SIGKILL`. There is nothing left to detach by hand.
+- **Inspection has substitutes.** The one thing an operator routinely inspects
+  — the per-source connection counters — the daemon prints itself
+  (`per-source counters: …`). For deeper introspection, run `bpftool` from an
+  **x86_64 host** in a bridged/TAP setup, where it builds and runs normally,
+  rather than putting a multi-MB debug binary on the BMC's ~64 MB flash.
+
+Consequence: any command in [README.md](README.md) that runs `bpftool` on the
+BMC — the deployment and troubleshooting verification steps — assumes a tool
+the image does not carry. Treat those as host-side or bridged-debugging steps.
+
 ## Detection coverage
 
 - **Payload inspection is capped at 127 bytes per call.** A signature that

@@ -114,8 +114,12 @@ hg_ch_u16(const unsigned char *base, uint32_t off, const unsigned char *end, uin
     return 1;
 }
 
+/* Takes the ClientHello sub-struct rather than the whole xdp_event, so it
+ * is structurally incapable of touching the header, the connection tuple or
+ * the TLS fields the caller already filled in. That used to rest on
+ * reviewer discipline; now it rests on the type. */
 HG_CH_INLINE void
-parse_client_hello_detail(struct xdp_event *evt,
+parse_client_hello_detail(struct hg_client_hello *out,
                           const unsigned char *ch,
                           const unsigned char *end)
 {
@@ -133,7 +137,7 @@ parse_client_hello_detail(struct xdp_event *evt,
     if (!hg_ch_u8(ch, off, end, &sid_len))
         return;
     if (sid_len > 32) {          /* RFC 8446: max 32 */
-        evt->sni_malformed = 1;
+        out->sni_malformed = 1;
         return;
     }
     off += 1 + sid_len;
@@ -144,11 +148,11 @@ parse_client_hello_detail(struct xdp_event *evt,
     off += 2;
 
     if (cs_len == 0 || (cs_len & 1)) {  /* must be a non-zero multiple of 2 */
-        evt->sni_malformed = 1;
+        out->sni_malformed = 1;
         return;
     }
 
-    evt->cipher_suites_offered = (uint16_t)(cs_len / 2);
+    out->cipher_suites_offered = (uint16_t)(cs_len / 2);
 
     HG_UNROLL
     for (int i = 0; i < HG_MAX_CIPHER_SUITES; i++) {
@@ -157,10 +161,10 @@ parse_client_hello_detail(struct xdp_event *evt,
             break;
         if (!hg_ch_u16(ch, off + (uint32_t)(i * 2), end, &suite))
             break;
-        evt->cipher_suites[i] = (uint16_t)suite;
+        out->cipher_suites[i] = (uint16_t)suite;
         captured++;
     }
-    evt->cipher_suite_count = (uint16_t)captured;
+    out->cipher_suite_count = (uint16_t)captured;
 
     /* Bound before advancing past the full list — a client offering more
      * than 256 suites (512 bytes) is well past anything legitimate, and
@@ -173,7 +177,7 @@ parse_client_hello_detail(struct xdp_event *evt,
     if (!hg_ch_u8(ch, off, end, &comp_len))
         return;
     if (comp_len > 16) {
-        evt->sni_malformed = 1;
+        out->sni_malformed = 1;
         return;
     }
     off += 1 + comp_len;
@@ -213,13 +217,13 @@ parse_client_hello_detail(struct xdp_event *evt,
         if (!hg_ch_u16(ch, off, end, &list_len) ||
             !hg_ch_u8(ch, off + 2, end, &ntype) ||
             !hg_ch_u16(ch, off + 3, end, &nlen)) {
-            evt->sni_malformed = 1;
+            out->sni_malformed = 1;
             return;
         }
 
         /* name_type 0 == host_name is the only type ever defined */
         if (ntype != 0 || nlen == 0 || list_len < nlen + 3) {
-            evt->sni_malformed = 1;
+            out->sni_malformed = 1;
             return;
         }
 
@@ -232,14 +236,14 @@ parse_client_hello_detail(struct xdp_event *evt,
                 break;
             if (!hg_ch_u8(ch, off + (uint32_t)k, end, &c))
                 break;
-            evt->sni_hostname[k] = (char)c;
+            out->sni_hostname[k] = (char)c;
             n++;
         }
 
         if (n > HG_SNI_LEN - 1)
             n = HG_SNI_LEN - 1;
-        evt->sni_hostname[n] = '\0';
-        evt->sni_present = (n > 0) ? 1 : 0;
+        out->sni_hostname[n] = '\0';
+        out->sni_present = (n > 0) ? 1 : 0;
 
         /* Fewer bytes captured than the name declared — either it exceeded
          * HG_SNI_LEN, or the packet ended mid-name. Either way the captured
@@ -249,7 +253,7 @@ parse_client_hello_detail(struct xdp_event *evt,
          * has nothing to do with. Flagging it malformed is what stops that
          * from becoming a mismatch-check bypass. */
         if (n < nlen)
-            evt->sni_malformed = 1;
+            out->sni_malformed = 1;
 
         return;
     }

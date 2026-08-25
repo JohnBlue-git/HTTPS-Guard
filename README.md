@@ -69,11 +69,11 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 │  │              https-guardd daemon                         │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
 │  │  │ poll thread: ring_buffer__poll()                   │  │  │
-│  │  │   → copy record, post, return (nothing else)       │  │  │
+│  │  │   → find owning hook, its ringBufferHandler()      │  │  │
+│  │  │     submits the record + its detection list        │  │  │
 │  │  ├──────────────── thread boundary ───────────────────┤  │  │
 │  │  │ DetectLoop (Boost.Asio io_context, 2 threads):     │  │  │
-│  │  │   → find owning IHookModule, parseEvent()          │  │  │
-│  │  │   → run detectors_[source] → Verdict               │  │  │
+│  │  │   → walk the list, first verdict wins:             │  │  │
 │  │  │     • TlsVersionDetector    (< TLS 1.2)            │  │  │
 │  │  │     • PayloadAnomalyDetector (SQLi/traversal)      │  │  │
 │  │  │     • CipherSuiteDetector   (weak suites, alert)   │  │  │
@@ -117,7 +117,7 @@ meta-https-guard/
 │   └── files/                        # Source tree — see DESIGN.md for full details
 ├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
 ├── recipes-bmcweb/bmcweb/            # bmcweb OemSecurityEvent schema append
-├── scripts/qemu-setup-tap.sh         # Host bridge / TAP / NAT setup for QEMU testing
+├── scripts/qemu-bridge/qemu-setup-tap.sh # Host bridge / TAP / NAT setup for QEMU testing
 └── manifest/main.xml                 # Repo manifest
 ```
 
@@ -127,15 +127,15 @@ The source under `files/` is organized around the **Detect → Classify → Disp
 
 | Component | Path | Role |
 |-----------|------|------|
-| **Detect** | `programs/` | Attaches BPF hooks and parses their raw events. Three hooks implement `IHookModule`: `ssl_uprobe/` (uprobes on `SSL_write()` **and** `SSL_read()`, PRIMARY), `xdp_tls/` (ClientHello inspection, blocklist enforcement, and the per-source connection counters, AUXILIARY), and `lsm_cert_guard/` (BPF-LSM on the HTTPS key — cannot attach on ARM32, see [LIMITATIONS.md](LIMITATIONS.md)). Each hook splits into `ebpf/` and `src/`; `core/` holds the BPF lifecycle wrapper and `HttpGuardProgram`, whose callback now only copies and enqueues |
-| **Classify** | `detections/` | Every classification rule behind `IDetector`, plus `core/DetectLoop` — the worker thread that owns parse → classify → dispatch. Eight rules: `tls_version/`, `payload_anomaly/`, `cipher_suite/`, `sni/`, `cert_access/`, `conn_rate/`, `slowloris/`, `renegotiation/`. Hook-specific event data is reached through capability interfaces in `core/`, so no rule depends on a hook. The three counting rules are stateful without any stateful detector — their state lives in a BPF map that `ConnRateSweeper` aggregates |
+| **Detect** | `programs/` | Attaches BPF hooks and hands raw records over — no parsing, no rules. Three hooks derive from `BpfProgram`: `ssl_uprobe/` (uprobes on `SSL_write()` **and** `SSL_read()`, PRIMARY), `xdp_tls/` (ClientHello inspection, blocklist enforcement, and the per-source connection counters, AUXILIARY), and `lsm_cert_guard/` (BPF-LSM on the HTTPS key — cannot attach on ARM32, see [LIMITATIONS.md](LIMITATIONS.md)). Each hook splits into `ebpf/` and `src/`; `core/` holds `BpfProgram` and `HttpGuardProgram`, which owns the one object, ring buffer and poll loop |
+| **Classify** | `detections/` | Eight detections, one directory each, every one holding its own event struct, its parse, its rule and its `DESIGN.md`: `tls_version/`, `payload_anomaly/`, `cipher_suite/`, `sni/`, `cert_access/`, `conn_rate/`, `slowloris/`, `renegotiation/`. Plus `core/` — the `IDetection` seam, `EventMeta`, and `DetectLoop`, which walks a submitted list and knows nothing about events. The three counting detections are stateful without any stateful rule: their state lives in a BPF map that `ConnRateSweeper` aggregates |
 | **Dispatch** | `actions/` | Three async countermeasures run through `ActionLoop`: `log/` (file write), `tcp/` (SOCK_DESTROY via Netlink), `blocklist/` (BPF map update) |
 | **Tests** | `tests/` | doctest-based unit tests for the `detections/` layer and the real parsers — no kernel/BPF/root/QEMU dependency |
 | **Event bridge** | `service/https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
 **Which rules enforce:** the blocklist applies to a source address on *every* port, so an actionable false positive removes all access to the BMC for the blocklist TTL. TLS-version, payload-anomaly and the three counting rules enforce; cipher-suite, SNI and certificate-access alert only. The reasoning is in `detections/CLAUDE.md`, and it is worth reading before changing a rule's `actionable` flag.
 
-> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md). Per-hook detection rationale and diagrams live in `programs/ssl_uprobe/DESIGN.md`, `programs/xdp_tls/DESIGN.md` and `programs/lsm_cert_guard/DESIGN.md`. Known gaps and unverified claims: [LIMITATIONS.md](LIMITATIONS.md).
+> For build system internals, the raw event ABI, and the security-model rationale, see [DESIGN.md](DESIGN.md). One level down, every unit documents itself: `detections/<family>/DESIGN.md` per detection (why detect it, how, how to protect, what to hook), `actions/<kind>/DESIGN.md` per countermeasure, plus a layer document each for `programs/`, `detections/` and `actions/`. Known gaps and unverified claims: [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Building HTTPS-Guard
 
@@ -177,16 +177,22 @@ bitbake https-guard-openbmc
 `https-guard-openbmc`'s behavior is controlled by `PACKAGECONFIG`, set per-recipe in your build's `conf/local.conf` (or a distro/machine conf). The default is:
 
 ```
-PACKAGECONFIG:pn-https-guard-openbmc ?= "simulation event-both"
+PACKAGECONFIG:pn-https-guard-openbmc ?= "daemon event-both"
 ```
 
 **Service selection** — which systemd services get built/enabled (pick one):
 
 | Flag | Effect |
 |------|--------|
-| `simulation` (default) | Enables `simulated-event-generator`, disables the real eBPF daemon. No kernel eBPF/XDP or BPF toolchain required — good for a first QEMU boot. |
-| `daemon` | Enables the real `https-guardd` (uprobe + optional XDP), disables the simulator. Requires a kernel with `CONFIG_BPF`/`CONFIG_UPROBE_EVENTS` (and `CONFIG_NET_XDP` for XDP). |
+| `daemon` **(default)** | Enables the real `https-guardd` (uprobe + optional XDP), disables the simulator. Requires a kernel with `CONFIG_BPF`/`CONFIG_UPROBE_EVENTS` (and `CONFIG_NET_XDP` for XDP — its absence is non-fatal, the daemon runs uprobe-only). Also turns the BPF object build on, which needs a target kernel built with `CONFIG_DEBUG_INFO_BTF`. |
+| `simulation` | Enables `simulated-event-generator` instead, disables the real daemon. No kernel eBPF/XDP support and no BPF toolchain required — the fallback for a machine whose kernel lacks BTF. |
 | `both` | Enables both, for comparing real vs. simulated events side by side. |
+
+> The default is `daemon` because the daemon is the point of the layer: shipping
+> the simulator by default meant a first boot looked like it was working while
+> detecting nothing real. The trade is that the default build now requires a
+> BTF-carrying kernel, where it previously skipped BPF entirely — see the flag
+> table above for the fallback.
 
 **Event delivery mode** — how events reach Redfish EventService subscribers (pick one):
 
@@ -231,8 +237,8 @@ The helper script creates `br-httpsguard` (`192.168.200.1/24`), attaches `tap-ht
 
 ```bash
 cd /path/to/HTTPS-Guard
-sudo ./meta-https-guard/scripts/qemu-setup-tap.sh destroy
-sudo ./meta-https-guard/scripts/qemu-setup-tap.sh create
+sudo ./meta-https-guard/scripts/qemu-bridge/qemu-setup-tap.sh destroy
+sudo ./meta-https-guard/scripts/qemu-bridge/qemu-setup-tap.sh create
 ```
 
 Expected output ends with:
@@ -314,7 +320,7 @@ runqemu johnblue nographic slirp
 journalctl -u https-guard-daemon -l | grep "enforcement active"
 # "https_guard: enforcement active via N of M hook(s)" — N/M depends on
 # what actually attached on your kernel; it is not hardcoded to any
-# specific hook combination (see programs/core/HttpGuardProgram.cpp).
+# specific hook combination (see programs/core/src/HttpGuardProgram.cpp).
 ```
 
 ### Port Forwarding Limitations
@@ -577,7 +583,7 @@ Two things to get right before any of this works:
 | `HttpsTrafficObserved` | Any clean HTTPS request — the no-rule-matched fallback | no | ✅ yes |
 | `HttpsConnectionRateViolation` | More than `HTTPS_GUARD_RATE_THRESHOLD` connections per 10s (§ [Volumetric](#volumetric-rate-slowloris-renegotiation)) | **yes** | ⚠ mechanism only |
 | `HttpsSlowlorisDetected` | Hold more than `HTTPS_GUARD_SLOWLORIS_THRESHOLD` connections open | **yes** | ⚠ lowered threshold |
-| `HttpsTlsRenegotiationStorm` | More than `HTTPS_GUARD_RENEG_THRESHOLD` handshakes per 10s | **yes** | ❌ no |
+| `HttpsTlsRenegotiationStorm` | More than `HTTPS_GUARD_RENEG_THRESHOLD` handshakes per 10s | **yes** | ⚠ lowered threshold |
 | `HttpsCertificateAccessViolation` | Read the HTTPS private key as any process other than `bmcweb` | no | ❌ cannot attach on ARM32 |
 
 `⚠` and `❌` are explained under [Verification status](#verification-status) —
@@ -585,7 +591,7 @@ they are limits of the test environment and the platform, not of the rules.
 
 ### The trigger helper
 
-`scripts/trigger/send_client_hello.py` builds TLS ClientHellos by hand,
+`scripts/trigger/trigger_detections.py` builds TLS ClientHellos by hand,
 because the three ClientHello-fed rules **cannot be driven with a normal
 client**: OpenSSL 3.x refuses to offer RC4 or TLS 1.0 at all, and
 `curl --tlsv1.0` is silently ignored. It sends one record and closes, which is
@@ -593,13 +599,13 @@ all XDP needs — no handshake ever completes.
 
 ```bash
 # From the HOST, not the guest.
-scripts/trigger/send_client_hello.py --list
+scripts/trigger/trigger_detections.py --list
 
 # SLIRP: use the forwarded HTTPS port that runqemu printed (often 4433/4434)
-scripts/trigger/send_client_hello.py weak_rc4 --port 4434
+scripts/trigger/trigger_detections.py weak_rc4 --port 4434
 
 # Bridge mode: go straight at the guest
-scripts/trigger/send_client_hello.py weak_rc4 --host 192.168.100.2 --port 443
+scripts/trigger/trigger_detections.py weak_rc4 --host 192.168.100.2 --port 443
 ```
 
 Wait for the daemon to finish attaching before sending anything — startup takes
@@ -648,7 +654,7 @@ bmcweb receiving the same bytes. That one usually declines to enforce
 **Enforcing.** This will blocklist the sender.
 
 ```bash
-scripts/trigger/send_client_hello.py legacy_tls10 --port 4434
+scripts/trigger/trigger_detections.py legacy_tls10 --port 4434
 ```
 
 ```
@@ -674,10 +680,10 @@ does not parse. It catches genuinely old clients, which have no such fallback.
 Alert-only, so this is safe to run against your own host.
 
 ```bash
-scripts/trigger/send_client_hello.py weak_rc4  --port 4434   # RC4 among modern suites
-scripts/trigger/send_client_hello.py weak_3des --port 4434   # 3DES
-scripts/trigger/send_client_hello.py weak_null --port 4434   # NULL encryption
-scripts/trigger/send_client_hello.py clean     --port 4434   # control: expect HttpsTrafficObserved
+scripts/trigger/trigger_detections.py weak_rc4  --port 4434   # RC4 among modern suites
+scripts/trigger/trigger_detections.py weak_3des --port 4434   # 3DES
+scripts/trigger/trigger_detections.py weak_null --port 4434   # NULL encryption
+scripts/trigger/trigger_detections.py clean     --port 4434   # control: expect HttpsTrafficObserved
 ```
 
 The table covers NULL encryption, EXPORT-grade, RC4, single-DES, 3DES and
@@ -693,8 +699,8 @@ Alert-only. Two independent paths, and **both are verified**.
 Malformed SNI fires unconditionally — no configuration needed:
 
 ```bash
-scripts/trigger/send_client_hello.py bad_sni       --port 4434   # unknown name_type
-scripts/trigger/send_client_hello.py truncated_sni --port 4434   # declared length > record
+scripts/trigger/trigger_detections.py bad_sni       --port 4434   # unknown name_type
+scripts/trigger/trigger_detections.py truncated_sni --port 4434   # declared length > record
 ```
 
 Hostname mismatch fires **only** when an expected name is configured:
@@ -709,7 +715,7 @@ systemctl restart https-guard-daemon
 ```
 
 ```bash
-scripts/trigger/send_client_hello.py other_sni --port 4434
+scripts/trigger/trigger_detections.py other_sni --port 4434
 ```
 
 ```
@@ -752,9 +758,16 @@ That produced `per-source counters: 1 source(s); busiest 151 attempts` — 150
 connections plus the SSH session, which is a useful sanity check that the
 counter is keyed the way you think it is.
 
-For Slowloris, hold connections open instead of closing them. For a
-renegotiation storm, send repeated ClientHellos on new connections
-(`send_client_hello.py clean` in a loop).
+For Slowloris, `trigger_detections.py slowloris` holds connections open — but
+this is unreliable through a SLIRP hostfwd: an earlier run reached 5 held
+connections (below), yet a re-measurement saw only ~1 of 3–8 arrive as
+guest-side `open_conns`. SLIRP does not forward held host connections to the
+guest consistently, so exercise this rule on a real netdev or a bridged/TAP
+network for a dependable result. For a renegotiation storm,
+`trigger_detections.py renegotiation` sends repeated handshake records on **one**
+connection (a storm is many handshakes on a single connection, not one each);
+bmcweb RSTs the stream after ~3 records, so set `HTTPS_GUARD_RENEG_THRESHOLD`
+below that to see it fire.
 
 **Reading the counter line is harder than it should be.** It goes to
 `std::cout`, which journald makes block-buffered, so it arrives in ~4KB batches
@@ -815,9 +828,9 @@ tests cover. The weaker claim is recorded as the weaker claim.
 | `TlsVersionDetector` | ✅ verified live via XDP. The uprobe path is unreachable on this image — OpenSSL 3.x will not negotiate below TLS 1.2 |
 | `CipherSuiteDetector` | ✅ verified live |
 | `SniDetector` | ✅ verified live — malformed *and* hostname-mismatch |
-| `SlowlorisDetector` | ⚠ verified live at a **lowered** threshold (5 connections against a limit of 3). Not at the shipped default of 100 |
+| `SlowlorisDetector` | ⚠ verified live once at a **lowered** threshold (5 connections against a limit of 3, SLIRP), not at the shipped default of 100. **Not reliably reproducible through a SLIRP hostfwd:** a re-measurement saw only ~1 of 3–8 held host connections arrive as guest-side `open_conns` — SLIRP does not forward held connections consistently. Exercise on a real netdev or bridged/TAP network for a dependable result |
 | `ConnRateDetector` | ⚠ mechanism verified; the shipped default of 500/10s was never exceeded, because SLIRP will not propagate a fast enough burst (~456 in 6s was the ceiling) |
-| `RenegotiationDetector` | ❌ never confirmed end to end. Driving handshakes needs connections held open, and that saturates the same SLIRP forward. Unit-tested, and its counter increments from the live-verified ClientHello path |
+| `RenegotiationDetector` | ⚠ verified live at a **lowered** threshold (2–3 handshake records on one connection against a limit of 2; full enforcement and a measured 326s lockout). bmcweb RSTs the malformed record stream after ~3 records, so the shipped default of 200 is not reachable through SLIRP. Sending the records on *one* connection, not one connection each, is what makes it reachable at all |
 | `CertAccessDetector` | ❌ unreachable on ARM32 — see above |
 
 ### Test-environment caveats
@@ -841,7 +854,11 @@ Every one of these cost real debugging time before being understood.
 - **The target image has no `bpftool`, and its BusyBox `ip` cannot detach XDP.**
   A leaked XDP attachment used to need a reboot; attachments are now
   `bpf_link`-owned and released by the kernel on process exit, including on
-  `SIGKILL`.
+  `SIGKILL`. `bpftool` is not installed and cannot be cleanly built for this
+  ARM32 target — the reasoning, and why it is not needed, is in
+  [LIMITATIONS.md](LIMITATIONS.md#tooling-no-bpftool-on-the-target-and-it-will-not-build-for-arm32).
+  The `bpftool` commands in the deployment and troubleshooting steps below are
+  therefore host-side / bridged-debugging steps, not on-BMC commands.
 
 ## Platform Support
 

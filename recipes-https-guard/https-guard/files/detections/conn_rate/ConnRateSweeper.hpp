@@ -6,9 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ConnRateEvent.hpp"
-#include "RenegotiationEvent.hpp"
-#include "SlowlorisEvent.hpp"
+#include "rate_sources.hpp"
 
 namespace https_guard {
 
@@ -40,18 +38,19 @@ public:
     ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept;
 
     /**
-     * Returns one event per source currently over the threshold.
+     * Reads the counters and classifies anything over its limit, dispatching
+     * verdicts through `ctx`.
      *
-     * Reports each window at most once per source: a flood produces a
-     * sustained overage, and re-emitting every sweep would bury the log and
-     * re-run enforcement against an address already blocklisted.
+     * Reports each window at most once per source: a flood produces a sustained
+     * overage, and re-emitting every sweep would bury the log and re-run
+     * enforcement against an address already blocklisted.
+     *
+     * Dispatches directly rather than returning events, because the three rules
+     * produce three unrelated concrete types and there is no longer a common
+     * base to return them as -- which is the point: each type carries only its
+     * own counter, so no rule can read another's.
      */
-    /**
-     * One event per rule per source currently over its limit. Returned as
-     * the common base because the three rules produce different concrete
-     * types, each carrying only the capability its own detector reads.
-     */
-    std::vector<std::unique_ptr<hg_event>> sweep() noexcept;
+    void sweep(const DispatchContext& ctx) noexcept;
 
     bool enabled() const noexcept
     {

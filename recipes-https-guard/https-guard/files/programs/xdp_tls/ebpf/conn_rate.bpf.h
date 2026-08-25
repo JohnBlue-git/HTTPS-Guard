@@ -23,8 +23,8 @@
  * Second, keeping the decision in userspace means the counters need no
  * BPF->userspace event channel at all: the daemon sweeps this map on a timer
  * and synthesises its own event. That avoids either bolting rate fields onto
- * xdp_event (the god-object problem just removed from hg_event) or changing
- * IHookModule so one hook can emit several event kinds.
+ * xdp_event (the god-object problem the event types were split to avoid) or
+ * changing BpfProgram so one hook can emit several event kinds.
  *
  * The cost is that enforcement waits for the next sweep rather than acting
  * on the offending packet. For *sustained* abuse -- which is what this

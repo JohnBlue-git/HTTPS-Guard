@@ -3,16 +3,26 @@
 #include <iostream>
 #include <utility>
 
-/* Explicit now that IHookModule.hpp forward-declares bpf_object/bpf_link
+/* Explicit now that BpfProgram.hpp forward-declares bpf_object/bpf_link
  * instead of including libbpf -- the hooks are where libbpf is actually
  * used, so this is where the dependency belongs. */
 #include <bpf/libbpf.h>
 
+#include <cstddef>   // offsetof, for the ABI static_asserts below
+#include "DetectLoop.hpp"
 #include "SslUprobeProgram.hpp"
+#include "event_meta.hpp"
 #include "ssl_uprobe_event.h"
 #include "proc_peer_resolver.hpp"
-#include "parse_uprobe_event.hpp"
-#include "uprobe_hg_event.hpp"
+
+/* DetectLoop::process() reads a uint32 at offset 0 of the raw record to find
+ * the owning hook, before it knows the type. Nesting hg_event_hdr must not
+ * move that, so pin it here rather than trusting that nobody reorders the
+ * members. */
+static_assert(offsetof(struct uprobe_event, hdr) == 0,
+              "hg_event_hdr must be the first member of uprobe_event");
+static_assert(offsetof(struct hg_event_hdr, event_source) == 0,
+              "event_source must be the first member of hg_event_hdr");
 
 static_assert(sizeof(struct uprobe_event) <= HG_MAX_RAW_EVENT_SIZE,
               "uprobe_event outgrew HG_MAX_RAW_EVENT_SIZE; raise the cap in "
@@ -20,8 +30,15 @@ static_assert(sizeof(struct uprobe_event) <= HG_MAX_RAW_EVENT_SIZE,
 
 namespace https_guard {
 
+void SslUprobeProgram::ringBufferHandler(const void* data, std::size_t size) noexcept
+{
+    DetectLoop::getInstance().submit(data, size, detections_);
+}
+
+
 SslUprobeProgram::SslUprobeProgram(std::string openssl_lib_path) noexcept
-    : openssl_lib_path_(std::move(openssl_lib_path))
+    : BpfProgram("ssl_uprobe")
+    , openssl_lib_path_(std::move(openssl_lib_path))
 {
 }
 
@@ -92,37 +109,8 @@ hg_event_source SslUprobeProgram::eventSource() const noexcept
     return HG_SOURCE_UPROBE;
 }
 
-std::unique_ptr<hg_event> SslUprobeProgram::parseEvent(const void* data, size_t size) const noexcept
-{
-    if (size < sizeof(struct uprobe_event)) {
-        std::cerr << "https_guard: uprobe event too small: " << size << " bytes\n";
-        return nullptr;
-    }
 
-    const auto* raw = static_cast<const struct uprobe_event*>(data);
-
-    auto owned = std::make_unique<UprobeEvent>();
-    UprobeEvent& evt = *owned;
-    parseUprobeEventFields(*raw, evt);
-
-    /* Deliberately NOT resolving the socket tuple here.
-     *
-     * That resolution reads and line-parses /proc/<pid>/net/tcp plus
-     * /proc/<pid>/fd -- the most expensive work in the whole pipeline -- and
-     * every consumer of the result sits behind Verdict::actionable, which
-     * most events never reach. So the event carries a pointer back to this
-     * hook, and whoever actually needs the tuple asks for it via
-     * hg_event::ensurePeerResolved() (see resolvePeer below). */
-    evt.peer_resolver = this;
-
-    std::cout << "https_guard: uprobe event received: process='" << evt.process
-              << "' (PID " << evt.pid << "), direction=" << (evt.is_inbound ? "read" : "write")
-              << ", tls_version=" << evt.tls_version << "\n";
-
-    return owned;
-}
-
-bool SslUprobeProgram::resolvePeer(hg_event& evt) const noexcept
+bool SslUprobeProgram::resolvePeer(EventMeta& meta) const noexcept
 {
     /* Fails closed. If the event can't be attributed to exactly one
      * established connection owned by this PID, the tuple stays zeroed and
@@ -133,18 +121,18 @@ bool SslUprobeProgram::resolvePeer(hg_event& evt) const noexcept
      * Cached with a short TTL: a single HTTPS request produces several
      * uprobe events for the same pid, and the underlying /proc content is
      * namespace-wide and byte-identical between them. */
-    const auto peer = ProcPeerResolver::resolveEstablishedPeerCached(static_cast<pid_t>(evt.pid));
+    const auto peer = ProcPeerResolver::resolveEstablishedPeerCached(static_cast<pid_t>(meta.pid));
     if (!peer.resolved) {
-        std::cerr << "https_guard: PID " << evt.pid << " (" << evt.process
+        std::cerr << "https_guard: PID " << meta.pid << " (" << meta.process
                   << "): peer unresolved (" << peer.reason
                   << "); enforcement will be skipped for this event\n";
         return false;
     }
 
-    evt.local_ip_v4  = peer.entry.local_ip_v4;
-    evt.remote_ip_v4 = peer.entry.remote_ip_v4;
-    evt.local_port   = peer.entry.local_port;
-    evt.remote_port  = peer.entry.remote_port;
+    meta.local_ip_v4  = peer.entry.local_ip_v4;
+    meta.remote_ip_v4 = peer.entry.remote_ip_v4;
+    meta.local_port   = peer.entry.local_port;
+    meta.remote_port  = peer.entry.remote_port;
     return true;
 }
 

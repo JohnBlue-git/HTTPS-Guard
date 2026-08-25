@@ -158,15 +158,15 @@ private:
 };
 
 // Runs the real parser over a built body, as the XDP program would.
-xdp_event parse(const std::vector<unsigned char>& body)
+hg_client_hello parse(const std::vector<unsigned char>& body)
 {
-    xdp_event evt{};
+    hg_client_hello evt{};
     std::memset(&evt, 0, sizeof(evt));
     parse_client_hello_detail(&evt, body.data(), body.data() + body.size());
     return evt;
 }
 
-std::vector<uint16_t> capturedSuites(const xdp_event& evt)
+std::vector<uint16_t> capturedSuites(const hg_client_hello& evt)
 {
     return {evt.cipher_suites, evt.cipher_suites + evt.cipher_suite_count};
 }
@@ -329,7 +329,7 @@ TEST_CASE("ClientHello parse: truncated packet never reads past the end")
 
     for (size_t len = 0; len < full.size(); len++) {
         const std::vector<unsigned char> prefix(full.begin(), full.begin() + len);
-        xdp_event evt{};
+        hg_client_hello evt{};
         std::memset(&evt, 0, sizeof(evt));
         parse_client_hello_detail(&evt, prefix.data(), prefix.data() + prefix.size());
 

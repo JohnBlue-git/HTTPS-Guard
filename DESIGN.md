@@ -1,6 +1,6 @@
 # HTTPS-Guard — Design Reference
 
-> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html) (predates the current file layout — see the [Doc Rewrites ticket](.scratch/extend-detection-coverage/issues/07-doc-rewrites.md) once it lands).
+> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html) — rendered via htmlpreview: [DESIGN.html (rendered)](https://htmlpreview.github.io/?https://github.com/JohnBlue-git/HTTPS-Guard//main/DESIGN.html) (predates the current file layout — see the [Doc Rewrites ticket](.scratch/extend-detection-coverage/issues/07-doc-rewrites.md) once it lands).
 
 This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline, and the source tree is organized around exactly those three stages:
 
@@ -24,65 +24,67 @@ This document covers the complete source code under `recipes-https-guard/https-g
 
 ```
 files/
-├── CMakeLists.txt                          # Root: project setup, deps, add_subdirectory(actions|detectors|programs|tests)
+├── CMakeLists.txt                          # Root: project setup, deps, add_subdirectory(actions|detections|programs|tests)
 ├── https-guard.conf                        # EnvironmentFile for systemd units
-├── scripts/
-│   └── gen_ssl_offset.c                    # Build-time ssl_st.version offset detector
-├── service/
-│   ├── https-guard-daemon.{service,sh}
-│   ├── https-guard-event-bridge.{service,sh}
-│   └── simulated-event-generator.{service,sh}
-├── programs/                               # Detect layer
+├── scripts/gen_ssl_offset.c                # Build-time ssl_st.version offset detector
+├── service/                                # systemd units + their shell wrappers
+├── programs/                               # Detect — attach BPF, hand over bytes. The only tree linking libbpf.
 │   ├── CMakeLists.txt                      # programs_lib (OBJECT) + the BPF object build
 │   ├── core/
-│   │   ├── BpfProgram.{hpp,cpp}            # Generic BPF lifecycle wrapper — knows nothing product-specific
-│   │   ├── IHookModule.hpp                 # attach() / eventSource() / parseEvent() — one per hook family
-│   │   ├── HttpGuardProgram.{hpp,cpp}      # Orchestrator: loops over hook modules, runs the detector registry
-│   │   ├── hg_event_source.h               # Shared `enum hg_event_source` (BPF C and C++ both compile this)
-│   │   ├── https_guard.bpf.c               # Thin aggregator: ring buffer map + #includes each hook's .bpf.h
-│   │   └── main.cpp                        # Composition root — the only place that knows every concrete hook/detector
-│   ├── ssl_uprobe/                         # PRIMARY hook — see programs/ssl_uprobe/DESIGN.md
-│   │   ├── SslUprobeProgram.{hpp,cpp}      # IHookModule: attaches the uprobe, parses uprobe_event
-│   │   ├── ssl_uprobe.bpf.h                # SEC("uprobe/ssl_write") program body
-│   │   ├── ssl_uprobe_event.h              # struct uprobe_event (BPF + C++ shared layout)
-│   │   └── proc_peer_resolver.hpp          # /proc/<pid>/net/tcp parser, PID → socket 4-tuple
-│   ├── xdp_tls/                            # AUXILIARY hook — see programs/xdp_tls/DESIGN.md
-│   │   ├── XdpTlsProgram.{hpp,cpp}         # IHookModule: attaches XDP (native → generic → skip), parses xdp_event
-│   │   ├── xdp_tls.bpf.h                   # SEC("xdp") program body
-│   │   └── xdp_tls_event.h                 # struct xdp_event
-│   └── utils/
-│       └── bounded_string.hpp              # Fixed-size char[] → std::string, shared by both hook modules
-├── detections/                               # Classify layer
-│   ├── CMakeLists.txt                      # detections_lib (INTERFACE — header-only)
-│   ├── core/
-│   │   ├── IDetector.hpp                   # evaluate(const hg_event&) -> std::optional<Verdict>
-│   │   ├── hg_event.hpp                    # Common parsed-event representation (no classification fields)
-│   │   └── Verdict.hpp                     # {severity, message_id, message, actionable} — a detector's output
-│   ├── tls_version/
-│   │   ├── TlsVersionDetector.hpp          # Flags TLS < 1.2, or a hook's tlsViolationHint()
-│   │   └── tls_version.hpp                 # TlsVersion: numeric code → display string
-│   └── payload_anomaly/
-│       └── PayloadAnomalyDetector.hpp       # SQLi / path-traversal substring rules
-├── actions/                                 # Dispatch layer
-│   ├── CMakeLists.txt                      # actions_lib (OBJECT) + the action_runner smoke-test binary
-│   ├── core/
-│   │   ├── ActionLoop.{hpp,cpp}            # Boost.Asio-based async action dispatcher
-│   │   └── main.cpp                        # action_runner entry point
-│   ├── blocklist/
-│   │   ├── blocklist.bpf.h                 # BPF-side XDP_DROP check (shared with programs/xdp_tls)
-│   │   ├── Blocklist.{hpp,cpp}             # Singleton BPF map wrapper
-│   │   └── BlocklistAction.{hpp,cpp}       # BlocklistAddAction
-│   ├── tcp/
-│   │   ├── TcpDestroyer.{hpp,cpp}          # Netlink SOCK_DESTROY, RAII lifecycle
-│   │   └── BlockTcpAction.{hpp,cpp}
-│   └── log/
-│       ├── async_mutex.hpp                 # AsyncFileStreamManager (coroutine-safe file I/O)
-│       ├── LogAction.{hpp,cpp}
-│       └── redfish_event_message.hpp       # Verdict + hg_event → Redfish JSON
-└── tests/
-    ├── CMakeLists.txt                      # doctest via FetchContent; host-only, off when cross-compiling
-    ├── test_placeholder.cpp                # Proves the harness runs end-to-end
-    └── test_detectors.cpp                  # Unit tests for both IDetector implementations
+│   │   ├── ebpf/https_guard.bpf.c          # The ONLY file clang compiles: ring buffer map + #includes each hook's .bpf.h
+│   │   ├── src/
+│   │   │   ├── BpfProgram.{hpp,cpp}        # Base class every hook inherits; default ringBufferHandler() submits
+│   │   │   └── HttpGuardProgram.{hpp,cpp}  # Owns the object, the ring buffer and the poll loop; HOLDS the hooks
+│   │   └── main.cpp                        # Composition root — the only place naming concrete hooks and handlers
+│   ├── ssl_uprobe/                         # PRIMARY hook — attachment mechanics in its DESIGN.md
+│   │   ├── ebpf/{ssl_uprobe.bpf.h,ssl_uprobe_event.h}
+│   │   └── src/{SslUprobeProgram.{hpp,cpp},proc_peer_resolver.hpp}
+│   ├── xdp_tls/                            # AUXILIARY hook
+│   │   ├── ebpf/{xdp_tls.bpf.h,xdp_tls_event.h,parse_client_hello.h,conn_rate.bpf.h}
+│   │   └── src/XdpTlsProgram.{hpp,cpp}
+│   ├── lsm_cert_guard/                     # AUXILIARY hook — cannot attach on ARM32, see LIMITATIONS.md
+│   │   ├── ebpf/{lsm_cert_guard.bpf.h,lsm_cert_guard_event.h}
+│   │   └── src/LsmCertGuardProgram.{hpp,cpp}
+│   └── utils/bounded_string.hpp            # Fixed-size char[] → std::string
+├── detections/                             # Classify — event types, parsing, rules, engine. No libbpf.
+│   ├── CMakeLists.txt                      # detections_lib (OBJECT) + the detect_runner binary
+│   ├── DESIGN.md                           # The pipeline: DetectLoop, admission, threading
+│   ├── core/                               # Grouped by duty: contract / event / engine
+│   │   ├── contract/                       #   what a detection must provide
+│   │   │   ├── IDetection.hpp              #     inspect(data, size, meta) -> optional<Verdict>
+│   │   │   ├── Verdict.hpp                 #     {severity, message_id, message, actionable}
+│   │   │   └── detection_traits.hpp        #     concepts describing what a RAW RECORD carries
+│   │   ├── event/                          #   the vocabulary they all speak
+│   │   │   ├── hg_event_source.h           #     discriminator + hg_event_hdr (BPF C and C++)
+│   │   │   ├── event_meta.hpp              #     EventMeta — composed into each event, not inherited
+│   │   │   ├── event_meta_from.hpp         #     the shared envelope parse, in exactly one place
+│   │   │   ├── IPeerResolver.hpp           #     lazy /proc resolution; only the enforcing path pays
+│   │   │   └── tls_version.hpp             #     a wire version code -> a display string
+│   │   ├── engine/                         #   what drives the pipeline
+│   │   │   ├── DetectLoop.{hpp,cpp}        #     singleton, asio, walks a submitted detection list
+│   │   │   └── dispatch.{hpp,cpp}          #     the shared tail: enforce if actionable, then log
+│   │   └── main.cpp                        #   detect_runner — standalone runner for the loop
+│   ├── tls_version/                        # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
+│   ├── payload_anomaly/                    # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
+│   ├── cipher_suite/                       # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
+│   ├── sni/                                # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
+│   ├── cert_access/                        # event + rule + IDetection + DESIGN.md  (LSM)
+│   ├── conn_rate/                          # rule + event + ConnRateSweeper + rate_sources + DESIGN.md
+│   ├── slowloris/                          # rule + event + DESIGN.md
+│   ├── renegotiation/                      # rule + event + DESIGN.md
+│   └── traffic_observed/                   # the always-matching terminal entry + DESIGN.md
+├── actions/                                # Dispatch
+│   ├── CMakeLists.txt                      # actions_lib (OBJECT) + the action_runner binary
+│   ├── DESIGN.md                           # ActionLoop: why coroutines, why unbounded here
+│   ├── core/{ActionLoop.{hpp,cpp},main.cpp}
+│   ├── blocklist/                          # the BPF map XDP reads + DESIGN.md
+│   ├── tcp/                                # netlink SOCK_DESTROY + DESIGN.md
+│   └── log/                                # Redfish JSON + coroutine-safe file I/O + DESIGN.md
+└── tests/                                  # Host-only, off when cross-compiling
+    ├── test_detectors.cpp                  # All eight rules + 12 static_asserts on the concepts
+    ├── test_uprobe_parsing.cpp             # The real detections, inspect()ing synthetic raw records
+    ├── test_client_hello_parsing.cpp       # The real parse_client_hello.h against hand-built wire bytes
+    └── detectloop/                         # Separate binary — DetectLoop scheduling; see its README
 ```
 
 ## Build System
@@ -141,85 +143,217 @@ A build-time host tool that determines the offset of `ssl_st.version` in OpenSSL
 
 ## The Detect Layer: `programs/`
 
-### `IHookModule` — the interface every hook implements
+### `BpfProgram` — the base class every hook inherits
 
 ```cpp
-class IHookModule {
+class BpfProgram {
 public:
-    virtual bool attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept = 0;
+    virtual bool attach(bpf_object*, std::vector<bpf_link*>&) noexcept = 0;
     virtual hg_event_source eventSource() const noexcept = 0;
-    virtual std::unique_ptr<hg_event> parseEvent(const void* data, size_t size) const noexcept = 0;
+    virtual void ringBufferHandler(const void* data, std::size_t size) noexcept;  // default: submit
 };
 ```
 
-A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into an event. It never classifies (that's the rules in `detections/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
+Three methods, one of them already implemented. A hook says how to attach
+itself, which event source its records carry, and — only if it must — what to do
+with a record on the poll thread. The default `ringBufferHandler()` body is
+`DetectLoop::getInstance().submit(data, size)` and nothing else, so a new hook
+gets event submission for free.
 
-`parseEvent()` returns an owning pointer rather than a value because the concrete type it builds carries hook-specific data behind capability interfaces; copying it as an `hg_event` would slice that away, so `hg_event` is non-copyable and the compiler rejects the mistake.
+**A hook does not parse its own records.** Parsing is part of deciding what an
+event means, so it lives with the rule that needs it in `detections/<family>/`. That leaves a
+hook down to the two things only it can do.
 
-Three hooks exist, each documented in depth in its own `DESIGN.md`:
+**`HttpGuardProgram` does not inherit this.** A hook *is* a `BpfProgram`; the
+orchestrator *has* several. It used to inherit it, which put the ring-buffer
+callback for records produced by hooks on the one class that is not a hook.
 
-| Hook | Role | Deep dive |
-|------|------|-----------|
-| `ssl_uprobe` | PRIMARY — uprobes on OpenSSL `SSL_write()` **and** `SSL_read()` | [programs/ssl_uprobe/DESIGN.md](recipes-https-guard/https-guard/files/programs/ssl_uprobe/DESIGN.md) |
-| `xdp_tls` | AUXILIARY — XDP on the NIC RX path; also maintains the per-source counters the rate/Slowloris/renegotiation rules read | [programs/xdp_tls/DESIGN.md](recipes-https-guard/https-guard/files/programs/xdp_tls/DESIGN.md) |
-| `lsm_cert_guard` | AUXILIARY — BPF-LSM on `file_open`, filtered to the HTTPS key. **Cannot attach on this project's ARM32 target at all** (no BPF trampoline), so it is alert-only there | [programs/lsm_cert_guard/DESIGN.md](recipes-https-guard/https-guard/files/programs/lsm_cert_guard/DESIGN.md) |
+### The raw event ABI — one envelope, then per-hook detail
 
-Each hook directory splits into `ebpf/` (the `SEC(...)` program and its raw event struct) and `src/` (the `IHookModule` implementation and its helpers). Classification rules are never inside a hook — see `detections/CLAUDE.md` for why.
+Each hook's `ebpf/<hook>_event.h` defines the exact bytes it puts on the ring
+buffer. Both the BPF program and the C++ hook module compile the same header,
+so there is no marshalling step and no version negotiation — but there is also
+nothing to catch a mismatch, which is why the layout is structured rather than
+flat.
+
+Every record starts with the same envelope, defined once in
+`detections/core/hg_event_source.h`:
+
+```c
+struct hg_event_hdr {
+    uint32_t event_source;   /* enum hg_event_source — keep first */
+    uint32_t reserved;
+    uint64_t timestamp_ns;
+    uint32_t pid;
+    uint32_t tgid;
+    char     comm[HG_COMM_LEN];
+};
+```
+
+and then nests whatever that hook alone can observe:
+
+| Hook | Layout | Size |
+|---|---|---|
+| `ssl_uprobe` | `hdr` · `direction` · `hg_uprobe_tls` | 184 B |
+| `xdp_tls` | `hdr` · `hg_conn_tuple` · `hg_xdp_tls` · `hg_client_hello` | 352 B |
+| `lsm_cert_guard` | `hdr` · `hg_cert_access` | 56 B |
+
+All three fit the `HG_MAX_RAW_EVENT_SIZE` (1024 B) cap that `DetectLoop` sizes
+its queue slots from; each hook's `.cpp` `static_assert`s that.
+
+Three things this buys, none of them cosmetic:
+
+- **The common fields cannot drift.** All three hooks previously carried their
+  own copy of the same five members, in slightly different orders, and one of
+  them called `comm` `process`. A shared struct is the difference between
+  "they happen to match" and "they cannot diverge".
+- **A parser can be handed a sub-struct instead of the whole event.**
+  `parse_client_hello_detail()` now takes `struct hg_client_hello*`, so it is
+  structurally incapable of touching the header, the tuple, or the TLS fields
+  the caller already filled in. That used to rest on reviewer discipline.
+- **Absent-together fields look absent-together.** The ClientHello block is
+  entirely zero for a non-handshake packet. As a nested struct that reads as
+  one optional group rather than nine fields that happen to be zero.
+
+`event_source` **must** stay the first member of `hg_event_hdr`, and `hdr` the
+first member of every event struct: `DetectLoop::process()` reads a `uint32` at
+offset 0 to find the owning hook before it knows the type. Two `static_assert`s
+per hook pin exactly that, rather than trusting that nobody reorders members.
 
 ### `https_guard.bpf.c` — the aggregator
 
-Every hook's BPF program body lives in its own `ebpf/<hook>.bpf.h`, but clang only ever compiles one translation unit: `programs/core/https_guard.bpf.c`. It declares the shared ring buffer map, then `#include`s each hook's header — so the result is a single BPF object with one ring buffer, one blocklist map, one per-source counter map, and one load/verify pass, regardless of how many hook headers get added.
+Every hook's BPF program body lives in its own `ebpf/<hook>.bpf.h`, but clang only ever compiles one translation unit: `programs/core/ebpf/https_guard.bpf.c`. It declares the shared ring buffer map, then `#include`s each hook's header — so the result is a single BPF object with one ring buffer, one blocklist map, one per-source counter map, and one load/verify pass, regardless of how many hook headers get added.
 
-### `HttpGuardProgram` — attach and hand off
+### `HttpGuardProgram` — owns the object, manages the hooks
 
-The sole `BpfProgram` subclass. It holds the `vector<unique_ptr<IHookModule>>` and owns a `DetectLoop`, both fed from `main.cpp` — it never constructs a concrete hook or detector itself. `attachProgram()` loops over the hooks calling `attach()`, requiring at least one to succeed.
+Holds the one `bpf_object`, the one ring buffer, the poll loop, and a
+`vector<unique_ptr<BpfProgram>>` fed from `main.cpp` — it never constructs a
+concrete hook itself. `attachHooks()` loops over them calling `attach()`,
+requiring at least one to succeed.
 
-Its ring-buffer callback is three lines: **copy the record, enqueue it, return.** All parsing, `/proc` enrichment, classification and action dispatch happen on the `DetectLoop` worker instead. libbpf needs that callback back promptly — a slow callback lets the ring buffer fill, and a full ring buffer silently drops events, which is a missed detection rather than merely added latency.
+**One object, one ring buffer, one blocklist map**, all singular on purpose:
+`BlocklistAddAction` writes the map the XDP program reads, so splitting the
+object per hook would give each its own map and enforcement would stop working
+while still looking healthy.
 
-Because everything is expressed through `IHookModule`/`IDetector`, adding a hook or a rule never requires touching `HttpGuardProgram` or `DetectLoop` — only `main.cpp`'s composition root grows by a line.
+Its ring-buffer callback reads the event source at offset 0, finds the owning
+hook, and calls that hook's `ringBufferHandler()` — whose default body copies the
+record into `DetectLoop` and returns. That trampoline lives here rather than on
+`BpfProgram` because `ring_buffer__new()` takes one callback and one context for
+the whole buffer, so a per-hook static could never be the thing libbpf calls.
+
+Everything else happens on `DetectLoop`'s threads. libbpf needs that callback
+back promptly — a slow callback lets the ring buffer fill, and a full ring buffer
+silently drops events, which is a missed detection rather than merely added
+latency.
+
+Neither this class nor `DetectLoop` names a concrete hook, rule or event type, so
+adding any of them only grows `main.cpp`'s composition root by a line.
 
 ## The Classify Layer: `detections/`
 
-### `IDetector` and `Verdict`
+### A detection: one directory, parse and rule together
+
+A detection owns everything about itself — its event struct, its parse, its rule
+and its `DESIGN.md` — and plugs in through one seam:
 
 ```cpp
-struct Verdict {
-    std::string severity;
-    std::string message_id;
-    std::string message;
-    bool        actionable = false;
-};
-
-class IDetector {
+class IDetection {
 public:
-    virtual std::optional<Verdict> evaluate(const hg_event& evt) const = 0;
+    virtual std::optional<Verdict> inspect(const void* data, std::size_t size,
+                                           EventMeta& meta) const = 0;
 };
 ```
 
-A detector is a pure, synchronous function: given an already-parsed event, decide whether its rule matches and, if so, produce the `Verdict` to act on. No I/O, no BPF/socket access, no knowledge of which hook produced the event, and **no state of its own** — including the three rules that are inherently stateful, whose counters live in a BPF map and are aggregated before a detector ever sees them.
+`nullopt` covers "not mine", "does not parse" and "no violation" alike; the
+caller does not distinguish, it tries the next entry.
 
-`hg_event` carries only what every event has. Hook-specific data is reached through small **capability interfaces** (`ITlsTrafficInfo`, `IClientHelloInfo`, `ICertAccessInfo`, `IConnectionRateInfo`, `ISlowlorisInfo`, `IRenegotiationInfo`), which the concrete per-hook event types implement. A rule depends on the capability it needs, so a certificate-access event does not have to pretend it has a TLS version, and adding a hook cannot widen a type every other hook depends on.
+Parse and evaluate live together because they are the same decision: what a
+detection needs out of a record is determined entirely by what its rule reads.
+Splitting them put half a detection in one directory and half in another.
 
-### The registry and the rules
+The rule itself is a plain class taking one concrete event struct:
 
-`DetectLoop::DetectorRegistry` maps each `hg_event_source` to an ordered list of rules; the loop runs a source's list in order and stops at the first match. No match falls back to an `OK` / `HttpsTrafficObserved` verdict built inline — not by a detector, since there is nothing to detect in that case.
+```cpp
+std::optional<Verdict> evaluate(const TlsVersionEvent& evt) const;
+```
 
-| Rule | Sources | Enforces? |
-|---|---|---|
-| `TlsVersionDetector` — negotiated/offered version below TLS 1.2 | uprobe, XDP | yes |
-| `PayloadAnomalyDetector` — SQLi / path-traversal / attack-signature substrings, case-insensitive | uprobe, XDP | yes |
-| `CipherSuiteDetector` — weak offered suites (NULL, EXPORT, RC4, 3DES, anon KEX) | XDP | no — alert only |
-| `SniDetector` — malformed SNI always; hostname mismatch only when configured | XDP | no — alert only |
-| `CertAccessDetector` — unrecognised process opened the HTTPS key | LSM | no |
-| `ConnRateDetector` — connection attempts per source per window | synthesised | yes |
-| `SlowlorisDetector` — connections held open per source | synthesised | yes |
-| `RenegotiationDetector` — TLS handshake records per source per window | synthesised | yes |
+No base class, no vtable, no concept. There *were* concepts here, and before
+that six virtual capability interfaces; both existed so two rules could serve
+two different event types. Once each detection got its own event struct that
+reason evaporated — every rule has one input type, so handing it the wrong event
+is an ordinary type mismatch — and the machinery was deleted rather than kept.
 
-**Why some rules enforce and others only alert** is the most important thing on this page. The blocklist applies to a source address on *every* port, so an actionable false positive removes all access to the BMC for the blocklist TTL. Cipher-suite and SNI findings describe an offer bmcweb refuses anyway — no damage done, so alerting is proportionate; making them actionable locked an operator out of SSH during testing. The three per-source counting rules describe *ongoing* harm, so they enforce, which makes their thresholds safety-critical rather than tuning details.
+### Serving two hooks without duplicating a detection
 
-`ITlsTrafficInfo::tlsViolationHint()` exists to prevent one specific bug: a genuinely-parsed `legacy_version` of `0x0000` is a real violation on the wire, whereas `tlsVersion() == 0` from the uprobe only means "never observed". `UprobeEvent` returns a hard `false`; `XdpEvent` returns its BPF-computed flag. Collapsing those two zeros shipped once and was caught by review, not by the implementer.
+`TlsVersionDetection<struct uprobe_event>` and
+`TlsVersionDetection<struct xdp_event>` share one rule and one event struct. The
+nested ABI makes the common parse a single expression (`raw->tls.version` for
+both), and the places the layouts genuinely differ are read behind
+`if constexpr`, guarded by concepts in `detections/core/detection_traits.hpp`
+that describe what a raw record carries:
 
-The three synthesised rules have no hook: their counters are maintained in BPF by `xdp_tls` and turned into events by `detections/conn_rate/ConnRateSweeper`, which the loop runs on a timer. That is how stateful detection is done here without any stateful detector — see `detections/CLAUDE.md`.
+```cpp
+if constexpr (HasConnectionTuple<RawT>) { fillConnection(raw->conn, meta); }
+else                                    { meta.peer_resolver = resolver_; }
+```
+
+A detection only one hook can feed says so in a `requires` clause, so naming it
+in the wrong hook's list does not compile.
+
+### The hook declares its list; the loop walks it
+
+```cpp
+void XdpTlsProgram::ringBufferHandler(const void* data, std::size_t size) noexcept
+{
+    DetectLoop::getInstance().submit(data, size, detections_);
+}
+```
+
+`DetectLoop` walks the list in order and stops at the first verdict. Three things
+follow:
+
+**First match wins**, which is what keeps one record to one Redfish event —
+running every entry would emit up to four for a single ClientHello.
+
+**List order is priority order, and it lives in the hook.** That is the one real
+cost of this shape: which rule wins is a classification decision now expressed in
+`programs/`. Accepted deliberately, because each list is 2–5 entries readable at
+the point where the hook says what it can observe — and because it decides
+something that matters: `xdp_tls` puts the two enforcing rules ahead of the two
+alert-only ones, so a legacy-TLS ClientHello that also offers RC4 is reported as
+the TLS violation, which enforces. The loop logs which index claimed each
+record, so the ordering is observable at runtime rather than only in source.
+
+**There is no "nothing matched" branch anywhere.** A hook puts an
+always-matching `TrafficObservedDetection` last and first-match-wins covers it.
+
+The pointer list is copied into the queued record: `submit()` returns
+immediately and the record is inspected later, so a view of a temporary at the
+call site would dangle. The pointees are owned by the hook, which outlives the
+loop.
+
+### Event structs, composed rather than inherited
+
+Each detection's struct carries its own fields plus a shared `EventMeta`:
+
+```cpp
+struct TlsVersionEvent {
+    EventMeta     meta;             // when, which process, which connection
+    std::uint16_t tls_version = 0;
+    bool          violation_hint = false;
+};
+```
+
+There is no common base, so nothing downcasts. `EventMeta` also carries the lazy
+`ensurePeerResolved()`, because resolving a uprobe event's tuple reads `/proc`
+and only the enforcing path needs it. The envelope parse lives in exactly one
+place (`event_meta_from.hpp`), since several detections inspect the same record.
+
+`violation_hint` is the field that looks redundant and is not: a parsed wire
+`legacy_version` of `0x0000` *is* a violation, while `tls_version == 0` from a
+uprobe only means "never observed". Collapsing those two zeros shipped as a real
+bug once.
 
 ## The Dispatch Layer: `actions/`
 
@@ -243,32 +377,31 @@ BPF Event (ring buffer)                          BPF per-source counters
     ▼                                                     │
 HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──────────────
     │                                                     │
-    ├─ size-check, claim a slot (bounded; drop newest)     │
-    └─ DetectLoop::submit() → asio::post(record_strand_)   │
+    ├─ find the owning hook by event_source at offset 0    │
+    └─ hook->ringBufferHandler(): submit(data, size,       │
+       detections_) → asio::post(record_strand_)          │
            (returns immediately; nothing else happens here)│
                      │                                    │
 ════════════ thread boundary ═════════════════════════════ │ ════════════
                      ▼                                    ▼
    DetectLoop::handleRecord() ── io_context ──  steady_timer, every 2s:
      (on record_strand_: serialized,             ConnRateSweeper reads the
-      arrival order preserved)                   counters and synthesises one
-                     │                           event per rule per offending
-                     │                           source.  NOT on the strand,
-                     │                           so a record backlog cannot
-                     │                           delay it.
+      arrival order preserved)                   counters and calls the three
+                     │                           typed rate handlers directly.
+                     │                           NOT on the strand, so a record
+                     │                           backlog cannot delay it.
                      ▼                                    │
-        DetectLoop::classifyAndDispatch(evt, source) ◄─────┘
+        walk rec.detections in order, first verdict wins ◄──┘
                      │
-                     ├─ Find the IHookModule whose eventSource() matches
-                     │   └─ (none → log + skip; synthesised events skip this)
+                     ├─ detections[0]->inspect(bytes, size, meta)
+                     ├─ detections[1]->inspect(...)      each one parses only
+                     ├─ ...                              what its own rule reads
+                     └─ detections[n-1] is TrafficObservedDetection,
+                        which always matches — so there is no
+                        "nothing matched" branch anywhere
                      │
-                     ├─ parseEvent(data, size) -> unique_ptr<hg_event>
-                     │   └─ nullptr (undersized/malformed) → skip
-                     │
-                     ├─ Run detectors_[source] in order, stop at first match
-                     │   └─ each casts to the capability it needs; an event
-                     │      without it declines rather than misreading
-                     │   └─ (no match → inline "OK / traffic observed")
+                     ▼
+        dispatchVerdict(meta, verdict, ctx)
                      │
                      ├─ if Verdict::actionable:
                      │   ├─ ensurePeerResolved()   ← the /proc walk, only now
@@ -302,7 +435,7 @@ concurrently with a record is safe only because classification holds no
 shared mutable state, which makes detector statelessness a threading
 requirement here rather than a style preference.
 
-Per-hook specifics — exactly what each `parseEvent()` extracts, and each hook's own attach fallback — live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
+Per-detection rationale — what each rule looks for, why it enforces or only alerts, and its limits — lives in `detections/<family>/DESIGN.md`, one document per detection. Hook *attachment* mechanics, and exactly what each hook can observe, live in `programs/<hook>/DESIGN.md`.
 
 To actually *fire* each of these rules and see which message ID it produces, see [README.md § Exercising the Detections](README.md#exercising-the-detections); `DESIGN.html` § 4 has the class-relationship diagrams, the capability matrix and the ownership table.
 
@@ -395,9 +528,9 @@ The eBPF hook defers the decision: it submits an observation to a ring buffer an
                             │  Userspace daemon (HttpGuardProgram)  │
                             │                                      │
                             │  ring_buffer__poll() loop            │
-                            │    → find the owning IHookModule     │
-                            │      → parseEvent()                  │
-                            │        → run detectors_[source]      │
+                            │    → walk the detection list        │
+                            │      → each inspect()s the record    │
+                            │        → first verdict wins          │
                             │          (complex rules, regex,      │
                             │           cross-field logic)         │
                             │          → Verdict                   │
@@ -442,8 +575,8 @@ Packet arrives on port 443
              ▼
   ┌────────────────────────────────┐
   │ Userspace daemon               │
-  │  → parseEvent() via IHookModule│
-  │  → classify via detectors_[]   │
+  │  → detections in list order    │
+  │  → first verdict wins          │
   │  → if Verdict.actionable:      │
   │    → BlockTcpAction(src,dst)   │
   │    → SOCK_DESTROY connection   │
@@ -462,14 +595,14 @@ Packet arrives on port 443
 
 Key design decisions this leads to:
 
-1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `ITlsTrafficInfo::tlsViolationHint()`, not baked into any detector's logic.
-2. **Userspace is intelligent** — all classification lives behind `IDetector`, all hook-attach/parse logic behind `IHookModule`; neither knows about the other.
+1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `XdpEvent::violation_hint`, not baked into any rule's logic.
+2. **Userspace is intelligent** — the event types, the parsing and the rules all live in `detections/`; `programs/` only attaches and hands over bytes. Neither names a type belonging to the other.
 3. **Different structs per hook** — `uprobe_event` has no socket info; `xdp_event` does (available from packet headers, unlike from uprobe context).
 4. **No CO-RE for userspace structs** — `ssl_st` is a userspace type, not in kernel BTF, hence `gen_ssl_offset.c`.
 
 ### Platform-Adaptive Enforcement
 
-The uprobe attaches unconditionally; failing to attach it is logged as required but does not by itself stop the daemon (only zero hooks attaching does). XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available. `HttpGuardProgram::attachProgram()` requires at least one hook of any kind to succeed; the summary line it logs (`"https_guard: enforcement active via N of M hook(s)"`) is intentionally hook-agnostic — the orchestrator has no hook names to report, only the generic `IHookModule` interface. Each hook still logs its own specific attach outcome internally (see the per-hook `DESIGN.md`s).
+The uprobe attaches unconditionally; failing to attach it is logged as required but does not by itself stop the daemon (only zero hooks attaching does). XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available. `HttpGuardProgram::attachHooks()` requires at least one hook of any kind to succeed; the summary line it logs (`"https_guard: enforcement active via N of M hook(s)"`) is intentionally hook-agnostic — the orchestrator sees only the generic `BpfProgram` base. Each hook still logs its own specific attach outcome internally; the attach mechanics for all three are in [`programs/DESIGN.md`](recipes-https-guard/https-guard/files/programs/DESIGN.md).
 
 **x86 servers / QEMU TAP+BRIDGE with virtio-net** — both hooks load. XDP proactively drops TLS violations at the wire, the uprobe still resolves PID→socket for enforcement, and the blocklist protects future connections from repeat offenders. Generic (SKB) XDP hooks `netif_receive_skb()` in software, so `virtio-net-device` attaches successfully even without native driver support.
 
@@ -495,7 +628,7 @@ Process calls SSL_write(ssl, buf, num)
        ▼
   Userspace daemon receives event
        │
-       ├── SslUprobeProgram::parseEvent() → ProcPeerResolver::getTcpSockets(pid)
+       ├── the uprobe detections inspect() it; IPeerResolver only if one enforces
        │     → reads /proc/<pid>/net/tcp, parses "AABBCCDD:PPPP"
        │     → returns socket 4-tuple
        │
@@ -549,9 +682,13 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 
 | Flag | Daemon | Generator | Bridge |
 |------|--------|-----------|--------|
-| `simulation` (default) | ✗ | ✓ | ✓ |
-| `daemon` | ✓ | ✗ | ✓ |
+| `daemon` **(default)** | ✓ | ✗ | ✓ |
+| `simulation` | ✗ | ✓ | ✓ |
 | `both` | ✓ | ✓ | ✓ |
+
+`daemon` and `both` additionally set `HTTPS_GUARD_BUILD_BPF=ON`, so the default
+build compiles the BPF object and therefore needs a target kernel carrying BTF.
+`simulation` is the fallback where that is not available.
 
 **Event sink mode:**
 
@@ -594,4 +731,6 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
 
 ## Development
 
-For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md). For per-hook detection rationale and diagrams, see `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
+For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md).
+
+For rationale one level down, every unit has its own document: `detections/<family>/DESIGN.md` per detection, `actions/<kind>/DESIGN.md` per countermeasure, and one per layer — `programs/DESIGN.md`, `detections/DESIGN.md`, `actions/DESIGN.md`.

@@ -12,13 +12,34 @@ inherit pkgconfig
 # =============================================================================
 # PACKAGECONFIG: choose which systemd services are auto-enabled
 #
-#   "simulation" (default)  — enable the synthetic event generator for QEMU
-#                             testing without real eBPF hardware support.
-#                             Disables the real daemon.
+#   "daemon" (default)      — enable the real eBPF-based https-guardd daemon.
+#                             Disables the simulator.
 #
-#   "daemon"                — enable the real eBPF-based https-guardd daemon.
-#                             Requires a kernel with eBPF/XDP and a TAP/bridge
-#                             network on the host. Disables the simulator.
+#                             This is the default because the daemon is the
+#                             point of the layer: shipping the simulator by
+#                             default meant a first boot looked like it was
+#                             working while detecting nothing real.
+#
+#                             It does raise the bar for a default build. The
+#                             daemon needs the BPF object, so this flag also
+#                             turns HTTPS_GUARD_BUILD_BPF ON (see the python()
+#                             block below) -- which needs clang-native,
+#                             bpftool-native, and a target kernel built with
+#                             CONFIG_DEBUG_INFO_BTF so vmlinux carries BTF. All
+#                             three are already in DEPENDS, but a machine whose
+#                             kernel lacks BTF will now fail at configure time
+#                             where the old default silently skipped BPF
+#                             entirely. Use "simulation" there.
+#
+#                             At runtime it also wants CONFIG_BPF and
+#                             CONFIG_UPROBE_EVENTS (plus CONFIG_NET_XDP for the
+#                             XDP hook, and see recipes-kernel/linux/ for the
+#                             fragment this layer adds). Missing XDP is
+#                             non-fatal -- the daemon runs uprobe-only.
+#
+#   "simulation"            — enable the synthetic event generator instead, for
+#                             a QEMU boot with no kernel eBPF/XDP support and no
+#                             BPF toolchain. Disables the real daemon.
 #
 #   "both"                  — enable both daemon and simulator (for debugging,
 #                             comparing real vs simulated events side by side).
@@ -37,7 +58,7 @@ inherit pkgconfig
 #                     delivery is via D-Bus only (filesystem log skipped
 #                     to avoid duplicate delivery).
 # =============================================================================
-PACKAGECONFIG ??= "simulation event-both"
+PACKAGECONFIG ??= "daemon event-both"
 
 PACKAGECONFIG[simulation] = ""
 PACKAGECONFIG[daemon] = ""
@@ -56,51 +77,73 @@ SRC_URI = " \
     file://service/simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
+    file://programs/DESIGN.md \
+    file://detections/DESIGN.md \
+    file://actions/DESIGN.md \
+    file://actions/log/DESIGN.md \
+    file://actions/blocklist/DESIGN.md \
+    file://actions/tcp/DESIGN.md \
     file://scripts/gen_ssl_offset.c \
     file://programs/CMakeLists.txt \
-    file://programs/core/https_guard.bpf.c \
+    file://programs/core/ebpf/https_guard.bpf.c \
     file://programs/core/main.cpp \
-    file://programs/core/HttpGuardProgram.hpp \
-    file://programs/core/HttpGuardProgram.cpp \
-    file://programs/core/BpfProgram.hpp \
-    file://programs/core/BpfProgram.cpp \
+    file://programs/core/src/HttpGuardProgram.hpp \
+    file://programs/core/src/HttpGuardProgram.cpp \
+    file://programs/core/src/BpfProgram.hpp \
+    file://programs/core/src/BpfProgram.cpp \
     file://programs/ssl_uprobe/src/proc_peer_resolver.hpp \
     file://programs/ssl_uprobe/ebpf/ssl_uprobe.bpf.h \
     file://programs/ssl_uprobe/ebpf/ssl_uprobe_event.h \
-    file://programs/ssl_uprobe/src/parse_uprobe_event.hpp \
     file://programs/ssl_uprobe/src/SslUprobeProgram.hpp \
-    file://programs/ssl_uprobe/src/uprobe_hg_event.hpp \
     file://programs/ssl_uprobe/src/SslUprobeProgram.cpp \
     file://programs/xdp_tls/ebpf/xdp_tls.bpf.h \
     file://programs/xdp_tls/ebpf/xdp_tls_event.h \
     file://programs/xdp_tls/ebpf/parse_client_hello.h \
     file://programs/xdp_tls/ebpf/conn_rate.bpf.h \
     file://programs/xdp_tls/src/XdpTlsProgram.hpp \
-    file://programs/xdp_tls/src/xdp_hg_event.hpp \
     file://programs/xdp_tls/src/XdpTlsProgram.cpp \
     file://programs/lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h \
     file://programs/lsm_cert_guard/ebpf/lsm_cert_guard_event.h \
     file://programs/lsm_cert_guard/src/LsmCertGuardProgram.hpp \
-    file://programs/lsm_cert_guard/src/cert_access_hg_event.hpp \
     file://programs/lsm_cert_guard/src/LsmCertGuardProgram.cpp \
     file://programs/utils/bounded_string.hpp \
     file://detections/CMakeLists.txt \
-    file://detections/core/hg_event.hpp \
-    file://detections/core/ITlsTrafficInfo.hpp \
-    file://detections/core/IClientHelloInfo.hpp \
-    file://detections/core/ICertAccessInfo.hpp \
-    file://detections/core/IConnectionRateInfo.hpp \
-    file://detections/core/ISlowlorisInfo.hpp \
-    file://detections/core/IRenegotiationInfo.hpp \
-    file://detections/core/hg_event_source.h \
-    file://detections/core/IHookModule.hpp \
-    file://detections/core/DetectLoop.hpp \
-    file://detections/core/DetectLoop.cpp \
-    file://detections/core/IDetector.hpp \
-    file://detections/core/IPeerResolver.hpp \
-    file://detections/core/Verdict.hpp \
+    file://detections/core/event/hg_event_source.h \
+    file://detections/core/engine/DetectLoop.hpp \
+    file://detections/core/engine/DetectLoop.cpp \
+    file://detections/core/main.cpp \
+    file://detections/core/event/IPeerResolver.hpp \
+    file://detections/core/contract/Verdict.hpp \
+    file://detections/core/contract/IDetection.hpp \
+    file://detections/core/event/event_meta_from.hpp \
+    file://detections/core/contract/detection_traits.hpp \
+    file://detections/traffic_observed/TrafficObservedDetection.hpp \
+    file://detections/traffic_observed/DESIGN.md \
+    file://detections/tls_version/TlsVersionEvent.hpp \
+    file://detections/tls_version/TlsVersionDetection.hpp \
+    file://detections/payload_anomaly/PayloadEvent.hpp \
+    file://detections/payload_anomaly/PayloadAnomalyDetection.hpp \
+    file://detections/cipher_suite/CipherSuiteEvent.hpp \
+    file://detections/cipher_suite/CipherSuiteDetection.hpp \
+    file://detections/sni/SniEvent.hpp \
+    file://detections/sni/SniDetection.hpp \
+    file://detections/cert_access/CertAccessEvent.hpp \
+    file://detections/cert_access/CertAccessDetection.hpp \
+    file://detections/tls_version/DESIGN.md \
+    file://detections/payload_anomaly/DESIGN.md \
+    file://detections/cipher_suite/DESIGN.md \
+    file://detections/sni/DESIGN.md \
+    file://detections/cert_access/DESIGN.md \
+    file://detections/conn_rate/DESIGN.md \
+    file://detections/slowloris/DESIGN.md \
+    file://detections/renegotiation/DESIGN.md \
+    file://detections/core/event/event_meta.hpp \
+    file://detections/core/engine/dispatch.hpp \
+    file://detections/core/engine/dispatch.cpp \
+    file://detections/conn_rate/rate_sources.hpp \
+    file://detections/conn_rate/rate_sources.cpp \
     file://detections/tls_version/TlsVersionDetector.hpp \
-    file://detections/tls_version/tls_version.hpp \
+    file://detections/core/event/tls_version.hpp \
     file://detections/payload_anomaly/PayloadAnomalyDetector.hpp \
     file://detections/cert_access/CertAccessDetector.hpp \
     file://detections/conn_rate/ConnRateEvent.hpp \
@@ -274,6 +317,10 @@ do_install() {
         install -m 0755 ${B}/https_guardd ${D}${sbindir}/https-guardd
     fi
 
+    if [ -x "${B}/detect_runner" ]; then
+        install -m 0755 ${B}/detect_runner ${D}${sbindir}/detect_runner
+    fi
+
     if [ -x "${B}/action_runner" ]; then
         install -m 0755 ${B}/action_runner ${D}${sbindir}/action_runner
     fi
@@ -301,6 +348,7 @@ do_install() {
 
 FILES:${PN} += " \
     ${sbindir}/action_runner \
+    ${sbindir}/detect_runner \
     ${sbindir}/https-guardd \
     ${sbindir}/https-guard-event-bridge \
     ${sbindir}/simulated-event-generator \

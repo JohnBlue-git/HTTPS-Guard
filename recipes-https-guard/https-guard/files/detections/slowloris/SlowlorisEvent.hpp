@@ -2,19 +2,22 @@
 
 #include <cstdint>
 
-#include "hg_event.hpp"
-#include "ISlowlorisInfo.hpp"
+#include "event_meta.hpp"
 
 namespace https_guard {
 
-/** Synthesised by ConnRateSweeper from the per-source held-open level. */
-class SlowlorisEvent final : public hg_event, public ISlowlorisInfo {
-public:
-    std::uint32_t open_connections = 0;
-    std::uint32_t slowloris_threshold = 0;
+/**
+ * Synthesised by ConnRateSweeper from the per-source held-open level.
+ *
+ * Satisfies SlowlorisEventLike only. `open_connections` is a *level*, not a
+ * windowed rate: the counter behind it survives the window roll, because an
+ * attacker who opens connections and then goes quiet would otherwise look idle.
+ */
+struct SlowlorisEvent {
+    EventMeta meta;
 
-    std::uint32_t openConnections() const noexcept override { return open_connections; }
-    std::uint32_t threshold() const noexcept override { return slowloris_threshold; }
+    std::uint32_t open_connections = 0;
+    std::uint32_t threshold        = 0;
 };
 
 }  // namespace https_guard

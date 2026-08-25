@@ -3,36 +3,30 @@
 #include <optional>
 #include <string>
 
-#include "IDetector.hpp"
-#include "hg_event.hpp"
-#include "ITlsTrafficInfo.hpp"
 #include "Verdict.hpp"
+#include "TlsVersionEvent.hpp"
 #include "tls_version.hpp"
 
 namespace https_guard {
 
 /**
- * Flags a negotiated TLS version below TLS 1.2 (0x0303) as a Critical
- * violation. A version of 0 normally means "no TLS version observed"
- * (e.g. the uprobe never resolved ssl->version) and is not on its own
- * treated as a violation — except when the producing hook already
- * determined it is one (tls_violation_hint), since a hook that classifies
- * on the wire (e.g. XDP) can see a genuinely-parsed 0x0000 legacy_version,
- * which is a real violation, not a missing-data sentinel.
+ * Flags TLS below 1.2, either because the version says so or because the
+ * producing hook already determined it on the wire.
+ *
+ * Bound to the TlsTrafficEvent *concept*, not to a hook and not to an
+ * interface: both the uprobe and the XDP path satisfy it, and neither is named
+ * here. An event that cannot describe TLS traffic is now a compile error at the
+ * call site rather than a silent runtime decline.
  */
-class TlsVersionDetector final : public IDetector {
+class TlsVersionDetector {
 public:
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const TlsVersionEvent& evt) const
     {
-        // Binds to the capability, not to a hook: both ssl_uprobe and
-        // xdp_tls supply this, and neither is named here.
-        const auto* tls = dynamic_cast<const ITlsTrafficInfo*>(&evt);
-        if (tls == nullptr) {
-            return std::nullopt;  // event source can't describe TLS traffic
-        }
-
-        const bool violation = tls->tlsViolationHint() ||
-                                (tls->tlsVersion() > 0 && tls->tlsVersion() < 0x0303);
+        /* violation_hint first, and separately from the numeric test, because
+         * the two producers can conclude different things from the same zero --
+         * see TlsVersionEvent.hpp. */
+        const bool violation = evt.violation_hint ||
+                               (evt.tls_version > 0 && evt.tls_version < 0x0303);
         if (!violation) {
             return std::nullopt;
         }
@@ -40,10 +34,10 @@ public:
         Verdict verdict;
         verdict.severity   = "Critical";
         verdict.message_id = "OemSecurityEvent.1.0.HttpsTlsVersionViolation";
-        verdict.message    = "Security violation: Process '" + evt.process +
-                             "' (PID " + std::to_string(evt.pid) +
+        verdict.message    = "Security violation: Process '" + evt.meta.process +
+                             "' (PID " + std::to_string(evt.meta.pid) +
                              ") attempted an HTTPS connection using an insecure TLS version (" +
-                             TlsVersion(tls->tlsVersion()).toString() + "). Packet was blocked.";
+                             TlsVersion(evt.tls_version).toString() + "). Packet was blocked.";
         verdict.actionable = true;
         return verdict;
     }

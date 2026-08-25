@@ -6,11 +6,13 @@
  * are replaced at LINK time. See README.md in this directory for what each
  * check is for and how to build it.
  */
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <vector>
 
@@ -18,6 +20,8 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include "DetectLoop.hpp"
+#include "rate_sources.hpp"
+#include "dispatch.hpp"
 #include "log/LogAction.hpp"
 #include "blocklist/BlocklistAction.hpp"
 #include "tcp/BlockTcpAction.hpp"
@@ -47,6 +51,28 @@ boost::asio::awaitable<void> BlockTcpAction::execute_async() { co_return; }
 
 }  // namespace https_guard
 
+/* dispatchVerdict: stubbed for the same reason ActionLoop is. This harness is
+ * about the loop's scheduling; what a verdict turns into is actions/'s job and
+ * is covered elsewhere. Counting the calls is also how the "first match wins"
+ * property below is observed. */
+namespace https_guard {
+std::atomic<int> g_dispatched{0};
+void dispatchVerdict(const EventMeta&, const Verdict&, const DispatchContext&)
+{
+    g_dispatched.fetch_add(1);
+}
+}  // namespace https_guard
+
+/* ConnRateSweeper's three classification collaborators. Stubbed for the same
+ * reason ActionLoop is: this harness is about the loop's scheduling, and the
+ * rules are covered by tests/test_detectors.cpp. Counting the calls also lets
+ * the sweep-cadence check below observe sweeps that found nothing. */
+namespace https_guard {
+void handleConnRateEvent(const ConnRateEvent&, const DispatchContext&) {}
+void handleSlowlorisEvent(const SlowlorisEvent&, const DispatchContext&) {}
+void handleRenegotiationEvent(const RenegotiationEvent&, const DispatchContext&) {}
+}  // namespace https_guard
+
 /* ConnRateSweeper's only two libbpf calls. Recording the timestamp of each
  * sweep's first call is how sweep cadence is observed. */
 static std::mutex              g_sweep_mu;
@@ -66,51 +92,56 @@ extern "C" int bpf_map_lookup_elem(int, const void*, void*) { return -1; }
 
 static constexpr hg_event_source kTestSource = HG_SOURCE_UPROBE;
 
-/* Records arrival order and can be made slow, to build a backlog. */
-class SlowHook final : public IHookModule {
+/* Stands in for a source handler: records arrival order and can be made slow,
+ * to build a backlog. Plugged in as an IDetection, which is exactly
+ * what the composition root uses -- so the harness drives the real seam rather
+ * than a test-only one. */
+class SlowDetection final : public IDetection {
 public:
-    std::atomic<int>          parsed{0};
-    std::atomic<int>          us_per_parse{0};
-    std::mutex                mu;
-    std::vector<std::uint32_t> order;
+    std::string_view name() const noexcept override { return "harness_slow"; }
 
-    bool attach(bpf_object*, std::vector<bpf_link*>&) noexcept override { return true; }
-    hg_event_source eventSource() const noexcept override { return kTestSource; }
+    mutable std::atomic<int>           handled{0};
+    std::atomic<int>                   us_per_event{0};
+    mutable std::mutex                 mu;
+    mutable std::vector<std::uint32_t> order;
+    bool                               throw_always = false;
 
-    std::unique_ptr<hg_event> parseEvent(const void* data, size_t size) const noexcept override
+    std::optional<Verdict> inspect(const void* data, std::size_t size,
+                                   EventMeta& meta) const override
     {
-        const auto us = us_per_parse.load();
+        const auto us = us_per_event.load();
         if (us > 0) std::this_thread::sleep_for(std::chrono::microseconds(us));
 
         std::uint32_t seq = 0;
         if (size >= 8) std::memcpy(&seq, static_cast<const unsigned char*>(data) + 4, 4);
         {
-            auto* self = const_cast<SlowHook*>(this);
-            const std::lock_guard<std::mutex> lk(self->mu);
-            self->order.push_back(seq);
+            const std::lock_guard<std::mutex> lk(mu);
+            order.push_back(seq);
         }
-        const_cast<SlowHook*>(this)->parsed.fetch_add(1);
+        handled.fetch_add(1);
 
-        auto evt = std::make_unique<hg_event>();
-        evt->pid = seq;
-        return evt;
+        /* After counting, so "every event still processed despite throws" is
+         * actually testing that the loop survived each one. */
+        if (throw_always) {
+            throw std::runtime_error("boom");
+        }
+
+        meta.pid = seq;
+        Verdict v;
+        v.severity   = "OK";
+        v.message_id = "harness";
+        return v;
     }
 };
 
-/* Throws, to prove one bad event does not take the daemon down. */
-class ThrowingDetector final : public IDetector {
-public:
-    std::optional<Verdict> evaluate(const hg_event&) const override
-    { throw std::runtime_error("boom"); }
-};
-
-static void submitSeq(DetectLoop& loop, std::uint32_t seq)
+static void submitSeq(DetectLoop& loop, DetectLoop::DetectionList detections,
+                      std::uint32_t seq)
 {
     unsigned char buf[16] = {};
     const std::uint32_t src = static_cast<std::uint32_t>(kTestSource);
     std::memcpy(buf, &src, 4);
     std::memcpy(buf + 4, &seq, 4);
-    loop.submit(buf, sizeof(buf));
+    loop.submit(buf, sizeof(buf), detections);
 }
 
 static int failures = 0;
@@ -126,16 +157,17 @@ int main()
 
     /* ---- 1. bounded admission: drop-newest past the cap ---------------- */
     {
-        std::vector<std::unique_ptr<IHookModule>> hooks;
-        auto hook = std::make_unique<SlowHook>();
-        SlowHook* raw = hook.get();
-        hooks.push_back(std::move(hook));
-        raw->us_per_parse.store(2000);          /* 2ms: makes a backlog easy */
+        SlowDetection src_storage;
+        SlowDetection* raw = &src_storage;
+        const std::array<const IDetection*, 1> detections{raw};
+        raw->us_per_event.store(2000);          /* 2ms: makes a backlog easy */
 
-        DetectLoop loop(al, hooks, {}, std::chrono::seconds(60), "/dev/null");
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
 
         const int n = 20000;
-        for (int i = 0; i < n; ++i) submitSeq(loop, static_cast<std::uint32_t>(i));
+        for (int i = 0; i < n; ++i) submitSeq(loop, detections, static_cast<std::uint32_t>(i));
 
         const auto dropped = loop.droppedCount();
         check(dropped > 0, "admission bounded: drops counted past the cap");
@@ -149,14 +181,15 @@ int main()
 
     /* ---- 2. FIFO order across records --------------------------------- */
     {
-        std::vector<std::unique_ptr<IHookModule>> hooks;
-        auto hook = std::make_unique<SlowHook>();
-        SlowHook* raw = hook.get();
-        hooks.push_back(std::move(hook));
+        SlowDetection src_storage;
+        SlowDetection* raw = &src_storage;
+        const std::array<const IDetection*, 1> detections{raw};
 
-        DetectLoop loop(al, hooks, {}, std::chrono::seconds(60), "/dev/null");
-        for (std::uint32_t i = 0; i < 500; ++i) submitSeq(loop, i);
-        for (int spin = 0; spin < 200 && raw->parsed.load() < 500; ++spin)
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
+        for (std::uint32_t i = 0; i < 500; ++i) submitSeq(loop, detections, i);
+        for (int spin = 0; spin < 200 && raw->handled.load() < 500; ++spin)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         bool ordered = raw->order.size() == 500;
@@ -168,18 +201,19 @@ int main()
 
     /* ---- 3. the sweep is not starved by a record backlog --------------- */
     {
-        std::vector<std::unique_ptr<IHookModule>> hooks;
-        auto hook = std::make_unique<SlowHook>();
-        SlowHook* raw = hook.get();
-        hooks.push_back(std::move(hook));
-        raw->us_per_parse.store(5000);          /* 5ms/event */
+        SlowDetection src_storage;
+        SlowDetection* raw = &src_storage;
+        const std::array<const IDetection*, 1> detections{raw};
+        raw->us_per_event.store(5000);          /* 5ms/event */
 
-        DetectLoop loop(al, hooks, {}, std::chrono::seconds(60), "/dev/null");
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
         loop.enableRateSweeps(3 /* any fd >= 0 */,
                               ConnRateSweeper::Thresholds{100, 100, 100});
 
         /* 3000 x 5ms = ~15s of backlog, against a 2s sweep interval. */
-        for (std::uint32_t i = 0; i < 3000; ++i) submitSeq(loop, i);
+        for (std::uint32_t i = 0; i < 3000; ++i) submitSeq(loop, detections, i);
 
         const auto t0 = clk::now();
         std::this_thread::sleep_for(std::chrono::seconds(9));
@@ -199,10 +233,10 @@ int main()
             if (!g_sweeps.empty()) last = g_sweeps.back();
         }
 
-        std::printf("      backlog still draining: parsed=%d of 3000\n", raw->parsed.load());
+        std::printf("      backlog still draining: handled=%d of 3000\n", raw->handled.load());
         std::printf("      sweeps in 9s=%zu  worst gap=%ldms (interval 2000ms)\n",
                     sweeps, worst_gap_ms);
-        check(raw->parsed.load() < 3000, "the backlog really was still draining");
+        check(raw->handled.load() < 3000, "the backlog really was still draining");
         check(sweeps >= 4, "sweep kept running while a backlog drained");
         check(worst_gap_ms < 4000, "sweep never delayed past ~2x its interval");
         (void)last;
@@ -211,35 +245,67 @@ int main()
 
     /* ---- 4. a throwing detector costs one event, not the daemon -------- */
     {
-        std::vector<std::unique_ptr<IHookModule>> hooks;
-        auto hook = std::make_unique<SlowHook>();
-        SlowHook* raw = hook.get();
-        hooks.push_back(std::move(hook));
+        SlowDetection src_storage;
+        SlowDetection* raw = &src_storage;
+        const std::array<const IDetection*, 1> detections{raw};
 
-        DetectLoop::DetectorRegistry reg;
-        reg[kTestSource].push_back(std::make_unique<ThrowingDetector>());
+        raw->throw_always = true;
 
-        DetectLoop loop(al, hooks, std::move(reg), std::chrono::seconds(60), "/dev/null");
-        for (std::uint32_t i = 0; i < 20; ++i) submitSeq(loop, i);
-        for (int spin = 0; spin < 200 && raw->parsed.load() < 20; ++spin)
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
+        for (std::uint32_t i = 0; i < 20; ++i) submitSeq(loop, detections, i);
+        for (int spin = 0; spin < 200 && raw->handled.load() < 20; ++spin)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        check(raw->parsed.load() == 20, "every event still processed despite throws");
+        check(raw->handled.load() == 20, "every event still processed despite throws");
+        loop.stop();
+    }
+
+    /* ---- 4b. the submitted pointer view must not dangle ---------------- */
+    {
+        /* submit() returns immediately and the record is inspected later, so a
+         * view of a temporary at the call site would dangle. Pass one on
+         * purpose: the braced list below is a temporary array that dies at the
+         * end of the statement, well before the loop looks at the record. If
+         * DetectLoop kept the view instead of copying the pointers, this is a
+         * use-after-free -- which is why the harness runs under ASan. */
+        SlowDetection detection;
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
+
+        const IDetection* one[] = {&detection};
+        for (std::uint32_t i = 0; i < 50; ++i) {
+            unsigned char buf[16] = {};
+            const std::uint32_t src = static_cast<std::uint32_t>(kTestSource);
+            std::memcpy(buf, &src, 4);
+            std::memcpy(buf + 4, &i, 4);
+            /* A fresh temporary span every call, from a temporary array. */
+            loop.submit(buf, sizeof(buf), DetectLoop::DetectionList{one, 1});
+        }
+
+        for (int spin = 0; spin < 200 && detection.handled.load() < 50; ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(detection.handled.load() == 50,
+              "records submitted with a temporary view are still inspected");
         loop.stop();
     }
 
     /* ---- 5. oversized/undersized records, and stop() idempotence ------- */
     {
-        std::vector<std::unique_ptr<IHookModule>> hooks;
-        hooks.push_back(std::make_unique<SlowHook>());
-        DetectLoop loop(al, hooks, {}, std::chrono::seconds(60), "/dev/null");
+        SlowDetection src_storage;
+        const std::array<const IDetection*, 1> detections{&src_storage};
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
 
         const auto before = loop.droppedCount();
         std::vector<unsigned char> big(HG_MAX_RAW_EVENT_SIZE + 1, 0);
-        loop.submit(big.data(), big.size());
+        loop.submit(big.data(), big.size(), detections);
         check(loop.droppedCount() == before + 1, "oversized record rejected and counted");
 
-        loop.submit(nullptr, 8);
-        loop.submit(big.data(), 0);
+        loop.submit(nullptr, 8, detections);
+        loop.submit(big.data(), 0, detections);
         check(loop.droppedCount() == before + 1, "null/empty submit is a no-op");
 
         loop.stop();

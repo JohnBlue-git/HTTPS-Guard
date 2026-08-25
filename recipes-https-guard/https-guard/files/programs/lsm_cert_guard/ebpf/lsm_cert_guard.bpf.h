@@ -126,17 +126,18 @@ int BPF_PROG(https_guard_cert_open, struct file *file)
     struct lsm_cert_guard_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
     if (evt) {
         __builtin_memset(evt, 0, sizeof(*evt));
-        evt->event_source   = HG_SOURCE_LSM_CERT_GUARD;
-        evt->comm_mismatch   = comm_ok ? 0 : 1;
-        evt->shadow_mode      = shadow_mode ? 1 : 0;
-        evt->timestamp_ns     = bpf_ktime_get_ns();
+        evt->hdr.event_source = HG_SOURCE_LSM_CERT_GUARD;
+        evt->hdr.reserved     = 0;
+        evt->cert.comm_mismatch = comm_ok ? 0 : 1;
+        evt->cert.shadow_mode   = shadow_mode ? 1 : 0;
+        evt->hdr.timestamp_ns   = bpf_ktime_get_ns();
 
         __u64 pid_tgid = bpf_get_current_pid_tgid();
-        evt->pid  = (__u32)pid_tgid;
-        evt->tgid = (__u32)(pid_tgid >> 32);
-        evt->cgroup_id = bpf_get_current_cgroup_id();
+        evt->hdr.pid  = (__u32)pid_tgid;
+        evt->hdr.tgid = (__u32)(pid_tgid >> 32);
+        evt->cert.cgroup_id = bpf_get_current_cgroup_id();
 
-        __builtin_memcpy(evt->comm, comm, sizeof(comm));
+        __builtin_memcpy(evt->hdr.comm, comm, sizeof(comm));
 
         bpf_ringbuf_submit(evt, 0);
     }

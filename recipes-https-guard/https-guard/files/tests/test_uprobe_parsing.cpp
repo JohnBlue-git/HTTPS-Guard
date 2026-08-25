@@ -1,138 +1,152 @@
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 
 #include <doctest/doctest.h>
 
-#include "parse_uprobe_event.hpp"
-#include "uprobe_hg_event.hpp"
-#include "xdp_hg_event.hpp"
+#include "IPeerResolver.hpp"
+#include "PayloadAnomalyDetection.hpp"
+#include "TlsVersionDetection.hpp"
+#include "TrafficObservedDetection.hpp"
+#include "ssl_uprobe_event.h"
+#include "xdp_tls_event.h"
 
 using namespace https_guard;
 
 namespace {
 
 uprobe_event makeRaw(hg_uprobe_direction direction, uint16_t tls_version,
-                      const char* process, const char* payload)
+                     const char* process, const char* payload)
 {
     uprobe_event raw{};
-    raw.event_source = HG_SOURCE_UPROBE;
-    raw.direction = direction;
-    raw.pid = 4242;
-    raw.tgid = 4242;
-    raw.tls_version = tls_version;
-    std::snprintf(raw.process, sizeof(raw.process), "%s", process);
-    std::snprintf(raw.payload_snippet, sizeof(raw.payload_snippet), "%s", payload);
+    raw.hdr.event_source = HG_SOURCE_UPROBE;
+    raw.hdr.timestamp_ns = 1700000000000000000ULL;
+    raw.hdr.pid  = 4242;
+    raw.hdr.tgid = 4242;
+    std::snprintf(raw.hdr.comm, sizeof(raw.hdr.comm), "%s", process);
+
+    raw.direction   = direction;
+    raw.tls.version = tls_version;
+    std::snprintf(raw.tls.payload_snippet, sizeof(raw.tls.payload_snippet), "%s", payload);
     return raw;
 }
 
 }  // namespace
 
-TEST_CASE("parseUprobeEventFields tags SSL_write events as outbound")
-{
-    const auto raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0304, "bmcweb", "HTTP/1.1 200 OK");
-    UprobeEvent evt;
-    parseUprobeEventFields(raw, evt);
+// A detection parses and evaluates in one step, so what a test can observe is
+// the EventMeta it filled and the Verdict it returned. That is the whole of what
+// the daemon acts on, and it is the real code path rather than a reimplementation
+// of it -- which is why inspect() must stay linkable without the actions.
 
-    CHECK(evt.is_inbound == false);
-    CHECK(evt.pid == 4242);
-    CHECK(evt.tls_version == 0x0304);
-    CHECK(evt.process == "bmcweb");
-    CHECK(evt.payload_snippet == "HTTP/1.1 200 OK");
+TEST_CASE("a detection fills the shared envelope from the raw record")
+{
+    // Regression: the header fields were being dropped. timestamp_ns in
+    // particular went nowhere, so RedfishEventMessage built every event's "Id"
+    // and "EventId" from 0 -- meaning every emitted Redfish event shared the
+    // same Id, which is exactly what an Id is for. The BPF side had been
+    // capturing it correctly the whole time.
+    const auto raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0303, "bmcweb", "ok");
+
+    EventMeta meta;
+    const TrafficObservedDetection<struct uprobe_event> detection;
+    const auto verdict = detection.inspect(&raw, sizeof(raw), meta);
+
+    REQUIRE(verdict.has_value());
+    CHECK(meta.timestamp_ns == 1700000000000000000ULL);
+    CHECK(meta.pid  == 4242);
+    CHECK(meta.tgid == 4242);
+    CHECK(meta.process == "bmcweb");
 }
 
-TEST_CASE("parseUprobeEventFields tags SSL_read events as inbound")
+TEST_CASE("the payload detection reads the plaintext the uprobe captured")
 {
     const auto raw = makeRaw(HG_UPROBE_DIR_READ, 0x0304, "bmcweb",
-                              "GET /redfish/v1?id=1 union select * from users");
-    UprobeEvent evt;
-    parseUprobeEventFields(raw, evt);
+                             "GET /redfish/v1?id=1 union select * from users");
 
-    CHECK(evt.is_inbound == true);
-    CHECK(evt.payload_snippet == "GET /redfish/v1?id=1 union select * from users");
+    EventMeta meta;
+    const PayloadAnomalyDetection<struct uprobe_event> detection;
+    const auto verdict = detection.inspect(&raw, sizeof(raw), meta);
+
+    REQUIRE(verdict.has_value());
+    CHECK(verdict->message_id == "OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected");
+    CHECK(verdict->message.find("union select") != std::string::npos);
+    CHECK(verdict->message.find("bmcweb") != std::string::npos);
 }
 
-TEST_CASE("parseUprobeEventFields does not truncate short fields early")
+TEST_CASE("clean traffic is claimed only by the terminal traffic-observed entry")
 {
-    const auto raw = makeRaw(HG_UPROBE_DIR_READ, 0x0303, "curl", "");
-    UprobeEvent evt;
-    parseUprobeEventFields(raw, evt);
+    const auto raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0304, "bmcweb", "HTTP/1.1 200 OK");
 
-    CHECK(evt.process == "curl");
-    CHECK(evt.payload_snippet == "");
+    EventMeta meta;
+    CHECK(TlsVersionDetection<struct uprobe_event>{}.inspect(&raw, sizeof(raw), meta)
+              .has_value() == false);
+    CHECK(PayloadAnomalyDetection<struct uprobe_event>{}.inspect(&raw, sizeof(raw), meta)
+              .has_value() == false);
+
+    const auto observed = TrafficObservedDetection<struct uprobe_event>{}
+                              .inspect(&raw, sizeof(raw), meta);
+    REQUIRE(observed.has_value());
+    CHECK(observed->message_id == "OemSecurityEvent.1.0.HttpsTrafficObserved");
+    CHECK(observed->severity == "OK");
+    CHECK(observed->actionable == false);
+    CHECK(observed->message.find("TLS 1.3") != std::string::npos);
 }
 
-// --- local/remote orientation (ticket 14) ------------------------------
-//
-// These pin the property that made the original bug possible: nothing
-// asserted on which end of the connection landed in which field, so the two
-// hooks could disagree indefinitely. A consumer must be able to ask for
-// "the peer" without knowing which hook produced the event.
-
-TEST_CASE("XDP orientation: an ingress packet's source is the REMOTE peer, its destination is LOCAL")
+TEST_CASE("a record too short for the layout is declined, not misread")
 {
-    // Mirrors XdpTlsProgram::parseEvent's mapping without needing libbpf:
-    // XDP is an ingress hook, so packet src = peer, packet dst = this BMC.
-    constexpr uint32_t kPacketSrc = 0x0100000A;  // the peer, as seen on the wire
-    constexpr uint32_t kPacketDst = 0x0F00000A;  // us
-    constexpr uint16_t kPacketSport = 51000;     // peer's ephemeral port
-    constexpr uint16_t kPacketDport = 443;       // our listening port
+    const auto raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0301, "curl", "x");
 
-    UprobeEvent evt;
-    evt.local_ip_v4  = kPacketDst;
-    evt.remote_ip_v4 = kPacketSrc;
-    evt.local_port   = kPacketDport;
-    evt.remote_port  = kPacketSport;
-
-    // The thing we would blocklist must be the peer, never ourselves.
-    CHECK(evt.remote_ip_v4 == kPacketSrc);
-    CHECK(evt.local_ip_v4 != evt.remote_ip_v4);
-    // Our end is the one serving 443.
-    CHECK(evt.local_port == 443);
+    EventMeta meta;
+    const TlsVersionDetection<struct uprobe_event> detection;
+    // A byte short of the struct: must decline rather than read past the record.
+    CHECK(detection.inspect(&raw, sizeof(raw) - 1, meta).has_value() == false);
+    CHECK(detection.inspect(nullptr, sizeof(raw), meta).has_value() == false);
+    // The full record does violate, so the decline above was about length.
+    CHECK(detection.inspect(&raw, sizeof(raw), meta).has_value() == true);
 }
 
-TEST_CASE("uprobe orientation: /proc's local_address is LOCAL, rem_address is REMOTE")
+TEST_CASE("a ClientHello detection declines a uprobe record, and vice versa")
 {
-    // /proc/<pid>/net/tcp column 1 is local_address, column 2 is rem_address
-    // (verified against the file's own header). For bmcweb, the local end is
-    // the one on 443 -- the opposite of the XDP packet's view, which is
-    // precisely why role-based names are needed.
-    constexpr uint32_t kLocal  = 0x0F00000A;
-    constexpr uint32_t kRemote = 0x0100000A;
+    // Not a type-system claim -- these are different template instantiations --
+    // but a runtime one: each checks the record is long enough for ITS layout,
+    // so a hook cannot accidentally feed the wrong one a short record and have
+    // it read garbage. xdp_event is much larger than uprobe_event.
+    const auto uprobe_raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0301, "curl", "x");
 
-    UprobeEvent evt;
-    evt.local_ip_v4  = kLocal;
-    evt.remote_ip_v4 = kRemote;
-    evt.local_port   = 443;
-    evt.remote_port  = 51000;
-
-    CHECK(evt.remote_ip_v4 == kRemote);
-    CHECK(evt.local_port == 443);
+    EventMeta meta;
+    const TlsVersionDetection<struct xdp_event> xdp_detection;
+    CHECK(xdp_detection.inspect(&uprobe_raw, sizeof(uprobe_raw), meta).has_value() == false);
 }
 
-TEST_CASE("both hooks agree on which field holds the peer, despite opposite wire views")
+// --- the connection tuple, named by role ------------------------------------
+
+TEST_CASE("both sources agree on which field holds the peer, despite opposite wire views")
 {
-    // The whole point: given the same real connection observed by either
-    // hook, remote_* names the same host. Under src/dst it did not.
+    // Given the same real connection observed either way, remote_* names the
+    // same host. Under src/dst it did not: the uprobe read /proc's local
+    // address into src_*, while the XDP ingress hook put the packet's sender
+    // there -- so the blocklist received the BMC's own address for one of them.
     constexpr uint32_t kPeer = 0x0100000A;
     constexpr uint32_t kUs   = 0x0F00000A;
 
-    hg_event from_xdp{};      // ingress packet: src=peer, dst=us
-    from_xdp.local_ip_v4  = kUs;
-    from_xdp.remote_ip_v4 = kPeer;
+    struct xdp_event raw{};
+    raw.hdr.event_source = HG_SOURCE_XDP;
+    raw.conn.src_ip_v4 = kPeer;    // ingress: src is the peer
+    raw.conn.dst_ip_v4 = kUs;
+    raw.conn.src_port  = 51000;
+    raw.conn.dst_port  = 443;
 
-    hg_event from_uprobe{};   // /proc: col1=local(us), col2=rem(peer)
-    from_uprobe.local_ip_v4  = kUs;
-    from_uprobe.remote_ip_v4 = kPeer;
+    EventMeta meta;
+    (void)TrafficObservedDetection<struct xdp_event>{}.inspect(&raw, sizeof(raw), meta);
 
-    CHECK(from_xdp.remote_ip_v4 == from_uprobe.remote_ip_v4);
-    CHECK(from_xdp.local_ip_v4  == from_uprobe.local_ip_v4);
+    CHECK(meta.remote_ip_v4 == kPeer);
+    CHECK(meta.local_ip_v4  == kUs);
+    CHECK(meta.local_port   == 443);
+    CHECK(meta.remote_port  == 51000);
 }
 
-// --- lazy peer resolution (ticket 11) ----------------------------------
-//
-// The point of the seam: resolving the connection tuple reads /proc, which
-// is the most expensive thing in the pipeline, and almost nothing needs the
-// result. These pin that it happens on demand, once, and not otherwise.
+// --- lazy peer resolution ---------------------------------------------------
 
 namespace {
 
@@ -141,16 +155,16 @@ class CountingResolver final : public IPeerResolver
 public:
     explicit CountingResolver(bool succeed) noexcept : succeed_(succeed) {}
 
-    bool resolvePeer(hg_event& evt) const noexcept override
+    bool resolvePeer(EventMeta& meta) const noexcept override
     {
         ++calls;
         if (!succeed_) {
             return false;   // leaves the tuple zeroed, as the real one does
         }
-        evt.local_ip_v4  = 0x0F00000A;
-        evt.remote_ip_v4 = 0x0100000A;
-        evt.local_port   = 443;
-        evt.remote_port  = 51000;
+        meta.local_ip_v4  = 0x0F00000A;
+        meta.remote_ip_v4 = 0x0100000A;
+        meta.local_port   = 443;
+        meta.remote_port  = 51000;
         return true;
     }
 
@@ -162,64 +176,58 @@ private:
 
 }  // namespace
 
-TEST_CASE("peer resolution does not happen unless something asks for it")
+TEST_CASE("peer resolution does not happen during parsing")
 {
+    // The whole saving: reading /proc is the most expensive thing in the
+    // pipeline, and only the enforcing path needs the result.
     CountingResolver resolver{true};
-    UprobeEvent evt;
-    evt.peer_resolver = &resolver;
+    const auto raw = makeRaw(HG_UPROBE_DIR_WRITE, 0x0304, "bmcweb", "HTTP/1.1 200 OK");
 
-    // Parsing and classifying an event must not trigger it: this is the
-    // whole saving, since most events are classified OK and never enforce.
+    EventMeta meta;
+    const TrafficObservedDetection<struct uprobe_event> detection{&resolver};
+    (void)detection.inspect(&raw, sizeof(raw), meta);
+
     CHECK(resolver.calls == 0);
-    CHECK(evt.remote_ip_v4 == 0);
+    CHECK(meta.peer_resolver == &resolver);
+    CHECK(meta.remote_ip_v4 == 0);
 }
 
 TEST_CASE("peer resolution is memoised: repeated asks cost one /proc read")
 {
     CountingResolver resolver{true};
-    UprobeEvent evt;
-    evt.peer_resolver = &resolver;
+    EventMeta meta;
+    meta.peer_resolver = &resolver;
 
-    CHECK(evt.ensurePeerResolved() == true);
-    CHECK(evt.ensurePeerResolved() == true);
-    CHECK(evt.ensurePeerResolved() == true);
+    CHECK(meta.ensurePeerResolved() == true);
+    CHECK(meta.ensurePeerResolved() == true);
+    CHECK(meta.ensurePeerResolved() == true);
     CHECK(resolver.calls == 1);
-    CHECK(evt.remote_ip_v4 == 0x0100000A);
-    CHECK(evt.local_port == 443);
+    CHECK(meta.remote_ip_v4 == 0x0100000A);
 }
 
-TEST_CASE("a failed resolution is remembered too, and leaves the tuple unusable")
+TEST_CASE("a failed resolution is remembered, not retried")
 {
     CountingResolver resolver{false};
-    UprobeEvent evt;
-    evt.peer_resolver = &resolver;
+    EventMeta meta;
+    meta.peer_resolver = &resolver;
 
-    CHECK(evt.ensurePeerResolved() == false);
-    CHECK(evt.ensurePeerResolved() == false);
-    CHECK(resolver.calls == 1);       // not retried per ask
-    CHECK(evt.remote_ip_v4 == 0);     // so enforcement declines
+    CHECK(meta.ensurePeerResolved() == false);
+    CHECK(meta.ensurePeerResolved() == false);
+    CHECK(resolver.calls == 1);
+    CHECK(meta.remote_ip_v4 == 0);   // fail-closed: nothing to enforce against
 }
 
-TEST_CASE("an event with no resolver reports unresolved rather than crashing")
-{
-    // XDP events take this path: their addresses come from the packet, so
-    // they never carry a resolver.
-    UprobeEvent evt;
-    CHECK(evt.peer_resolver == nullptr);
-    CHECK(evt.ensurePeerResolved() == false);
-}
-
-TEST_CASE("an event that already knows its address needs no resolver to be enforceable")
+TEST_CASE("an event that already knows its address needs no resolver to enforce")
 {
     // Pins the regression that silently disabled enforcement for XDP and
     // connection-rate events: both fill remote_ip_v4 directly and carry no
     // resolver, so gating enforcement on ensurePeerResolved() returning true
     // skipped them entirely.
-    XdpEvent evt;
-    evt.remote_ip_v4 = 0x0100000A;   // came from the packet headers
-    evt.local_ip_v4  = 0x0F00000A;
+    EventMeta meta;
+    meta.remote_ip_v4 = 0x0100000A;
+    meta.local_ip_v4  = 0x0F00000A;
 
-    CHECK(evt.peer_resolver == nullptr);
-    CHECK(evt.ensurePeerResolved() == false);   // nothing to resolve...
-    CHECK(evt.remote_ip_v4 != 0);               // ...but the address is there
+    CHECK(meta.peer_resolver == nullptr);
+    CHECK(meta.ensurePeerResolved() == false);   // nothing to resolve...
+    CHECK(meta.remote_ip_v4 != 0);               // ...but the address is there
 }

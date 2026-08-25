@@ -396,17 +396,22 @@
       <div class="prose">
         <p>The two kernel probes see different things and submit different structs &mdash; there is no shared "event" type, because the uprobe has no access to socket info and the XDP program has no access to the OpenSSL session. The daemon tells them apart by an <code>event_source</code> discriminator that is always the struct's first field.</p>
       </div>
+      <div class="prose">
+        <p>Both the BPF program and the C++ hook module compile the same header, so there is no marshalling step &mdash; and equally nothing to catch a mismatch, which is why the layout is nested rather than flat. Three consequences worth knowing. The five common fields live in one shared struct, so they <em>cannot</em> drift between hooks (all three previously carried their own copy, and one called <code>comm</code> &ldquo;process&rdquo;). A parser can be handed the sub-struct it fills rather than the whole event &mdash; <code>parse_client_hello_detail()</code> takes <code>hg_client_hello*</code>, so it is structurally unable to touch anything the caller already wrote. And <code>event_source</code> must stay first inside <code>hg_event_hdr</code>, with <code>hdr</code> first in every event struct, because <code>DetectLoop::process()</code> reads a <code>uint32</code> at offset 0 before it knows the record's type; two <code>static_assert</code>s per hook pin that rather than trusting nobody reorders a member.</p>
+      </div>
       <div class="table-wrap">
         <table>
-          <caption>Event structs at a glance</caption>
-          <thead><tr><th>Field</th><th class="mono">uprobe_event</th><th class="mono">xdp_event</th></tr></thead>
+          <caption>Raw event structs at a glance &mdash; one shared envelope, then per-hook detail</caption>
+          <thead><tr><th></th><th class="mono">uprobe_event</th><th class="mono">xdp_event</th><th class="mono">lsm_cert_guard_event</th></tr></thead>
           <tbody>
-            <tr><td>Source</td><td class="mono">HG_SOURCE_UPROBE</td><td class="mono">HG_SOURCE_XDP</td></tr>
-            <tr><td>TLS version</td><td>from <code>ssl-&gt;version</code> via <code>bpf_probe_read_user()</code></td><td>from parsed ClientHello</td></tr>
-            <tr><td>Socket info</td><td class="mono">&mdash; not available</td><td>src/dst IP, src/dst port</td></tr>
-            <tr><td>Pre-classification</td><td class="mono">none (purely observational)</td><td><code>is_violation</code> flag only</td></tr>
-            <tr><td>Payload snippet</td><td>up to 127 bytes</td><td>up to 127 bytes</td></tr>
-            <tr><td>Size</td><td class="num-cell">~176 bytes</td><td class="num-cell">~224 bytes</td></tr>
+            <tr><td>Envelope</td><td colspan="3" style="text-align:center"><code>hg_event_hdr hdr</code> &mdash; <code>event_source</code>, <code>timestamp_ns</code>, <code>pid</code>/<code>tgid</code>, <code>comm</code></td></tr>
+            <tr><td>Source</td><td class="mono">HG_SOURCE_UPROBE</td><td class="mono">HG_SOURCE_XDP</td><td class="mono">HG_SOURCE_LSM_CERT_GUARD</td></tr>
+            <tr><td>Detail sub-structs</td><td><code>direction</code>, <code>hg_uprobe_tls</code></td><td><code>hg_conn_tuple</code>, <code>hg_xdp_tls</code>, <code>hg_client_hello</code></td><td><code>hg_cert_access</code></td></tr>
+            <tr><td>TLS version</td><td>from <code>ssl-&gt;version</code> via <code>bpf_probe_read_user()</code></td><td>from the ClientHello on the wire</td><td class="mono">&mdash;</td></tr>
+            <tr><td>Connection tuple</td><td class="mono">&mdash; a uprobe has no socket</td><td>full 4-tuple, named by direction</td><td class="mono">&mdash;</td></tr>
+            <tr><td>Pre-classification</td><td class="mono">none (purely observational)</td><td><code>tls.is_violation</code> hint only</td><td><code>cert.comm_mismatch</code> (weak)</td></tr>
+            <tr><td>Payload snippet</td><td>up to 127 bytes</td><td>up to 127 bytes</td><td class="mono">&mdash;</td></tr>
+            <tr><td>Size</td><td class="num-cell">184 B</td><td class="num-cell">352 B</td><td class="num-cell">56 B</td></tr>
           </tbody>
         </table>
       </div>
@@ -430,7 +435,7 @@ push(LogAction{...});                  // always</pre>
       </div>
       <div class="prose">
         <p>Two properties of that loop are easy to lose in a rewrite and worth stating. Admission is bounded by an explicit in-flight count, because <code>post()</code> is an unbounded queue and on a ~1GB BMC an OOM &mdash; which takes <em>all</em> detection with it &mdash; is a far worse outcome than one dropped event; the policy is drop-the-newest, so what remains is a coherent prefix of history rather than a hole in the middle. And the loop runs two threads with the connection-rate sweep timer deliberately <em>off</em> the record strand: a single-threaded loop starves that timer by FIFO fairness alone, since it queues behind every record already posted. Measured against a deliberate backlog, one thread produced zero sweeps in nine seconds where two produced one every two.</p>
-        <p>A rule reaches hook-specific data through a <em>capability interface</em> rather than off a shared struct, so a certificate-access event is not obliged to carry a TLS version or a cipher-suite list. An event that cannot supply a capability is declined rather than misread.</p>
+        <p>A rule reaches an event's data off a plain struct, and binds to it through a <em>concept</em> rather than a shared base class &mdash; so a certificate-access event is not obliged to carry a TLS version or a cipher-suite list, and a rule that reads a field its event cannot supply does not compile. There is no downcast anywhere on this path.</p>
         <p>A <code>uprobe_event</code> carries no socket info, so the 4-tuple is recovered from <code>/proc</code> &mdash; but lazily, only once a verdict is actionable, since that walk is the most expensive step in the pipeline and most events never reach it. It also fails closed: a process owning several established connections cannot be attributed to one, and enforcement declines rather than guessing. An <code>xdp_event</code> already has the tuple from the packet headers.</p>
       </div>
       <div class="table-wrap">
@@ -458,117 +463,109 @@ push(LogAction{...});                  // always</pre>
     <section id="classes">
       <h2><span class="num">&sect;4</span> Class Relationships</h2>
       <div class="prose">
-        <p>The whole codebase plugs into <strong>three interfaces</strong>, and almost nothing else is polymorphic. <code>IHookModule</code> is a source of events, <code>IDetector</code> is a rule, <code>IAction</code> is a response. Adding a hook, a rule or a countermeasure means writing one class and adding one line to the composition root in <code>programs/core/main.cpp</code> &mdash; the engine classes are never touched.</p>
-        <p>That is the property worth protecting when reading the diagram below: <code>HttpGuardProgram</code>, <code>DetectLoop</code> and <code>ActionLoop</code> know only the interfaces. None of them names a concrete hook, rule or action.</p>
+        <p>Three things extend this codebase: a <strong>hook</strong> derives from <code>BpfProgram</code>, a <strong>detection</strong> implements <code>IDetection</code>, and a <strong>response</strong> implements <code>IAction</code>. A new hook is one class plus one line in <code>programs/core/main.cpp</code>. A new detection is one directory under <code>detections/</code> plus one entry in the list of whichever hook can feed it &mdash; nothing else changes, including the composition root.</p>
+        <p>The property worth protecting when reading the diagram: <code>HttpGuardProgram</code>, <code>DetectLoop</code> and <code>ActionLoop</code> name no concrete hook, detection, event or action. A record arrives carrying the list of detections to try against it, the loop walks that list in order, and the first verdict wins &mdash; so inside a detection the concrete type is known to the compiler from the raw bytes through to the verdict, and outside one nothing knows what an event is at all.</p>
       </div>
 
       <figure class="diagram">
         <div class="diagram-frame">
-          <svg viewBox="0 0 900 650" role="img" aria-label="Three interfaces form the seams: IHookModule implemented by SslUprobeProgram, XdpTlsProgram and LsmCertGuardProgram; IDetector implemented by eight detectors; IAction implemented by LogAction, BlockTcpAction and BlocklistAddAction. Below them, HttpGuardProgram owns the hooks and calls DetectLoop::submit, DetectLoop calls parseEvent on the owning hook and evaluate on the detectors, then calls ActionLoop::pushAction, which co_spawns the actions. Separately, hg_event is the common event base and six capability interfaces expose hook-specific data; six concrete event types each extend hg_event and implement only the capabilities their hook can supply.">
-            <text class="dg-zone-label dg-zone-label-user" x="24" y="22">Seams &mdash; the three interfaces everything plugs into</text>
+          <svg viewBox="0 0 900 660" role="img" aria-label="Three extension points: BpfProgram is derived from by SslUprobeProgram, XdpTlsProgram and LsmCertGuardProgram; eight rules are plain classes bound to concepts; IAction is implemented by LogAction, BlockTcpAction and BlocklistAddAction. Below them HttpGuardProgram owns the BPF object and the hooks and calls DetectLoop::submit; DetectLoop looks up a handler by event source and calls it; the handler parses, runs its rules and calls dispatchVerdict, which calls ActionLoop::pushAction, which co_spawns the actions. Separately, EventMeta is composed into six concrete event structs, and seven concepts describe which fields each supplies.">
+            <text class="dg-zone-label dg-zone-label-user" x="24" y="22">Extension points &mdash; write one class, add one line to main.cpp</text>
 
-            <!-- interface headers -->
             <rect class="dg-pill dg-pill-neutral" x="24"  y="34" width="250" height="36" rx="18"/>
-            <text class="dg-title" x="149" y="57" text-anchor="middle">IHookModule</text>
+            <text class="dg-title" x="149" y="57" text-anchor="middle">BpfProgram</text>
             <rect class="dg-pill dg-pill-neutral" x="325" y="34" width="250" height="36" rx="18"/>
-            <text class="dg-title" x="450" y="57" text-anchor="middle">IDetector</text>
+            <text class="dg-title" x="450" y="57" text-anchor="middle">IDetection</text>
             <rect class="dg-pill dg-pill-neutral" x="626" y="34" width="250" height="36" rx="18"/>
             <text class="dg-title" x="751" y="57" text-anchor="middle">IAction</text>
 
-            <!-- implementers -->
             <rect class="dg-box dg-box-kernel" x="24" y="82" width="250" height="86" rx="10"/>
             <text class="dg-label" x="149" y="108" text-anchor="middle">SslUprobeProgram</text>
             <text class="dg-label" x="149" y="127" text-anchor="middle">XdpTlsProgram</text>
             <text class="dg-label" x="149" y="146" text-anchor="middle">LsmCertGuardProgram</text>
 
             <rect class="dg-box dg-box-user" x="325" y="82" width="250" height="176" rx="10"/>
-            <text class="dg-label" x="450" y="108" text-anchor="middle">TlsVersionDetector</text>
-            <text class="dg-label" x="450" y="127" text-anchor="middle">PayloadAnomalyDetector</text>
-            <text class="dg-label" x="450" y="146" text-anchor="middle">CipherSuiteDetector</text>
-            <text class="dg-label" x="450" y="165" text-anchor="middle">SniDetector</text>
-            <text class="dg-label" x="450" y="184" text-anchor="middle">CertAccessDetector</text>
-            <text class="dg-label" x="450" y="203" text-anchor="middle">ConnRateDetector</text>
-            <text class="dg-label" x="450" y="222" text-anchor="middle">SlowlorisDetector</text>
-            <text class="dg-label" x="450" y="241" text-anchor="middle">RenegotiationDetector</text>
+            <text class="dg-label" x="450" y="108" text-anchor="middle">TlsVersionDetection</text>
+            <text class="dg-label" x="450" y="127" text-anchor="middle">PayloadAnomalyDetection</text>
+            <text class="dg-label" x="450" y="146" text-anchor="middle">CipherSuiteDetection</text>
+            <text class="dg-label" x="450" y="165" text-anchor="middle">SniDetection</text>
+            <text class="dg-label" x="450" y="184" text-anchor="middle">CertAccessDetection</text>
+            <text class="dg-label" x="450" y="203" text-anchor="middle">TrafficObservedDetection</text>
+            <text class="dg-sub"   x="450" y="224" text-anchor="middle">&mdash; and three counter rules the</text>
+            <text class="dg-sub"   x="450" y="240" text-anchor="middle">sweeper calls without a record</text>
 
             <rect class="dg-box dg-box-warn" x="626" y="82" width="250" height="86" rx="10"/>
             <text class="dg-label" x="751" y="108" text-anchor="middle">LogAction</text>
             <text class="dg-label" x="751" y="127" text-anchor="middle">BlockTcpAction</text>
             <text class="dg-label" x="751" y="146" text-anchor="middle">BlocklistAddAction</text>
 
-            <!-- engine row -->
             <rect class="dg-box" x="24"  y="338" width="250" height="64" rx="10"/>
             <text class="dg-title" x="149" y="364" text-anchor="middle">HttpGuardProgram</text>
-            <text class="dg-sub"   x="149" y="383" text-anchor="middle">: BpfProgram &mdash; poll thread</text>
+            <text class="dg-sub"   x="149" y="383" text-anchor="middle">object + ringbuf + poll loop</text>
 
             <rect class="dg-box" x="325" y="338" width="250" height="64" rx="10"/>
             <text class="dg-title" x="450" y="364" text-anchor="middle">DetectLoop</text>
-            <text class="dg-sub"   x="450" y="383" text-anchor="middle">asio::io_context, 2 threads</text>
+            <text class="dg-sub"   x="450" y="383" text-anchor="middle">singleton, 2 threads, no types</text>
 
             <rect class="dg-box" x="626" y="338" width="250" height="64" rx="10"/>
             <text class="dg-title" x="751" y="364" text-anchor="middle">ActionLoop</text>
-            <text class="dg-sub"   x="751" y="383" text-anchor="middle">asio::io_context, 1 thread</text>
+            <text class="dg-sub"   x="751" y="383" text-anchor="middle">singleton, 1 thread</text>
 
-            <!-- engine -> interface edges -->
             <path class="dg-edge dg-edge-kernel" d="M149,338 V170" marker-end="url(#arrowKernel)"/>
             <text class="dg-edge-label" x="157" y="256">owns, attach()</text>
 
             <path class="dg-edge dg-edge-user" d="M450,338 V260" marker-end="url(#arrowUser)"/>
-            <text class="dg-edge-label" x="458" y="300">evaluate()</text>
+            <text class="dg-edge-label" x="458" y="292">walks the list</text>
+            <text class="dg-edge-label" x="458" y="306">first match wins</text>
 
             <path class="dg-edge dg-edge-neutral" d="M751,338 V170" marker-end="url(#arrowNeutral)"/>
             <text class="dg-edge-label" x="759" y="256">co_spawn</text>
 
-            <path class="dg-edge dg-edge-user dg-edge-dashed" d="M340,338 V308 H200 V172" marker-end="url(#arrowUser)"/>
-            <text class="dg-edge-label" x="252" y="302" text-anchor="middle">parseEvent()</text>
-
-            <!-- engine -> engine edges -->
             <path class="dg-edge dg-edge-neutral" d="M274,370 H323" marker-end="url(#arrowNeutral)"/>
-            <text class="dg-edge-label" x="299" y="326" text-anchor="middle">submit()</text>
+            <text class="dg-edge-label" x="299" y="326" text-anchor="middle">submit(+list)</text>
 
             <path class="dg-edge dg-edge-neutral" d="M575,370 H624" marker-end="url(#arrowNeutral)"/>
             <text class="dg-edge-label" x="600" y="326" text-anchor="middle">pushAction()</text>
 
-            <!-- event model -->
-            <text class="dg-zone-label dg-zone-label-kernel" x="24" y="438">Event model &mdash; one base, six capabilities, six concrete types</text>
+            <text class="dg-zone-label dg-zone-label-kernel" x="24" y="438">Event model &mdash; one struct per detection, composed not inherited</text>
 
             <rect class="dg-box" x="24" y="452" width="400" height="52" rx="10"/>
-            <text class="dg-title" x="224" y="474" text-anchor="middle">hg_event</text>
+            <text class="dg-title" x="224" y="474" text-anchor="middle">EventMeta</text>
             <text class="dg-sub"   x="224" y="492" text-anchor="middle">when &middot; which process &middot; local_* / remote_* &middot; peer_resolver</text>
 
             <rect class="dg-box" x="476" y="452" width="400" height="52" rx="10"/>
-            <text class="dg-title" x="676" y="474" text-anchor="middle">6 capability interfaces</text>
-            <text class="dg-sub"   x="676" y="492" text-anchor="middle">ITlsTrafficInfo &middot; IClientHelloInfo &middot; ICertAccessInfo &middot; &hellip;</text>
+            <text class="dg-title" x="676" y="474" text-anchor="middle">EventMeta + own fields</text>
+            <text class="dg-sub"   x="676" y="492" text-anchor="middle">one struct per detection, carrying only what its rule reads</text>
 
             <rect class="dg-box dg-box-user" x="24" y="572" width="852" height="56" rx="10"/>
-            <text class="dg-label" x="450" y="595" text-anchor="middle">UprobeEvent &middot; XdpEvent &middot; CertAccessEvent &middot; ConnRateEvent &middot; SlowlorisEvent &middot; RenegotiationEvent</text>
-            <text class="dg-sub"   x="450" y="614" text-anchor="middle">each extends hg_event, and implements only the capabilities its own hook can actually supply</text>
+            <text class="dg-label" x="450" y="595" text-anchor="middle">TlsVersionEvent &middot; PayloadEvent &middot; CipherSuiteEvent &middot; SniEvent &middot; CertAccessEvent &middot; ConnRate &middot; Slowloris &middot; Renegotiation</text>
+            <text class="dg-sub"   x="450" y="614" text-anchor="middle">plain structs, no common base: each CONTAINS an EventMeta and is read by exactly one rule</text>
 
             <path class="dg-edge dg-edge-neutral" d="M300,572 V506" marker-end="url(#arrowNeutral)"/>
-            <text class="dg-edge-label" x="308" y="544">extends</text>
+            <text class="dg-edge-label" x="308" y="544">contains</text>
             <path class="dg-edge dg-edge-neutral" d="M620,572 V506" marker-end="url(#arrowNeutral)"/>
-            <text class="dg-edge-label" x="628" y="544">implements</text>
+            <text class="dg-edge-label" x="628" y="544">plus</text>
           </svg>
         </div>
-        <figcaption>Fig. 2 &mdash; Class relationships. Solid edges are ownership or a direct call; the dashed edge is <code>DetectLoop</code> calling back into whichever hook produced the record it is holding, found by matching <code>eventSource()</code>. Note what is <em>absent</em>: no engine class names a concrete type, and no detector names a concrete event &mdash; a rule binds to a capability interface, which is why two rules can serve both the uprobe and XDP hooks without either hook knowing about the other.</figcaption>
+        <figcaption>Fig. 2 &mdash; Class relationships. Note what is <em>absent</em>: no engine class names a concrete type, and there is no common event base to downcast from. A detection carries its own event struct, its own parse and its own rule, so the concrete type is known to the compiler end to end &mdash; and a detection that serves two hooks is one template over the raw layout rather than two copies. The three counter rules have no <code>IDetection</code> because they have no ring-buffer record: <code>ConnRateSweeper</code> reads the BPF map on a timer and calls them directly.</figcaption>
       </figure>
 
       <div class="table-wrap">
         <table>
-          <caption>The three seams</caption>
-          <thead><tr><th>Interface</th><th>Contract</th><th>Implemented by</th><th>Called from</th></tr></thead>
+          <caption>The extension points</caption>
+          <thead><tr><th>What</th><th>Contract</th><th>Implemented by</th><th>Called from</th></tr></thead>
           <tbody>
             <tr>
-              <td class="mono">IHookModule</td>
-              <td><code>attach()</code>, <code>eventSource()</code>, <code>parseEvent()</code></td>
+              <td class="mono">BpfProgram</td>
+              <td><code>attach()</code>, <code>eventSource()</code>, and a <code>ringBufferHandler()</code> that submits the record <em>together with this hook's detection list</em></td>
               <td>3 hooks &mdash; uprobe, XDP, LSM</td>
-              <td><code>HttpGuardProgram</code> attaches; <code>DetectLoop</code> parses</td>
+              <td><code>HttpGuardProgram</code> attaches them and dispatches records to them</td>
             </tr>
             <tr>
-              <td class="mono">IDetector</td>
-              <td><code>evaluate(const hg_event&amp;) const &rarr; optional&lt;Verdict&gt;</code></td>
-              <td>8 rules</td>
-              <td><code>DetectLoop</code>, first match wins per event source</td>
+              <td class="mono">IDetection</td>
+              <td><code>inspect(data, size, meta) const &rarr; optional&lt;Verdict&gt;</code> &mdash; parse and evaluate together</td>
+              <td>8 detections, one directory each</td>
+              <td>the loop, walking the submitting hook's list in order &mdash; first verdict wins</td>
             </tr>
             <tr>
               <td class="mono">IAction</td>
@@ -578,35 +575,38 @@ push(LogAction{...});                  // always</pre>
             </tr>
             <tr>
               <td class="mono">IPeerResolver</td>
-              <td><code>resolvePeer(hg_event&amp;) const</code></td>
+              <td><code>resolvePeer(EventMeta&amp;) const</code></td>
               <td><code>SslUprobeProgram</code> only</td>
-              <td><code>hg_event::ensurePeerResolved()</code>, lazily</td>
+              <td><code>EventMeta::ensurePeerResolved()</code>, lazily</td>
             </tr>
           </tbody>
         </table>
       </div>
       <div class="prose">
-        <p><code>IPeerResolver</code> is the fourth seam and the odd one out: it exists so a uprobe event can recover its own 4-tuple from <code>/proc</code> <em>on demand</em>. That walk is the most expensive step in the pipeline and only the enforcing path needs it, so the event carries a non-owning pointer to the hook rather than the hook doing the work up front. <code>SslUprobeProgram</code> is therefore the one class implementing two seams at once.</p>
+        <p><code>IPeerResolver</code> is the odd one out and the only virtual interface left on the classification path: it exists so a uprobe event can recover its own 4-tuple from <code>/proc</code> <em>on demand</em>. That walk is the most expensive step in the pipeline and only the enforcing path needs it, so the event carries a non-owning pointer to the hook rather than the hook doing the work up front. <code>SslUprobeProgram</code> is therefore the one class extending two of these at once.</p>
       </div>
 
       <div class="table-wrap">
         <table>
-          <caption>Capability matrix &mdash; which event supplies what</caption>
-          <thead><tr><th>Event type</th><th>Produced by</th><th>ITlsTrafficInfo</th><th>IClientHelloInfo</th><th>ICertAccessInfo</th><th>IConnectionRateInfo</th><th>ISlowlorisInfo</th><th>IRenegotiationInfo</th></tr></thead>
+          <caption>The eight detections</caption>
+          <thead><tr><th>Detection</th><th>Its event struct carries</th><th>Fed by</th><th>Enforces</th></tr></thead>
           <tbody>
-            <tr><td class="mono">UprobeEvent</td><td>ssl_uprobe</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-            <tr><td class="mono">XdpEvent</td><td>xdp_tls</td><td>&check;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-            <tr><td class="mono">CertAccessEvent</td><td>lsm_cert_guard</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
-            <tr><td class="mono">ConnRateEvent</td><td>ConnRateSweeper</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td></tr>
-            <tr><td class="mono">SlowlorisEvent</td><td>ConnRateSweeper</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&mdash;</td></tr>
-            <tr><td class="mono">RenegotiationEvent</td><td>ConnRateSweeper</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td></tr>
+            <tr><td class="mono">tls_version</td><td>version + <code>violation_hint</code></td><td>uprobe <em>and</em> XDP</td><td><strong>yes</strong></td></tr>
+            <tr><td class="mono">payload_anomaly</td><td>plaintext prefix</td><td>uprobe <em>and</em> XDP</td><td><strong>yes</strong></td></tr>
+            <tr><td class="mono">cipher_suite</td><td>offered suites + true count</td><td>XDP</td><td>no &mdash; alert only</td></tr>
+            <tr><td class="mono">sni</td><td>SNI present / malformed / hostname</td><td>XDP</td><td>no &mdash; alert only</td></tr>
+            <tr><td class="mono">cert_access</td><td>real exe path + identity mismatch</td><td>BPF-LSM</td><td>no</td></tr>
+            <tr><td class="mono">conn_rate</td><td>attempts in window</td><td>sweeper</td><td><strong>yes</strong></td></tr>
+            <tr><td class="mono">slowloris</td><td>connections held open</td><td>sweeper</td><td><strong>yes</strong></td></tr>
+            <tr><td class="mono">renegotiation</td><td>handshakes in window</td><td>sweeper</td><td><strong>yes</strong></td></tr>
           </tbody>
         </table>
       </div>
 
       <div class="prose">
-        <p>The matrix is the point of the design, not a side effect of it. <code>hg_event</code> once carried 25 members covering every hook at once, so an LSM certificate-access event arrived holding a cipher-suite list and an SNI flag, and every new hook widened a type in the classification layer that every other hook depended on. Now a rule <code>dynamic_cast</code>s to the one capability it needs and <strong>declines</strong> if the event cannot supply it &mdash; so the three sweeper-synthesised events can share a single <code>hg_event_source</code> and still not poach each other's work, because each carries only its own capability.</p>
-        <p>Two consequences are load-bearing. Events are <strong>non-copyable</strong> &mdash; copying one as an <code>hg_event</code> would slice off the hook's half &mdash; which is why <code>parseEvent()</code> returns <code>unique_ptr&lt;hg_event&gt;</code>. And <code>ITlsTrafficInfo</code> carries a <code>tlsViolationHint()</code> that exists purely to stop one specific bug: a genuinely parsed <code>legacy_version</code> of <code>0x0000</code> is a real violation on the wire, whereas <code>tlsVersion() == 0</code> from a uprobe only means &ldquo;never observed&rdquo;. Collapsing those two zeros shipped once.</p>
+        <p>Each struct carries only what its own rule reads, and that is the end of a three-stage story worth knowing. A single <code>hg_event</code> once carried 25 members covering every hook at once, so an LSM certificate-access event arrived holding a cipher-suite list and an SNI flag. Then it became a base class plus six virtual capability interfaces, which fixed the god-object but left every rule <code>dynamic_cast</code>ing at runtime &mdash; an event that could not supply a field made the rule <em>decline</em>, indistinguishable in the log from an event that simply did not violate. Then concepts replaced the interfaces, moving that to compile time.</p>
+        <p>Now each detection owns its struct outright, and the concepts went with the problem they solved: with one input type per rule, handing it the wrong event is an ordinary type mismatch. Concepts do survive in <code>detection_traits.hpp</code>, doing different work &mdash; describing what a <em>raw record</em> carries, which is what lets one templated detection serve two hooks without a specialisation per hook.</p>
+        <p>One field looks redundant and is not. <code>violation_hint</code> exists because the two TLS-bearing sources conclude different things from the same number: a genuinely-parsed wire <code>legacy_version</code> of <code>0x0000</code> <em>is</em> a violation, whereas <code>tls_version == 0</code> from a uprobe only means &ldquo;never observed&rdquo;. The XDP instantiation reads the BPF-computed flag; the uprobe one leaves it false. Collapsing those two zeros shipped as a real bug once, caught by review rather than by the implementer.</p>
       </div>
 
       <div class="table-wrap">
@@ -614,12 +614,11 @@ push(LogAction{...});                  // always</pre>
           <caption>Ownership and lifetime</caption>
           <thead><tr><th>Holder</th><th>Holds</th><th>How</th><th>Why that way</th></tr></thead>
           <tbody>
-            <tr><td class="mono">main()</td><td>the hook list, the detector registry</td><td>by value, built once</td><td>the single composition root; the only place concrete types are named</td></tr>
-            <tr><td class="mono">HttpGuardProgram</td><td><code>DetectLoop</code></td><td>by value</td><td>the poll thread's only job is to copy a record and hand it over</td></tr>
-            <tr><td class="mono">DetectLoop</td><td>hooks</td><td><code>const&amp;</code> to <code>main</code>'s vector</td><td>hooks outlive every event they produce, so no shared ownership is needed</td></tr>
-            <tr><td class="mono">DetectLoop</td><td>detectors, <code>ConnRateSweeper</code></td><td>owned</td><td>nothing else uses them</td></tr>
-            <tr><td class="mono">DetectLoop</td><td><code>ActionLoop</code></td><td><code>&amp;</code> to the singleton</td><td>one dispatcher for the process</td></tr>
-            <tr><td class="mono">hg_event</td><td><code>IPeerResolver</code></td><td>raw non-owning pointer</td><td>it <em>is</em> the hook, which outlives the event; null means &ldquo;not resolvable for this source&rdquo;</td></tr>
+            <tr><td class="mono">main()</td><td>the hook list</td><td>built once, moved in</td><td>the only place concrete hooks are named &mdash; a new <em>detection</em> does not touch it</td></tr>
+            <tr><td class="mono">HttpGuardProgram</td><td>the BPF object, the ring buffer, the hooks</td><td>owned</td><td>one object, one ring buffer, one blocklist map &mdash; splitting them would break enforcement silently</td></tr>
+            <tr><td class="mono">DetectLoop</td><td><code>ConnRateSweeper</code> only</td><td>owned; a singleton</td><td>one pipeline per process, reachable from any hook without threading a reference through the BPF lifecycle. It holds no detections &mdash; they arrive with each record</td></tr>
+            <tr><td class="mono">a hook</td><td>its detections</td><td>owned as members</td><td>the pointers it submits must stay valid until the loop inspects the record, which happens after <code>submit()</code> returns &mdash; so the loop copies the pointer list, and the pointees live with the hook</td></tr>
+            <tr><td class="mono">EventMeta</td><td><code>IPeerResolver</code></td><td>raw non-owning pointer</td><td>it <em>is</em> the hook, which outlives the event; null means &ldquo;not resolvable for this source&rdquo;</td></tr>
           </tbody>
         </table>
       </div>
@@ -632,7 +631,7 @@ push(LogAction{...});                  // always</pre>
         <pre>actions_lib  &lt;--  detections_lib  &lt;--  programs_lib</pre>
       </div>
       <div class="prose">
-        <p><code>IHookModule</code> and <code>hg_event</code> therefore live in <code>detections/core/</code> rather than in <code>programs/</code>, even though hooks implement them &mdash; putting them with the hooks would make the graph cyclic, since <code>DetectLoop</code> has to call hooks. For the same reason <code>IHookModule.hpp</code> forward-declares <code>bpf_object</code> and <code>bpf_link</code> instead of including <code>&lt;bpf/libbpf.h&gt;</code>: the classification tree must stay buildable, and unit-testable, with no kernel present. <code>programs/</code> is the only tree that links libbpf, which is what stops a classification rule from acquiring a kernel dependency from the code sitting next to it.</p>
+        <p><code>detections_lib</code> must stay buildable &mdash; and unit-testable &mdash; with no kernel present, so it names no type from <code>programs/</code> except the plain-C raw event structs, which are the BPF&harr;userspace wire format rather than code. <code>IDetection</code> exists precisely so it does not have to: a record arrives with the detections to try against it, and the loop never learns what produced it or what any of them mean. <code>programs/</code> is the only tree that links libbpf, which is what stops a rule from acquiring a kernel dependency from the code sitting next to it.</p>
       </div>
     </section>
 
@@ -805,7 +804,7 @@ push(LogAction{...});                  // always</pre>
 │   ├── https-guard-openbmc.bb        # BitBake recipe (PACKAGECONFIG, install)
 │   └── files/                        # Detect -> Classify -> Dispatch
 │       ├── programs/                 # Detect: one dir per hook
-│       │   ├── core/                 #   BPF wrapper, aggregator, composition root
+│       │   ├── core/                 #   ebpf/ + src/ + main.cpp (composition root)
 │       │   ├── ssl_uprobe/           #   ebpf/ + src/  (SSL_write and SSL_read)
 │       │   ├── xdp_tls/              #   ebpf/ + src/  (ClientHello, blocklist, counters)
 │       │   └── lsm_cert_guard/       #   ebpf/ + src/  (HTTPS key access)
@@ -818,7 +817,7 @@ push(LogAction{...});                  // always</pre>
 │       └── tests/                    # doctest; no kernel, root or QEMU needed
 ├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
 ├── recipes-bmcweb/bmcweb/            # OemSecurityEvent Redfish message registry
-├── scripts/qemu-setup-tap.sh         # Host bridge/TAP setup for XDP testing
+├── scripts/qemu-bridge/qemu-setup-tap.sh # Host bridge/TAP setup for XDP testing
 └── manifest/main.xml</pre>
       </div>
       <div class="table-wrap">
@@ -828,9 +827,9 @@ push(LogAction{...});                  // always</pre>
           <tbody>
             <tr><td>eBPF programs</td><td class="mono">programs/&lt;hook&gt;/ebpf/</td><td>Uprobes capture TLS version + plaintext both directions; XDP inspects ClientHellos, enforces the blocklist and maintains per-source counters; BPF-LSM watches the HTTPS key</td></tr>
             <tr><td>Hook modules</td><td class="mono">programs/&lt;hook&gt;/src/</td><td>Attach the BPF programs and parse their raw records into events. No classification here</td></tr>
-            <tr><td>Rules + engine</td><td class="mono">detections/</td><td>Eight pure <code>IDetector</code> rules, the capability interfaces they bind to, and <code>DetectLoop</code> &mdash; the Boost.Asio loop owning parse &rarr; classify &rarr; dispatch</td></tr>
+            <tr><td>Rules + engine</td><td class="mono">detections/</td><td>Eight rules bound to concepts, the event structs and parsing they consume, and <code>DetectLoop</code> &mdash; the Boost.Asio loop owning parse &rarr; classify &rarr; dispatch. One directory per detection, each with its own <code>DESIGN.md</code></td></tr>
             <tr><td>Enforcement actions</td><td class="mono">actions/</td><td>Three async countermeasures dispatched by <code>ActionLoop</code></td></tr>
-            <tr><td>BPF wrapper</td><td class="mono">programs/core/BpfProgram</td><td>RAII wrapper for program load / attach / detach</td></tr>
+            <tr><td>BPF wrapper</td><td class="mono">programs/core/src/BpfProgram</td><td>RAII wrapper for program load / attach / detach</td></tr>
             <tr><td>Event bridge</td><td class="mono">https-guard-event-bridge.sh</td><td>Tails the event log, forwards to D-Bus and/or the Redfish filesystem log</td></tr>
           </tbody>
         </table>
@@ -845,7 +844,7 @@ push(LogAction{...});                  // always</pre>
           <li><a href="DESIGN.md">DESIGN.md</a> &mdash; the per-file reference this document distills: full struct layouts, the BitBake build flow, and the synchronous-vs-asynchronous strategy write-up in depth.</li>
           <li><a href="README.md#exercising-the-detections">README.md &sect; Exercising the Detections</a> &mdash; how to make each of the nine event types fire, which message ID each produces, and which have actually been driven end-to-end on hardware rather than only unit-tested.</li>
           <li><a href="LIMITATIONS.md">LIMITATIONS.md</a> &mdash; what this tool does <em>not</em> do: the ARM32 trampoline gap, the capture caps, and the fact that the blocklist applies to a source address on every port.</li>
-          <li><a href="scripts/trigger/send_client_hello.py">scripts/trigger/send_client_hello.py</a> &mdash; builds TLS ClientHellos by hand, because OpenSSL 3.x refuses to offer the weak suites and legacy versions the XDP rules look for.</li>
+          <li><a href="scripts/trigger/trigger_detections.py">scripts/trigger/trigger_detections.py</a> &mdash; builds TLS ClientHellos by hand, because OpenSSL 3.x refuses to offer the weak suites and legacy versions the XDP rules look for.</li>
           <li><a href="scripts/listener/">scripts/listener/</a> &mdash; a minimal HTTPS receiver for testing Redfish EventService push end-to-end.</li>
         </ul>
       </div>

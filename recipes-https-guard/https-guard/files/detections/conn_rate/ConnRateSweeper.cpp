@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <iostream>
 
@@ -10,6 +11,31 @@
 #include "conn_rate.bpf.h"
 
 namespace https_guard {
+
+namespace {
+
+/* Synthesised events have no BPF header to take a timestamp from, and a zero
+ * one is not harmless: RedfishEventMessage builds both "Id" and "EventId" out
+ * of it, so every rate, Slowloris and renegotiation event was emitted as
+ * Id "0" / EventId "0-0" -- indistinguishable from each other in the event
+ * log. The ring-buffer path had exactly this bug once and it was fixed there
+ * only.
+ *
+ * CLOCK_MONOTONIC deliberately, because that is what bpf_ktime_get_ns()
+ * reads: the two paths' ids then share one clock domain and sort against
+ * each other. Wall-clock here would order these events randomly among the
+ * parsed ones. */
+std::uint64_t monotonic_now_ns() noexcept
+{
+    struct timespec ts = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
+
+}  // namespace
 
 ConnRateSweeper::ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept
     : map_fd_(map_fd)
@@ -33,11 +59,10 @@ ConnRateSweeper::ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept
               << "/" << HTTPS_GUARD_CONN_RATE_WINDOW_SEC << "s; 0 = rule off)\n";
 }
 
-std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
+void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
 {
-    std::vector<std::unique_ptr<hg_event>> flagged;
     if (!enabled()) {
-        return flagged;
+        return;
     }
 
     /* Iterate with get_next_key rather than holding any lock: entries may be
@@ -58,6 +83,10 @@ std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
     std::size_t   entries_seen = 0;
     std::uint32_t max_syn = 0, max_hello = 0;
     std::int32_t  max_open = 0;
+
+    /* One reading per sweep: events synthesised by the same walk share it,
+     * which is accurate -- they were all observed by that walk. */
+    const std::uint64_t now_ns = monotonic_now_ns();
 
     auto describe = [](std::uint32_t ip_net_order) {
         char buf[INET_ADDRSTRLEN] = {};
@@ -81,13 +110,14 @@ std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
                 seen_rate[key] = entry.window_start_ns;
                 const auto prev = reported_rate_.find(key);
                 if (prev == reported_rate_.end() || prev->second != entry.window_start_ns) {
-                    auto evt = std::make_unique<ConnRateEvent>();
-                    evt->remote_ip_v4   = key;
-                    evt->source_ip      = describe(key);
-                    evt->attempt_count  = entry.syn_count;
-                    evt->window_seconds = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
-                    evt->rate_threshold = thresholds_.connection_rate;
-                    flagged.push_back(std::move(evt));
+                    ConnRateEvent evt;
+                    evt.meta.remote_ip_v4 = key;
+                    evt.meta.source_ip    = describe(key);
+                    evt.meta.timestamp_ns = now_ns;
+                    evt.attempts_in_window = entry.syn_count;
+                    evt.window_seconds     = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
+                    evt.threshold          = thresholds_.connection_rate;
+                    handleConnRateEvent(evt, ctx);
                 }
             }
 
@@ -97,13 +127,14 @@ std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
                 seen_reneg[key] = entry.window_start_ns;
                 const auto prev = reported_reneg_.find(key);
                 if (prev == reported_reneg_.end() || prev->second != entry.window_start_ns) {
-                    auto evt = std::make_unique<RenegotiationEvent>();
-                    evt->remote_ip_v4   = key;
-                    evt->source_ip      = describe(key);
-                    evt->handshake_count = entry.hello_count;
-                    evt->window_seconds  = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
-                    evt->reneg_threshold = thresholds_.handshakes;
-                    flagged.push_back(std::move(evt));
+                    RenegotiationEvent evt;
+                    evt.meta.remote_ip_v4 = key;
+                    evt.meta.source_ip    = describe(key);
+                    evt.meta.timestamp_ns = now_ns;
+                    evt.handshakes_in_window = entry.hello_count;
+                    evt.window_seconds       = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
+                    evt.threshold            = thresholds_.handshakes;
+                    handleRenegotiationEvent(evt, ctx);
                 }
             }
 
@@ -117,12 +148,13 @@ std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
                 seen_open[key] = level;
                 const auto prev = reported_open_.find(key);
                 if (prev == reported_open_.end() || level > prev->second) {
-                    auto evt = std::make_unique<SlowlorisEvent>();
-                    evt->remote_ip_v4        = key;
-                    evt->source_ip           = describe(key);
-                    evt->open_connections    = level;
-                    evt->slowloris_threshold = thresholds_.open_conns;
-                    flagged.push_back(std::move(evt));
+                    SlowlorisEvent evt;
+                    evt.meta.remote_ip_v4 = key;
+                    evt.meta.source_ip    = describe(key);
+                    evt.meta.timestamp_ns = now_ns;
+                    evt.open_connections  = level;
+                    evt.threshold         = thresholds_.open_conns;
+                    handleSlowlorisEvent(evt, ctx);
                 }
             }
         }
@@ -146,7 +178,6 @@ std::vector<std::unique_ptr<hg_event>> ConnRateSweeper::sweep() noexcept
     reported_rate_  = std::move(seen_rate);
     reported_reneg_ = std::move(seen_reneg);
     reported_open_  = std::move(seen_open);
-    return flagged;
 }
 
 }  // namespace https_guard

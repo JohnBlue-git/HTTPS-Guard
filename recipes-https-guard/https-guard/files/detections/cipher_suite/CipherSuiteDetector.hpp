@@ -3,9 +3,7 @@
 #include <optional>
 #include <string>
 
-#include "IDetector.hpp"
-#include "hg_event.hpp"
-#include "IClientHelloInfo.hpp"
+#include "CipherSuiteEvent.hpp"
 #include "Verdict.hpp"
 #include "weak_cipher_suites.hpp"
 
@@ -39,16 +37,11 @@ namespace https_guard {
  *
  * XDP-only: no other hook sees ClientHello bytes at all.
  */
-class CipherSuiteDetector final : public IDetector {
+class CipherSuiteDetector {
 public:
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const CipherSuiteEvent& evt) const
     {
-        const auto* hello = dynamic_cast<const IClientHelloInfo*>(&evt);
-        if (hello == nullptr) {
-            return std::nullopt;  // only a hook that parses ClientHellos can feed this
-        }
-
-        for (const uint16_t code : hello->cipherSuites()) {
+        for (const std::uint16_t code : evt.cipher_suites) {
             const WeakCipherSuite* weak = findWeakCipherSuite(code);
             if (weak == nullptr) {
                 continue;
@@ -57,10 +50,10 @@ public:
             Verdict verdict;
             verdict.severity   = "Warning";
             verdict.message_id = "OemSecurityEvent.1.0.HttpsWeakCipherSuiteDetected";
-            verdict.message    = "Weak cipher suite offered from " + describeSource(evt) +
+            verdict.message    = "Weak cipher suite offered from " + describeSource(evt.meta) +
                                  ": " + std::string(weak->name) + " (0x" + toHex(code) +
                                  ") — " + std::string(weak->reason) +
-                                 ". Client offered " + std::to_string(hello->cipherSuitesOffered()) +
+                                 ". Client offered " + std::to_string(evt.cipher_suites_offered) +
                                  " suite(s) total.";
             verdict.actionable = false;  // see the class comment — blocklisting on this is a DoS risk
             return verdict;
@@ -70,19 +63,19 @@ public:
     }
 
 private:
-    static std::string describeSource(const hg_event& evt)
+    static std::string describeSource(const EventMeta& meta)
     {
-        return evt.source_ip.empty() ? std::string("an unidentified peer")
-                                     : evt.source_ip;
+        return meta.source_ip.empty() ? std::string("an unidentified peer")
+                                      : meta.source_ip;
     }
 
-    static std::string toHex(uint16_t value)
+    static std::string toHex(std::uint16_t value)
     {
         static constexpr char kDigits[] = "0123456789abcdef";
         std::string out(4, '0');
         for (int i = 3; i >= 0; --i) {
-            out[static_cast<size_t>(i)] = kDigits[value & 0xF];
-            value = static_cast<uint16_t>(value >> 4);
+            out[static_cast<std::size_t>(i)] = kDigits[value & 0xF];
+            value = static_cast<std::uint16_t>(value >> 4);
         }
         return out;
     }

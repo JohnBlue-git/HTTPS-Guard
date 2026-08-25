@@ -1,20 +1,30 @@
 #include <cstring>
 #include <memory>
 #include <iostream>
+#include <utility>
 
 #include <linux/if_link.h>  /* XDP_FLAGS_SKB_MODE, XDP_FLAGS_UPDATE_IF_NOEXIST */
 
-/* Explicit now that IHookModule.hpp forward-declares bpf_object/bpf_link
+/* Explicit now that BpfProgram.hpp forward-declares bpf_object/bpf_link
  * instead of including libbpf -- the hooks are where libbpf is actually
  * used, so this is where the dependency belongs. */
 #include <bpf/bpf.h>       /* bpf_prog_get_fd_by_id, bpf_prog_get_info_by_fd */
 #include <bpf/libbpf.h>
 #include <unistd.h>        /* close() for the queried program fd */
 
+#include <cstddef>   // offsetof, for the ABI static_asserts below
+#include "DetectLoop.hpp"
 #include "XdpTlsProgram.hpp"
 #include "xdp_tls_event.h"
-#include "xdp_hg_event.hpp"
-#include "bounded_string.hpp"
+
+/* DetectLoop::process() reads a uint32 at offset 0 of the raw record to find
+ * the owning hook, before it knows the type. Nesting hg_event_hdr must not
+ * move that, so pin it here rather than trusting that nobody reorders the
+ * members. */
+static_assert(offsetof(struct xdp_event, hdr) == 0,
+              "hg_event_hdr must be the first member of xdp_event");
+static_assert(offsetof(struct hg_event_hdr, event_source) == 0,
+              "event_source must be the first member of hg_event_hdr");
 
 static_assert(sizeof(struct xdp_event) <= HG_MAX_RAW_EVENT_SIZE,
               "xdp_event outgrew HG_MAX_RAW_EVENT_SIZE; raise the cap in "
@@ -22,9 +32,16 @@ static_assert(sizeof(struct xdp_event) <= HG_MAX_RAW_EVENT_SIZE,
 
 namespace https_guard {
 
-XdpTlsProgram::XdpTlsProgram(unsigned int ifindex) noexcept
-    : ifindex_(ifindex)
+XdpTlsProgram::XdpTlsProgram(unsigned int ifindex, std::string expected_sni) noexcept
+    : BpfProgram("xdp_tls")
+    , ifindex_(ifindex)
+    , sni_(std::move(expected_sni))
 {
+}
+
+void XdpTlsProgram::ringBufferHandler(const void* data, std::size_t size) noexcept
+{
+    DetectLoop::getInstance().submit(data, size, detections_);
 }
 
 XdpTlsProgram::~XdpTlsProgram() noexcept
@@ -132,9 +149,24 @@ bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexc
     struct bpf_xdp_attach_opts opts = {};
     opts.sz = sizeof(opts);
 
-    // Native first (driver ndo_bpf), then generic/SKB (software fallback,
-    // which is what virtio-net and similar need).
-    int native_err = bpf_xdp_attach(ifindex_, xdp_fd, XDP_FLAGS_UPDATE_IF_NOEXIST, &opts);
+    // bpf_xdp_attach() takes the mode in its flags. Three modes exist:
+    //   XDP_FLAGS_DRV_MODE  — native: runs inside the driver's Rx path on the
+    //                         raw DMA buffer, before the kernel builds an
+    //                         sk_buff. Fastest (an XDP_DROP costs almost
+    //                         nothing), but needs driver support — the AST2600's
+    //                         ftgmac100 has it.
+    //   XDP_FLAGS_SKB_MODE  — generic: runs later, after the sk_buff is already
+    //                         allocated. Slower, but works on any driver, veth,
+    //                         or virtio-net — which is what QEMU's TAP setup uses.
+    //   XDP_FLAGS_HW_MODE   — offloaded onto a SmartNIC's own processor. No BMC
+    //                         NIC offers this, so it is never attempted here.
+    // Native first, then generic. Passing no mode bit already defaults to
+    // native, but naming XDP_FLAGS_DRV_MODE states the intent and is symmetric
+    // with the SKB fallback below. On failure the kernel does NOT silently
+    // downgrade DRV->SKB; we do that ourselves, explicitly, so the log says which
+    // mode actually took.
+    int native_err = bpf_xdp_attach(
+        ifindex_, xdp_fd, XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST, &opts);
     if (!native_err) {
         owns_legacy_attachment_ = true;
         std::cout << "https_guard: XDP attached in native mode (legacy path)\n";
@@ -161,55 +193,5 @@ hg_event_source XdpTlsProgram::eventSource() const noexcept
     return HG_SOURCE_XDP;
 }
 
-std::unique_ptr<hg_event> XdpTlsProgram::parseEvent(const void* data, size_t size) const noexcept
-{
-    if (size < sizeof(struct xdp_event)) {
-        std::cerr << "https_guard: xdp event too small: " << size << " bytes\n";
-        return nullptr;
-    }
-
-    const auto* raw = static_cast<const struct xdp_event*>(data);
-
-    auto owned = std::make_unique<XdpEvent>();
-    XdpEvent& evt = *owned;
-    evt.pid         = raw->pid;
-    evt.tls_version = raw->tls_version;
-    evt.violation_hint = (raw->is_violation != 0);
-    // XDP is an INGRESS hook, so the packet's destination is this BMC and
-    // its source is the peer. The raw struct keeps the wire's own src/dst
-    // vocabulary; the translation into local/remote roles belongs here, at
-    // the boundary where a hook stops speaking packet and starts speaking
-    // hg_event.
-    evt.local_ip_v4  = raw->dst_ip_v4;
-    evt.remote_ip_v4 = raw->src_ip_v4;
-    evt.local_port   = raw->dst_port;
-    evt.remote_port  = raw->src_port;
-    evt.process         = boundedString(raw->process);
-    evt.payload_snippet = boundedString(raw->payload_snippet);
-    // The BPF side formats the peer address into raw->source_ip but this
-    // never copied it across, so every XDP verdict message read "an
-    // unidentified peer" despite the address being right there. Noticed
-    // because ticket 04's new cipher-suite/SNI messages name the source.
-    evt.source_ip       = boundedString(raw->source_ip);
-
-    const uint16_t captured =
-        raw->cipher_suite_count < HG_MAX_CIPHER_SUITES ? raw->cipher_suite_count
-                                                       : HG_MAX_CIPHER_SUITES;
-    evt.cipher_suites.assign(raw->cipher_suites, raw->cipher_suites + captured);
-    evt.cipher_suites_offered = raw->cipher_suites_offered;
-
-    evt.sni_present   = (raw->sni_present != 0);
-    evt.sni_malformed = (raw->sni_malformed != 0);
-    evt.sni_hostname  = boundedString(raw->sni_hostname);
-
-    std::cout << "https_guard: xdp event received: process='" << evt.process
-              << "' (PID " << evt.pid << "), tls_version=" << evt.tls_version
-              << ", is_violation=" << raw->is_violation
-              << ", cipher_suites=" << evt.cipher_suites.size() << "/"
-              << evt.cipher_suites_offered
-              << ", sni='" << evt.sni_hostname << "'\n";
-
-    return owned;
-}
 
 }  // namespace https_guard

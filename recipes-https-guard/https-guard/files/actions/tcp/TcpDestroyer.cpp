@@ -132,7 +132,7 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
      * Byte order at this boundary -- the reason SOCK_DESTROY never worked
      * before.
      *
-     * hg_event's convention (see detections/core/hg_event.hpp) is:
+     * EventMeta's convention (see detections/core/event_meta.hpp) is:
      *   - addresses: NETWORK byte order
      *   - ports:     HOST byte order
      *

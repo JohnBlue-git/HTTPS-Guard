@@ -7,23 +7,22 @@
 #include <sstream>
 #include <string>
 
-#include "hg_event.hpp"
+#include "event_meta.hpp"
 
 namespace https_guard {
 
 class RedfishEventMessage {
 public:
-    /* Takes the event by reference and keeps only the two scalars it
-     * formats. It used to store an hg_event by value, which is no longer
-     * possible now that events are polymorphic (the copy would slice off
-     * the hook's half) -- and was never needed, since nothing here read
-     * more than these. */
-    RedfishEventMessage(const hg_event& event,
+    /* Takes the metadata by reference and keeps only the two scalars it
+     * formats. Nothing here ever needed more, and taking EventMeta rather than
+     * a whole event means this stays usable by every source without knowing
+     * any of their types. */
+    RedfishEventMessage(const EventMeta& meta,
                         std::string message_id,
                         std::string message,
                         std::string severity)
-        : timestamp_ns_(event.timestamp_ns)
-        , pid_(event.pid)
+        : timestamp_ns_(meta.timestamp_ns)
+        , pid_(meta.pid)
         , message_id_(std::move(message_id))
         , message_(std::move(message))
         , severity_(std::move(severity))

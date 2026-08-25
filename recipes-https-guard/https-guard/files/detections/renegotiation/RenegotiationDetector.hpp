@@ -3,10 +3,8 @@
 #include <optional>
 #include <string>
 
-#include "IDetector.hpp"
-#include "IRenegotiationInfo.hpp"
+#include "RenegotiationEvent.hpp"
 #include "Verdict.hpp"
-#include "hg_event.hpp"
 
 namespace https_guard {
 
@@ -19,30 +17,27 @@ namespace https_guard {
  *
  * Stateless: the counting is done in BPF and aggregated by ConnRateSweeper.
  */
-class RenegotiationDetector final : public IDetector {
+class RenegotiationDetector {
 public:
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const RenegotiationEvent& evt) const
     {
-        const auto* reneg = dynamic_cast<const IRenegotiationInfo*>(&evt);
-        if (reneg == nullptr) {
-            return std::nullopt;
-        }
-        if (reneg->threshold() == 0 || reneg->handshakeCount() < reneg->threshold()) {
+        if (evt.threshold == 0 || evt.handshakes_in_window < evt.threshold) {
             return std::nullopt;
         }
 
-        const std::string peer = evt.source_ip.empty() ? std::string("an unidentified peer")
-                                                       : evt.source_ip;
+        const std::string peer = evt.meta.source_ip.empty()
+                                     ? std::string("an unidentified peer")
+                                     : evt.meta.source_ip;
 
         Verdict verdict;
         verdict.severity   = "Warning";
         verdict.message_id = "OemSecurityEvent.1.0.HttpsTlsRenegotiationStorm";
         verdict.message    = "TLS renegotiation storm from " + peer + ": " +
-                             std::to_string(reneg->handshakeCount()) +
+                             std::to_string(evt.handshakes_in_window) +
                              " handshake records in " +
-                             std::to_string(reneg->windowSeconds()) +
+                             std::to_string(evt.window_seconds) +
                              "s exceeds the configured limit of " +
-                             std::to_string(reneg->threshold()) +
+                             std::to_string(evt.threshold) +
                              ". Source should be quarantined.";
         verdict.actionable = true;
         return verdict;

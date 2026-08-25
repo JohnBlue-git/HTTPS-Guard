@@ -4,9 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "IDetector.hpp"
-#include "hg_event.hpp"
-#include "IClientHelloInfo.hpp"
+#include "SniEvent.hpp"
 #include "Verdict.hpp"
 
 namespace https_guard {
@@ -42,53 +40,43 @@ namespace https_guard {
  *
  * XDP-only: no other hook sees ClientHello bytes at all.
  */
-class SniDetector final : public IDetector {
+class SniDetector {
 public:
-    /**
-     * @param expected_hostname  The one hostname this BMC should be
-     *   addressed as. Empty (the default) disables mismatch checking
-     *   entirely — see the class comment for why that's the safe default.
-     */
     explicit SniDetector(std::string expected_hostname = {})
         : expected_hostname_(toLower(std::move(expected_hostname)))
     {
     }
 
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const SniEvent& evt) const
     {
-        const auto* hello = dynamic_cast<const IClientHelloInfo*>(&evt);
-        if (hello == nullptr) {
-            return std::nullopt;  // only a hook that parses ClientHellos can feed this
-        }
-
-        if (hello->sniMalformed()) {
-            return makeVerdict(evt,
+        if (evt.sni_malformed) {
+            return makeVerdict(evt.meta,
                 "malformed or over-long SNI/ClientHello structure"
                 " — no standard client produces this");
         }
 
-        if (!hello->sniPresent() || expected_hostname_.empty()) {
+        if (!evt.sni_present || expected_hostname_.empty()) {
             return std::nullopt;
         }
 
-        if (toLower(hello->sniHostname()) == expected_hostname_) {
+        if (toLower(evt.sni_hostname) == expected_hostname_) {
             return std::nullopt;
         }
 
-        return makeVerdict(evt,
-            "SNI hostname '" + hello->sniHostname() + "' does not match the expected '" +
+        return makeVerdict(evt.meta,
+            "SNI hostname '" + evt.sni_hostname + "' does not match the expected '" +
             expected_hostname_ + "'");
     }
 
 private:
-    std::optional<Verdict> makeVerdict(const hg_event& evt, const std::string& detail) const
+    std::optional<Verdict> makeVerdict(const EventMeta& meta, const std::string& detail) const
     {
         Verdict verdict;
         verdict.severity   = "Warning";
         verdict.message_id = "OemSecurityEvent.1.0.HttpsSniAnomalyDetected";
         verdict.message    = "SNI anomaly from " +
-                             (evt.source_ip.empty() ? std::string("an unidentified peer")
-                                                    : evt.source_ip) +
+                             (meta.source_ip.empty() ? std::string("an unidentified peer")
+                                                     : meta.source_ip) +
                              ": " + detail + ".";
         verdict.actionable = false;  // see the class comment — blocklisting on this is a DoS risk
         return verdict;

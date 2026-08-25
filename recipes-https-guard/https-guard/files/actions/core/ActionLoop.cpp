@@ -2,8 +2,15 @@
 #include <iostream>
 #include <utility>
 
+#include <cstddef>
+#include <vector>
+
 #include <boost/asio/co_spawn.hpp>
+#include <boost/asio/deferred.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/parallel_group.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include "ActionLoop.hpp"
 
@@ -72,6 +79,84 @@ void ActionLoop::pushAction(std::unique_ptr<IAction> action) noexcept
         std::cerr << "Error: failed to push action to ActionLoop: " << e.what() << '\n';
     } catch (...) {
         std::cerr << "Error: failed to push action to ActionLoop due to unknown error\n";
+    }
+}
+
+void ActionLoop::pushActions(std::vector<std::unique_ptr<IAction>> actions) noexcept
+{
+    if (actions.empty() || stop_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    try {
+        asio::co_spawn(io_context_,
+            [this, actions = std::move(actions)]() mutable -> asio::awaitable<void> {
+                if (stop_.load(std::memory_order_relaxed)) {
+                    co_return;
+                }
+
+                const auto executor = co_await asio::this_coro::executor;
+
+                /* Collect the launched operations first, then wait on all of
+                 * them -- the shape `when_all` takes in other coroutine
+                 * libraries. co_spawn(..., deferred) yields an operation that
+                 * has not started yet, and parallel_group starts them together.
+                 * Ranged, because the count is a runtime property of the verdict
+                 * (one, two or three). */
+                using Op = decltype(asio::co_spawn(
+                    executor, std::declval<asio::awaitable<void>>(), asio::deferred));
+
+                std::vector<Op> ops;
+                ops.reserve(actions.size());
+                for (auto& action : actions) {
+                    if (action) {
+                        ops.push_back(asio::co_spawn(
+                            executor, action->execute_async(), asio::deferred));
+                    }
+                }
+                if (ops.empty()) {
+                    co_return;
+                }
+
+                auto [completion_order, exceptions] =
+                    co_await asio::experimental::make_parallel_group(std::move(ops))
+                        .async_wait(asio::experimental::wait_for_all(),
+                                    asio::use_awaitable);
+                (void)completion_order;
+
+                /* One report per verdict, naming which parts failed. Previously
+                 * each action logged into the void independently, so "two of
+                 * three countermeasures worked" was not something anyone could
+                 * see. */
+                std::size_t failed = 0;
+                for (std::size_t i = 0; i < exceptions.size(); ++i) {
+                    if (!exceptions[i]) {
+                        continue;
+                    }
+                    ++failed;
+                    try {
+                        std::rethrow_exception(exceptions[i]);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: action " << i << " of " << exceptions.size()
+                                  << " failed: " << e.what() << '\n';
+                    } catch (...) {
+                        std::cerr << "Error: action " << i << " of " << exceptions.size()
+                                  << " failed with an unknown exception\n";
+                    }
+                }
+                if (failed != 0) {
+                    std::cerr << "Error: " << failed << " of " << exceptions.size()
+                              << " action(s) for this verdict did not complete\n";
+                }
+
+                co_return;
+            },
+            asio::detached);
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: failed to push action group to ActionLoop: " << e.what() << '\n';
+    } catch (...) {
+        std::cerr << "Error: failed to push action group to ActionLoop (unknown error)\n";
     }
 }
 

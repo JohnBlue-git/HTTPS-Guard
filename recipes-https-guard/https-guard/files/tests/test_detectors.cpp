@@ -1,16 +1,27 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <array>
+#include <cstdio>
+#include <optional>
+
 #include <doctest/doctest.h>
 
 #include "TlsVersionDetector.hpp"
 #include "PayloadAnomalyDetector.hpp"
 #include "CertAccessDetector.hpp"
 
-// Detectors bind to capability interfaces, so a test must build the
-// concrete event a real hook would produce -- constructing a bare
-// hg_event no longer compiles, which is the point of the split.
-#include "uprobe_hg_event.hpp"
-#include "xdp_hg_event.hpp"
-#include "cert_access_hg_event.hpp"
+// Each rule takes exactly one event struct, and each struct carries only what
+// its own rule reads. Handing a rule the wrong event is therefore an ordinary
+// type error -- which is why the concepts that used to express that are gone:
+// with one input type per rule they did no dispatch work and asserted nothing
+// the compiler was not already enforcing.
+#include "TlsVersionEvent.hpp"
+#include "PayloadEvent.hpp"
+#include "CipherSuiteEvent.hpp"
+#include "SniEvent.hpp"
+#include "CertAccessEvent.hpp"
+#include "CipherSuiteDetection.hpp"
+#include "TlsVersionDetection.hpp"
+#include "xdp_tls_event.h"
 #include "ConnRateEvent.hpp"
 #include "ConnRateDetector.hpp"
 #include "SlowlorisEvent.hpp"
@@ -24,10 +35,10 @@ using namespace https_guard;
 
 TEST_CASE("TlsVersionDetector flags a version below TLS 1.2 as a Critical violation")
 {
-    UprobeEvent evt;
+    TlsVersionEvent evt;
     evt.tls_version = 0x0302;  // TLS 1.1
-    evt.process = "bmcweb";
-    evt.pid = 1234;
+    evt.meta.process = "bmcweb";
+    evt.meta.pid = 1234;
 
     TlsVersionDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -40,7 +51,7 @@ TEST_CASE("TlsVersionDetector flags a version below TLS 1.2 as a Critical violat
 
 TEST_CASE("TlsVersionDetector does not flag TLS 1.3")
 {
-    UprobeEvent evt;
+    TlsVersionEvent evt;
     evt.tls_version = 0x0304;  // TLS 1.3
 
     TlsVersionDetector detector;
@@ -49,7 +60,7 @@ TEST_CASE("TlsVersionDetector does not flag TLS 1.3")
 
 TEST_CASE("TlsVersionDetector boundary: exactly TLS 1.2 is not a violation")
 {
-    UprobeEvent evt;
+    TlsVersionEvent evt;
     evt.tls_version = 0x0303;  // TLS 1.2, the threshold itself
 
     TlsVersionDetector detector;
@@ -58,7 +69,7 @@ TEST_CASE("TlsVersionDetector boundary: exactly TLS 1.2 is not a violation")
 
 TEST_CASE("TlsVersionDetector boundary: tls_version 0 means no data, not a violation")
 {
-    UprobeEvent evt;
+    TlsVersionEvent evt;
     evt.tls_version = 0;  // ssl->version was never resolved
 
     TlsVersionDetector detector;
@@ -69,7 +80,7 @@ TEST_CASE("TlsVersionDetector: tls_violation_hint overrides tls_version==0 (XDP-
 {
     // A hook that classifies on the wire (XDP) can see a genuinely parsed
     // legacy_version of 0x0000 — that's a real violation, not "no data".
-    XdpEvent evt;
+    TlsVersionEvent evt;
     evt.tls_version = 0;
     evt.violation_hint = true;
 
@@ -85,10 +96,10 @@ TEST_CASE("TlsVersionDetector: tls_violation_hint overrides tls_version==0 (XDP-
 
 TEST_CASE("PayloadAnomalyDetector flags a SQL-injection-looking payload as a Warning")
 {
-    UprobeEvent evt;
+    PayloadEvent evt;
     evt.payload_snippet = "GET /redfish/v1?id=1 union select * from users";
-    evt.process = "bmcweb";
-    evt.pid = 42;
+    evt.meta.process = "bmcweb";
+    evt.meta.pid = 42;
 
     PayloadAnomalyDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -101,7 +112,7 @@ TEST_CASE("PayloadAnomalyDetector flags a SQL-injection-looking payload as a War
 
 TEST_CASE("PayloadAnomalyDetector does not flag an ordinary Redfish request")
 {
-    UprobeEvent evt;
+    PayloadEvent evt;
     evt.payload_snippet = "GET /redfish/v1/Managers/BMC HTTP/1.1";
 
     PayloadAnomalyDetector detector;
@@ -110,7 +121,7 @@ TEST_CASE("PayloadAnomalyDetector does not flag an ordinary Redfish request")
 
 TEST_CASE("PayloadAnomalyDetector boundary: matching is case-insensitive")
 {
-    UprobeEvent evt;
+    PayloadEvent evt;
     evt.payload_snippet = "GET /x?id=1 UNION SELECT password FROM users";
 
     PayloadAnomalyDetector detector;
@@ -119,7 +130,7 @@ TEST_CASE("PayloadAnomalyDetector boundary: matching is case-insensitive")
 
 TEST_CASE("PayloadAnomalyDetector boundary: empty payload does not match")
 {
-    UprobeEvent evt;
+    PayloadEvent evt;
     evt.payload_snippet = "";
 
     PayloadAnomalyDetector detector;
@@ -131,7 +142,7 @@ TEST_CASE("PayloadAnomalyDetector boundary: empty payload does not match")
 TEST_CASE("CertAccessDetector does not flag bmcweb's own recognized access")
 {
     CertAccessEvent evt;
-    evt.process = "bmcweb";
+    evt.meta.process = "bmcweb";
     evt.real_exe_path = "/usr/bin/bmcweb";
     evt.identity_mismatch = false;
 
@@ -142,8 +153,8 @@ TEST_CASE("CertAccessDetector does not flag bmcweb's own recognized access")
 TEST_CASE("CertAccessDetector flags an unrecognized process as Critical")
 {
     CertAccessEvent evt;
-    evt.process = "evil";
-    evt.pid = 999;
+    evt.meta.process = "evil";
+    evt.meta.pid = 999;
     evt.real_exe_path = "/tmp/evil";
     evt.cgroup_id = 7;
     evt.identity_mismatch = true;
@@ -180,10 +191,10 @@ TEST_CASE("CertAccessDetector boundary: message differs once shadow mode is off"
 
 TEST_CASE("CipherSuiteDetector flags an offered RC4 suite as a Warning")
 {
-    XdpEvent evt;
+    CipherSuiteEvent evt;
     evt.cipher_suites = {0x1301, 0x0005};  // TLS_AES_128_GCM_SHA256, RC4_128_SHA
     evt.cipher_suites_offered = 2;
-    evt.source_ip = "10.0.0.9";
+    evt.meta.source_ip = "10.0.0.9";
 
     CipherSuiteDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -201,7 +212,7 @@ TEST_CASE("CipherSuiteDetector flags an offered RC4 suite as a Warning")
 
 TEST_CASE("CipherSuiteDetector does not flag a modern-only suite list")
 {
-    XdpEvent evt;
+    CipherSuiteEvent evt;
     evt.cipher_suites = {0x1301, 0x1302, 0x1303, 0xC02F, 0xC030};
     evt.cipher_suites_offered = 5;
 
@@ -214,7 +225,7 @@ TEST_CASE("CipherSuiteDetector boundary: an empty suite list matches nothing")
     // A non-XDP event never populates cipher_suites at all; the detector is
     // registered for XDP only, but must be inert rather than crash if it
     // ever sees one.
-    XdpEvent evt;
+    CipherSuiteEvent evt;
 
     CipherSuiteDetector detector;
     CHECK(detector.evaluate(evt).has_value() == false);
@@ -222,11 +233,11 @@ TEST_CASE("CipherSuiteDetector boundary: an empty suite list matches nothing")
 
 TEST_CASE("CipherSuiteDetector boundary: flags NULL-encryption and anonymous-KEX suites too")
 {
-    XdpEvent null_cipher;
+    CipherSuiteEvent null_cipher;
     null_cipher.cipher_suites = {0x0002};  // TLS_RSA_WITH_NULL_SHA
     null_cipher.cipher_suites_offered = 1;
 
-    XdpEvent anon_kex;
+    CipherSuiteEvent anon_kex;
     anon_kex.cipher_suites = {0x0018};  // TLS_DH_anon_WITH_RC4_128_MD5
     anon_kex.cipher_suites_offered = 1;
 
@@ -246,7 +257,7 @@ TEST_CASE("SniDetector does not flag an absent SNI")
 {
     // The normal case for a BMC reached by IP address — must stay silent,
     // or every legitimate connection would raise a Warning.
-    XdpEvent evt;
+    SniEvent evt;
     evt.sni_present = false;
 
     SniDetector detector("bmc.example.com");
@@ -255,9 +266,9 @@ TEST_CASE("SniDetector does not flag an absent SNI")
 
 TEST_CASE("SniDetector flags a malformed SNI even with no expected hostname configured")
 {
-    XdpEvent evt;
+    SniEvent evt;
     evt.sni_malformed = true;
-    evt.source_ip = "192.0.2.5";
+    evt.meta.source_ip = "192.0.2.5";
 
     SniDetector detector;  // no expected hostname: mismatch checking off
     const auto verdict = detector.evaluate(evt);
@@ -272,7 +283,7 @@ TEST_CASE("SniDetector flags a malformed SNI even with no expected hostname conf
 TEST_CASE("SniDetector does not flag a mismatch when no expected hostname is configured")
 {
     // Opt-in by design: unset means "any hostname is acceptable".
-    XdpEvent evt;
+    SniEvent evt;
     evt.sni_present = true;
     evt.sni_hostname = "something.else.invalid";
 
@@ -282,10 +293,10 @@ TEST_CASE("SniDetector does not flag a mismatch when no expected hostname is con
 
 TEST_CASE("SniDetector flags a mismatch against a configured expected hostname")
 {
-    XdpEvent evt;
+    SniEvent evt;
     evt.sni_present = true;
     evt.sni_hostname = "attacker.example.net";
-    evt.source_ip = "198.51.100.7";
+    evt.meta.source_ip = "198.51.100.7";
 
     SniDetector detector("bmc.example.com");
     const auto verdict = detector.evaluate(evt);
@@ -298,7 +309,7 @@ TEST_CASE("SniDetector flags a mismatch against a configured expected hostname")
 TEST_CASE("SniDetector boundary: hostname comparison is case-insensitive")
 {
     // DNS names are case-insensitive; flagging on case alone would be noise.
-    XdpEvent evt;
+    SniEvent evt;
     evt.sni_present = true;
     evt.sni_hostname = "BMC.Example.COM";
 
@@ -313,46 +324,71 @@ TEST_CASE("SniDetector boundary: hostname comparison is case-insensitive")
 // supply a capability is declined rather than misread — and that a rule
 // tied to one capability ignores events carrying only the other.
 
-TEST_CASE("a certificate-access event has no TLS capability, so TLS rules decline it")
+// The capability-boundary assertions that lived here are gone with the concepts
+// they used, and nothing was lost: each rule now takes one concrete struct, so
+// "this rule cannot read that event" is an ordinary type mismatch the compiler
+// reports at the call site. The same goes for the three counter rules, which
+// each take a different struct.
+
+TEST_CASE("the rule matching a certificate-access event still fires")
 {
-    // Previously this event would have carried tls_version = 0 and a
-    // cipher-suite vector, and the TLS detector would have evaluated them.
     CertAccessEvent evt;
     evt.identity_mismatch = true;
 
-    TlsVersionDetector tls;
-    PayloadAnomalyDetector payload;
-    CHECK(tls.evaluate(evt).has_value() == false);
-    CHECK(payload.evaluate(evt).has_value() == false);
-
-    // ...while the rule that does match its capability still fires.
     CertAccessDetector cert;
     CHECK(cert.evaluate(evt).has_value() == true);
 }
 
-TEST_CASE("a uprobe event has no ClientHello capability, so those rules decline it")
+TEST_CASE("a ClientHello can satisfy two rules; each still fires on its own event")
 {
-    UprobeEvent evt;
-    evt.tls_version = 0x0304;
-    evt.payload_snippet = "GET / HTTP/1.1";
+    // One record can be both legacy-TLS and weak-suite. Which verdict is
+    // *emitted* is decided by the hook's detection list order, not here --
+    // see the priority test below, and XdpTlsProgram's list.
+    TlsVersionEvent tls_evt;
+    tls_evt.tls_version = 0x0301;          // TLS 1.0 on the wire
+    CHECK(TlsVersionDetector{}.evaluate(tls_evt).has_value() == true);
 
-    CipherSuiteDetector cipher;
-    SniDetector sni{"bmc.example.com"};
-    CHECK(cipher.evaluate(evt).has_value() == false);
-    CHECK(sni.evaluate(evt).has_value() == false);
+    CipherSuiteEvent cipher_evt;
+    cipher_evt.cipher_suites = {0x0005};   // and RC4 offered
+    cipher_evt.cipher_suites_offered = 1;
+    CHECK(CipherSuiteDetector{}.evaluate(cipher_evt).has_value() == true);
 }
 
-TEST_CASE("an XDP event supplies both capabilities, so both families apply")
+TEST_CASE("detection list order decides which verdict a record produces")
 {
-    XdpEvent evt;
-    evt.tls_version = 0x0301;             // TLS 1.0 on the wire
-    evt.cipher_suites = {0x0005};         // and RC4 offered
-    evt.cipher_suites_offered = 1;
+    // The real property, and a real decision: a ClientHello that is BOTH
+    // legacy-TLS and RC4-offering must be reported as the TLS violation, which
+    // enforces, rather than as the weak cipher suite, which is alert-only.
+    // That is expressed purely as list order in XdpTlsProgram, so this pins it.
+    struct xdp_event raw{};
+    raw.hdr.event_source = HG_SOURCE_XDP;
+    raw.hdr.pid = 7;
+    std::snprintf(raw.hdr.comm, sizeof(raw.hdr.comm), "%s", "swapper/0");
+    raw.tls.version = 0x0301;              // TLS 1.0
+    raw.tls.is_violation = 1;
+    raw.client_hello.cipher_suites[0] = 0x0005;   // RC4
+    raw.client_hello.cipher_suite_count = 1;
+    raw.client_hello.cipher_suites_offered = 1;
 
-    TlsVersionDetector tls;
-    CipherSuiteDetector cipher;
-    CHECK(tls.evaluate(evt).has_value() == true);
-    CHECK(cipher.evaluate(evt).has_value() == true);
+    const TlsVersionDetection<struct xdp_event>  tls_detection;
+    const CipherSuiteDetection<struct xdp_event> cipher_detection;
+
+    // Both claim the record on their own...
+    EventMeta m1, m2;
+    REQUIRE(tls_detection.inspect(&raw, sizeof(raw), m1).has_value());
+    REQUIRE(cipher_detection.inspect(&raw, sizeof(raw), m2).has_value());
+
+    // ...so order is what settles it. TLS version comes first in the hook's
+    // list, and it is the one that enforces.
+    const std::array<const IDetection*, 2> ordered{&tls_detection, &cipher_detection};
+    EventMeta meta;
+    std::optional<Verdict> first;
+    for (const IDetection* d : ordered) {
+        if ((first = d->inspect(&raw, sizeof(raw), meta))) break;
+    }
+    REQUIRE(first.has_value());
+    CHECK(first->message_id == "OemSecurityEvent.1.0.HttpsTlsVersionViolation");
+    CHECK(first->actionable == true);
 }
 
 // --- ConnRateDetector (ticket 05) ---------------------------------------
@@ -364,10 +400,10 @@ TEST_CASE("an XDP event supplies both capabilities, so both families apply")
 TEST_CASE("ConnRateDetector flags a source over the configured threshold")
 {
     ConnRateEvent evt;
-    evt.attempt_count  = 250;
+    evt.attempts_in_window  = 250;
     evt.window_seconds = 10;
-    evt.rate_threshold = 200;
-    evt.source_ip      = "10.0.0.9";
+    evt.threshold = 200;
+    evt.meta.source_ip      = "10.0.0.9";
 
     ConnRateDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -386,9 +422,9 @@ TEST_CASE("ConnRateDetector flags a source over the configured threshold")
 TEST_CASE("ConnRateDetector boundary: exactly at the threshold counts as over")
 {
     ConnRateEvent evt;
-    evt.attempt_count  = 200;
+    evt.attempts_in_window  = 200;
     evt.window_seconds = 10;
-    evt.rate_threshold = 200;
+    evt.threshold = 200;
 
     ConnRateDetector detector;
     CHECK(detector.evaluate(evt).has_value() == true);
@@ -397,9 +433,9 @@ TEST_CASE("ConnRateDetector boundary: exactly at the threshold counts as over")
 TEST_CASE("ConnRateDetector boundary: one below the threshold is not flagged")
 {
     ConnRateEvent evt;
-    evt.attempt_count  = 199;
+    evt.attempts_in_window  = 199;
     evt.window_seconds = 10;
-    evt.rate_threshold = 200;
+    evt.threshold = 200;
 
     ConnRateDetector detector;
     CHECK(detector.evaluate(evt).has_value() == false);
@@ -411,22 +447,16 @@ TEST_CASE("ConnRateDetector: a zero threshold means disabled, never 'everything 
     // threshold everything exceeds would blocklist every source that ever
     // connects, so this is the most consequential boundary in the class.
     ConnRateEvent evt;
-    evt.attempt_count  = 5000;
+    evt.attempts_in_window  = 5000;
     evt.window_seconds = 10;
-    evt.rate_threshold = 0;
+    evt.threshold = 0;
 
     ConnRateDetector detector;
     CHECK(detector.evaluate(evt).has_value() == false);
 }
 
-TEST_CASE("ConnRateDetector declines events that carry no rate information")
-{
-    UprobeEvent evt;
-    evt.tls_version = 0x0304;
-
-    ConnRateDetector detector;
-    CHECK(detector.evaluate(evt).has_value() == false);
-}
+// Covered at compile time by the !ConnectionRateEvent<UprobeEvent> assertion
+// above: a rate rule can no longer be handed a uprobe event at all.
 
 // --- SlowlorisDetector / RenegotiationDetector (ticket 06) --------------
 //
@@ -439,8 +469,8 @@ TEST_CASE("SlowlorisDetector flags a source holding too many connections open")
 {
     SlowlorisEvent evt;
     evt.open_connections = 150;
-    evt.slowloris_threshold = 100;
-    evt.source_ip = "10.0.0.9";
+    evt.threshold = 100;
+    evt.meta.source_ip = "10.0.0.9";
 
     SlowlorisDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -458,12 +488,12 @@ TEST_CASE("SlowlorisDetector boundary: N triggers, N-1 does not")
 
     SlowlorisEvent at;
     at.open_connections = 100;
-    at.slowloris_threshold = 100;
+    at.threshold = 100;
     CHECK(detector.evaluate(at).has_value() == true);
 
     SlowlorisEvent below;
     below.open_connections = 99;
-    below.slowloris_threshold = 100;
+    below.threshold = 100;
     CHECK(detector.evaluate(below).has_value() == false);
 }
 
@@ -471,7 +501,7 @@ TEST_CASE("SlowlorisDetector: zero threshold means disabled")
 {
     SlowlorisEvent evt;
     evt.open_connections = 100000;
-    evt.slowloris_threshold = 0;
+    evt.threshold = 0;
 
     SlowlorisDetector detector;
     CHECK(detector.evaluate(evt).has_value() == false);
@@ -480,10 +510,10 @@ TEST_CASE("SlowlorisDetector: zero threshold means disabled")
 TEST_CASE("RenegotiationDetector flags a handshake storm")
 {
     RenegotiationEvent evt;
-    evt.handshake_count = 250;
+    evt.handshakes_in_window = 250;
     evt.window_seconds  = 10;
-    evt.reneg_threshold = 200;
-    evt.source_ip = "10.0.0.9";
+    evt.threshold = 200;
+    evt.meta.source_ip = "10.0.0.9";
 
     RenegotiationDetector detector;
     const auto verdict = detector.evaluate(evt);
@@ -499,33 +529,21 @@ TEST_CASE("RenegotiationDetector boundary: N within window triggers, N-1 does no
     RenegotiationDetector detector;
 
     RenegotiationEvent at;
-    at.handshake_count = 200; at.window_seconds = 10; at.reneg_threshold = 200;
+    at.handshakes_in_window = 200; at.window_seconds = 10; at.threshold = 200;
     CHECK(detector.evaluate(at).has_value() == true);
 
     RenegotiationEvent below;
-    below.handshake_count = 199; below.window_seconds = 10; below.reneg_threshold = 200;
+    below.handshakes_in_window = 199; below.window_seconds = 10; below.threshold = 200;
     CHECK(detector.evaluate(below).has_value() == false);
 }
 
-TEST_CASE("the three per-source rules do not poach each other's events")
+TEST_CASE("each per-source rule fires on its own event type")
 {
-    // All three are registered under one event source, so first-match-wins
-    // relies on each event carrying only its own capability.
-    ConnRateEvent rate;   rate.attempt_count = 999;  rate.rate_threshold = 1;
-    SlowlorisEvent slow;  slow.open_connections = 999; slow.slowloris_threshold = 1;
-    RenegotiationEvent rn; rn.handshake_count = 999;  rn.reneg_threshold = 1;
+    ConnRateEvent      rate; rate.attempts_in_window   = 999; rate.threshold = 1;
+    SlowlorisEvent     slow; slow.open_connections     = 999; slow.threshold = 1;
+    RenegotiationEvent rn;   rn.handshakes_in_window   = 999; rn.threshold   = 1;
 
-    ConnRateDetector d_rate;
-    SlowlorisDetector d_slow;
-    RenegotiationDetector d_reneg;
-
-    CHECK(d_rate.evaluate(rate).has_value()  == true);
-    CHECK(d_slow.evaluate(rate).has_value()  == false);
-    CHECK(d_reneg.evaluate(rate).has_value() == false);
-
-    CHECK(d_slow.evaluate(slow).has_value()  == true);
-    CHECK(d_rate.evaluate(slow).has_value()  == false);
-
-    CHECK(d_reneg.evaluate(rn).has_value()   == true);
-    CHECK(d_rate.evaluate(rn).has_value()    == false);
+    CHECK(ConnRateDetector{}.evaluate(rate).has_value()      == true);
+    CHECK(SlowlorisDetector{}.evaluate(slow).has_value()     == true);
+    CHECK(RenegotiationDetector{}.evaluate(rn).has_value()   == true);
 }

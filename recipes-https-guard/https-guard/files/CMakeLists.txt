@@ -70,7 +70,7 @@ if(HTTPS_GUARD_BUILD_BPF)
     add_dependencies(https_guardd https_guard_bpf)
 endif()
 
-foreach(target IN ITEMS https_guardd action_runner)
+foreach(target IN ITEMS https_guardd action_runner detect_runner)
     target_include_directories(${target}
         PRIVATE
         ${LIBBPF_INCLUDE_DIRS}

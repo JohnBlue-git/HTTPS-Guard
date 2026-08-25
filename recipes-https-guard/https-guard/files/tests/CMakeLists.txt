@@ -23,16 +23,22 @@ add_executable(https_guard_tests
 )
 target_link_libraries(https_guard_tests PRIVATE doctest::doctest detections_lib)
 
-# These tests exercise the parsing headers under programs/ that are
-# deliberately dependency-free (parse_uprobe_event.hpp, parse_client_hello.h)
-# -- add just their header paths, not the full programs_lib, which would pull
-# in libbpf via IHookModule.hpp/BpfProgram.cpp. That dependency-free property
-# is what lets the *real* parsers be tested rather than reimplementations.
+# These tests exercise the real parsers and the real rules with no kernel, no
+# root and no actions linked. That is possible because everything they touch is
+# deliberately dependency-free: each source's parse() is header-only,
+# parse_client_hello.h is shared verbatim with the BPF program, and the rules
+# are concept-bound templates over plain event structs.
+#
+# detections_lib is linked for the rest of the classification tree; the paths
+# below are the few headers that live under programs/ because they are the
+# BPF<->userspace wire format rather than code.
 target_include_directories(https_guard_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/programs/core
+    # The raw <hook>_event.h wire structs, and boundedString(). Every source's
+    # parse() is header-only for exactly this reason: the tests exercise the
+    # real parser, and they must not have to link the actions to do it.
     ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/ebpf
-    ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/src
     ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
+    ${CMAKE_SOURCE_DIR}/programs/lsm_cert_guard/ebpf
     ${CMAKE_SOURCE_DIR}/programs/utils
 )
 

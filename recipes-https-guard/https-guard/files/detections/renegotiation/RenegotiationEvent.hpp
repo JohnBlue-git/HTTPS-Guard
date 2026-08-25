@@ -2,21 +2,24 @@
 
 #include <cstdint>
 
-#include "hg_event.hpp"
-#include "IRenegotiationInfo.hpp"
+#include "event_meta.hpp"
 
 namespace https_guard {
 
-/** Synthesised by ConnRateSweeper from the per-source handshake counter. */
-class RenegotiationEvent final : public hg_event, public IRenegotiationInfo {
-public:
-    std::uint32_t handshake_count = 0;
-    std::uint32_t window_seconds  = 0;
-    std::uint32_t reneg_threshold = 0;
+/**
+ * Synthesised by ConnRateSweeper from the per-source handshake counter.
+ *
+ * Satisfies RenegotiationEventLike only. It and ConnRateEvent both carry a
+ * windowed count, and keeping them as separate types with separate concepts is
+ * what makes "one rule reading another's counter" a compile error rather than
+ * something a test has to catch.
+ */
+struct RenegotiationEvent {
+    EventMeta meta;
 
-    std::uint32_t handshakeCount() const noexcept override { return handshake_count; }
-    std::uint32_t windowSeconds() const noexcept override { return window_seconds; }
-    std::uint32_t threshold() const noexcept override { return reneg_threshold; }
+    std::uint32_t handshakes_in_window = 0;
+    std::uint32_t window_seconds       = 0;
+    std::uint32_t threshold            = 0;
 };
 
 }  // namespace https_guard

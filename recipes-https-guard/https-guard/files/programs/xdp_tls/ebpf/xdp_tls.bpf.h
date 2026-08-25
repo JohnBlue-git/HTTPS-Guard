@@ -48,15 +48,15 @@
 static __always_inline int
 fill_xdp_event_fields(struct xdp_event *evt, void *data_end)
 {
-    evt->event_source = HG_SOURCE_XDP;
-    evt->is_violation = 0;
+    evt->hdr.event_source = HG_SOURCE_XDP;
+    evt->tls.is_violation = 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    evt->pid = (__u32)pid_tgid;
-    evt->tgid = (__u32)(pid_tgid >> 32);
-    evt->timestamp_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&evt->process, sizeof(evt->process));
-    evt->padding = 0;
+    evt->hdr.pid = (__u32)pid_tgid;
+    evt->hdr.tgid = (__u32)(pid_tgid >> 32);
+    evt->hdr.timestamp_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
+    evt->hdr.reserved = 0;
     return 0;
 }
 
@@ -225,13 +225,13 @@ int https_guard_xdp(struct xdp_md *ctx)
 
         __builtin_memset(evt, 0, sizeof(*evt));
         fill_xdp_event_fields(evt, data_end);
-        evt->src_ip_v4 = ip->saddr;
-        evt->dst_ip_v4 = ip->daddr;
-        evt->src_port  = bpf_ntohs(tcp->source);
-        evt->dst_port  = bpf_ntohs(tcp->dest);
+        evt->conn.src_ip_v4 = ip->saddr;
+        evt->conn.dst_ip_v4 = ip->daddr;
+        evt->conn.src_port  = bpf_ntohs(tcp->source);
+        evt->conn.dst_port  = bpf_ntohs(tcp->dest);
 
         /*
-         * Write printable source-IP string directly into evt->source_ip.
+         * Write printable source-IP string directly into evt->conn.src_ip_str.
          */
         {
             const __u8 *b = (const __u8 *)&ip->saddr;
@@ -241,17 +241,17 @@ int https_guard_xdp(struct xdp_md *ctx)
             for (i = 0; i < 4; i++) {
                 oct = b[i];
                 if (oct >= 100) {
-                    evt->source_ip[p++] = '0' + oct / 100;
+                    evt->conn.src_ip_str[p++] = '0' + oct / 100;
                 }
                 if (oct >= 10) {
-                    evt->source_ip[p++] = '0' + (oct / 10) % 10;
+                    evt->conn.src_ip_str[p++] = '0' + (oct / 10) % 10;
                 }
-                evt->source_ip[p++] = '0' + oct % 10;
+                evt->conn.src_ip_str[p++] = '0' + oct % 10;
                 if (i < 3) {
-                    evt->source_ip[p++] = '.';
+                    evt->conn.src_ip_str[p++] = '.';
                 }
             }
-            evt->source_ip[p] = '\0';
+            evt->conn.src_ip_str[p] = '\0';
         }
 
         /* Parse TLS ClientHello - extract version and check for violation.
@@ -263,10 +263,10 @@ int https_guard_xdp(struct xdp_md *ctx)
         __u16 tls_ver = 0;
         if (cursor + 2 <= payload_end) {
             tls_ver = ((__u16)cursor[0] << 8) | (__u16)cursor[1];
-            evt->tls_version = tls_ver;
+            evt->tls.version = tls_ver;
             /* Minimal classification for XDP line-rate decision */
             is_violation = (tls_ver < 0x0303) ? 1 : 0;
-            evt->is_violation = is_violation;
+            evt->tls.is_violation = is_violation;
 
             /* Cipher suites + SNI, from the same ClientHello body `cursor`
              * already points at. Only for an actual ClientHello — every
@@ -275,7 +275,7 @@ int https_guard_xdp(struct xdp_md *ctx)
              * were a ClientHello would produce garbage rather than nothing.
              * Deliberately does not touch tls_version/is_violation above. */
             if (tcp_payload + 6 <= payload_end && tcp_payload[5] == 0x01) {
-                parse_client_hello_detail(evt, cursor, payload_end);
+                parse_client_hello_detail(&evt->client_hello, cursor, payload_end);
             }
         }
 
@@ -284,7 +284,7 @@ int https_guard_xdp(struct xdp_md *ctx)
         /* Direct enforcement: drop TLS version violations at XDP level.
          * This MUST stay in BPF - XDP cannot wait for userspace.
          *
-         * IMPORTANT: We use the local 'is_violation' variable, NOT evt->is_violation,
+         * IMPORTANT: We use the local 'is_violation' variable, NOT evt->tls.is_violation,
          * because bpf_ringbuf_submit() invalidates the evt pointer. */
         if (is_violation) {
             bpf_printk("xdp: DROP - TLS version violation (0x%04x < 0x0303)\n",
@@ -308,14 +308,14 @@ int https_guard_xdp(struct xdp_md *ctx)
 
         __builtin_memset(evt, 0, sizeof(*evt));
         fill_xdp_event_fields(evt, data_end);
-        evt->src_ip_v4    = ip->saddr;
-        evt->dst_ip_v4    = ip->daddr;
-        evt->src_port     = bpf_ntohs(tcp->source);
-        evt->dst_port     = bpf_ntohs(tcp->dest);
-        evt->is_violation = 0;  /* Not a TLS version violation, just HTTP on port 443 */
+        evt->conn.src_ip_v4    = ip->saddr;
+        evt->conn.dst_ip_v4    = ip->daddr;
+        evt->conn.src_port     = bpf_ntohs(tcp->source);
+        evt->conn.dst_port     = bpf_ntohs(tcp->dest);
+        evt->tls.is_violation = 0;  /* Not a TLS version violation, just HTTP on port 443 */
 
-        safe_strlcpy(evt->payload_snippet, tcp_payload,
-                     sizeof(evt->payload_snippet), data_end);
+        safe_strlcpy(evt->tls.payload_snippet, tcp_payload,
+                     sizeof(evt->tls.payload_snippet), data_end);
 
         bpf_ringbuf_submit(evt, 0);
     }

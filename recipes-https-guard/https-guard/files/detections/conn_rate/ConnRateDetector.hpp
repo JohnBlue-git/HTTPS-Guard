@@ -3,10 +3,8 @@
 #include <optional>
 #include <string>
 
-#include "IConnectionRateInfo.hpp"
-#include "IDetector.hpp"
+#include "ConnRateEvent.hpp"
 #include "Verdict.hpp"
-#include "hg_event.hpp"
 
 namespace https_guard {
 
@@ -27,34 +25,30 @@ namespace https_guard {
  * configurable for exactly that reason, and the default was chosen by
  * measuring ordinary traffic rather than picked as a round number.
  */
-class ConnRateDetector final : public IDetector {
+class ConnRateDetector {
 public:
-    std::optional<Verdict> evaluate(const hg_event& evt) const override
+    std::optional<Verdict> evaluate(const ConnRateEvent& evt) const
     {
-        const auto* rate = dynamic_cast<const IConnectionRateInfo*>(&evt);
-        if (rate == nullptr) {
-            return std::nullopt;  // not a rate observation
-        }
-
         // The sweeper only synthesises an event once a window is already over
         // the threshold, but re-check rather than trust the caller: this class
         // is what the tests exercise, and it should be correct alone.
-        if (rate->threshold() == 0 || rate->attemptCount() < rate->threshold()) {
+        if (evt.threshold == 0 || evt.attempts_in_window < evt.threshold) {
             return std::nullopt;
         }
 
-        const std::string peer = evt.source_ip.empty() ? std::string("an unidentified peer")
-                                                       : evt.source_ip;
+        const std::string peer = evt.meta.source_ip.empty()
+                                     ? std::string("an unidentified peer")
+                                     : evt.meta.source_ip;
 
         Verdict verdict;
         verdict.severity   = "Warning";
         verdict.message_id = "OemSecurityEvent.1.0.HttpsConnectionRateViolation";
         verdict.message    = "Connection-rate violation from " + peer + ": " +
-                             std::to_string(rate->attemptCount()) +
+                             std::to_string(evt.attempts_in_window) +
                              " connection attempts in " +
-                             std::to_string(rate->windowSeconds()) +
+                             std::to_string(evt.window_seconds) +
                              "s exceeds the configured threshold of " +
-                             std::to_string(rate->threshold()) +
+                             std::to_string(evt.threshold) +
                              ". Source should be quarantined.";
         verdict.actionable = true;
         return verdict;

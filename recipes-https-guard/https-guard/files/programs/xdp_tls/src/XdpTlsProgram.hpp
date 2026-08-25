@@ -1,6 +1,15 @@
 #pragma once
 
-#include "IHookModule.hpp"
+#include <array>
+#include <string>
+
+#include "BpfProgram.hpp"
+#include "CipherSuiteDetection.hpp"
+#include "PayloadAnomalyDetection.hpp"
+#include "SniDetection.hpp"
+#include "TlsVersionDetection.hpp"
+#include "TrafficObservedDetection.hpp"
+#include "xdp_tls_event.h"
 
 namespace https_guard {
 
@@ -30,16 +39,41 @@ namespace https_guard {
  * (which covers clean shutdown, though not a crash — an unavoidable
  * limitation of that API, and the reason it isn't the first choice).
  */
-class XdpTlsProgram final : public IHookModule {
+class XdpTlsProgram final : public BpfProgram {
 public:
-    explicit XdpTlsProgram(unsigned int ifindex) noexcept;
+    /** `expected_sni` empty disables SNI hostname-mismatch checking. */
+    XdpTlsProgram(unsigned int ifindex, std::string expected_sni) noexcept;
+
+    /**
+     * Submits a record with the four detections this hook can feed, in priority
+     * order: the two enforcing ones first, then the two alert-only ClientHello
+     * ones, then the always-matching traffic-observed report.
+     *
+     * That order matters and is a real decision. A ClientHello can satisfy
+     * several of these at once, and only the first verdict is emitted -- so a
+     * legacy-TLS ClientHello that also offers RC4 is reported as the TLS
+     * violation, which enforces, rather than as the weak suite, which does not.
+     */
+    void ringBufferHandler(const void* data, std::size_t size) noexcept override;
     ~XdpTlsProgram() noexcept override;
 
     bool attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept override;
     hg_event_source eventSource() const noexcept override;
-    std::unique_ptr<hg_event> parseEvent(const void* data, size_t size) const noexcept override;
 
 private:
+    using Raw = struct xdp_event;
+
+    /* Owned here so the pointers submitted with each record outlive the async
+     * hop. Const and stateless, so DetectLoop's two threads can run them
+     * concurrently. */
+    const TlsVersionDetection<Raw>         tls_version_;
+    const PayloadAnomalyDetection<Raw>     payload_anomaly_;
+    const CipherSuiteDetection<Raw>        cipher_suite_;
+    const SniDetection<Raw>                sni_;
+    const TrafficObservedDetection<Raw>    traffic_observed_;
+    const std::array<const IDetection*, 5> detections_{
+        &tls_version_, &payload_anomaly_, &cipher_suite_, &sni_, &traffic_observed_};
+
     /**
      * Clears an attachment left behind by a previous instance of *this*
      * daemon, and only that.

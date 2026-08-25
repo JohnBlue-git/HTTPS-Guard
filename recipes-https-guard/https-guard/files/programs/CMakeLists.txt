@@ -1,11 +1,17 @@
-# Detect layer: the generic BPF lifecycle wrapper (core/BpfProgram),
-# the HTTPS-Guard-specific orchestrator (core/HttpGuardProgram), and the
-# per-hook attach/parse modules (ssl_uprobe/, xdp_tls/). Also owns the BPF
-# object build below, since core/https_guard.bpf.c is what it compiles.
+# Detect layer: the generic BPF lifecycle wrapper (core/src/BpfProgram),
+# the HTTPS-Guard-specific orchestrator (core/src/HttpGuardProgram), and the
+# per-hook attach/parse modules (ssl_uprobe/, xdp_tls/, lsm_cert_guard/).
+# Also owns the BPF object build below, since core/ebpf/https_guard.bpf.c is
+# what it compiles.
+#
+# core/ follows the same ebpf/ + src/ split as every hook directory, so what
+# a file *is* is visible from its path rather than from its extension. main.cpp
+# stays at the top of core/ deliberately: it is the composition root, not part
+# of either half.
 
 add_library(programs_lib OBJECT
-    core/BpfProgram.cpp
-    core/HttpGuardProgram.cpp
+    core/src/BpfProgram.cpp
+    core/src/HttpGuardProgram.cpp
     ssl_uprobe/src/SslUprobeProgram.cpp
     xdp_tls/src/XdpTlsProgram.cpp
     lsm_cert_guard/src/LsmCertGuardProgram.cpp
@@ -13,9 +19,12 @@ add_library(programs_lib OBJECT
 
 target_include_directories(programs_lib
     PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    # core/ splits the same way the hooks do; main.cpp includes
+    # HttpGuardProgram.hpp from core/src.
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/ebpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/src
     # Each hook splits into ebpf/ (the BPF program and its raw event struct)
-    # and src/ (the IHookModule implementation). Classification rules are not
+    # and src/ (the BpfProgram subclass). Classification rules are not
     # here at all -- they all live in ../detections/, which keeps this tree
     # the only one that depends on libbpf.
     ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf
@@ -30,8 +39,8 @@ target_include_directories(programs_lib
     ${BOOST_INCLUDE_DIR}
 )
 
-# The hooks implement IHookModule and HttpGuardProgram feeds DetectLoop, both
-# of which live in detections/. actions_lib comes in transitively through
+# The hooks are BpfPrograms whose default ring-buffer handler submits to
+# DetectLoop, which lives in detections/. actions_lib comes in transitively through
 # detections_lib, but is named explicitly since main.cpp also touches it.
 target_link_libraries(programs_lib PUBLIC detections_lib actions_lib)
 target_compile_definitions(programs_lib PUBLIC BOOST_ERROR_CODE_HEADER_ONLY)
@@ -129,9 +138,10 @@ if(HTTPS_GUARD_BUILD_BPF)
         -O2
         -g
         -I${CMAKE_CURRENT_BINARY_DIR}
-        # hg_event_source.h moved to the classification tree; the BPF side
-        # shares that header with userspace, so it needs the path too.
-        -I${CMAKE_SOURCE_DIR}/detections/core
+        # hg_event_source.h lives with the event vocabulary in the
+        # classification tree; the BPF side compiles it as C, so it needs the
+        # path too.
+        -I${CMAKE_SOURCE_DIR}/detections/core/event
     )
 
     if(LIBBPF_INCLUDE_DIRS)
@@ -152,20 +162,21 @@ if(HTTPS_GUARD_BUILD_BPF)
         endif()
     endforeach()
 
-    # core/https_guard.bpf.c is a thin aggregator: it declares the shared
-    # ring buffer map and #includes each hook's own <hook>.bpf.h (relative
-    # includes, e.g. ../ssl_uprobe/ssl_uprobe.bpf.h) — so compiling this
-    # one file pulls in every hook's BPF program into a single object.
+    # core/ebpf/https_guard.bpf.c is a thin aggregator: it declares the
+    # shared ring buffer map and #includes each hook's own <hook>.bpf.h
+    # (relative includes, e.g. ../../ssl_uprobe/ebpf/ssl_uprobe.bpf.h) — so
+    # compiling this one file pulls in every hook's BPF program into a
+    # single object.
     add_custom_command(
         OUTPUT ${HTTPS_GUARD_BPF_OBJECT}
         COMMAND ${HTTPS_GUARD_BPF_CLANG_EXECUTABLE} ${HTTPS_GUARD_BPF_FLAGS}
-                -c ${CMAKE_CURRENT_SOURCE_DIR}/core/https_guard.bpf.c
+                -c ${CMAKE_CURRENT_SOURCE_DIR}/core/ebpf/https_guard.bpf.c
                 -o ${HTTPS_GUARD_BPF_OBJECT}
         DEPENDS
             ${HTTPS_GUARD_VMLINUX_HEADER}
             ${HTTPS_GUARD_SSL_OFFSET_HEADER}
-            ${CMAKE_CURRENT_SOURCE_DIR}/core/https_guard.bpf.c
-            ${CMAKE_SOURCE_DIR}/detections/core/hg_event_source.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/core/ebpf/https_guard.bpf.c
+            ${CMAKE_SOURCE_DIR}/detections/core/event/hg_event_source.h
             ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe_event.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls.bpf.h

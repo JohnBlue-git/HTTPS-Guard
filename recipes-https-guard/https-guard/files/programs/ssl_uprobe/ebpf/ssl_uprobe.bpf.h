@@ -69,15 +69,16 @@
 static __always_inline int
 fill_uprobe_event_fields(struct uprobe_event *evt, enum hg_uprobe_direction direction)
 {
-    evt->event_source = HG_SOURCE_UPROBE;
+    evt->hdr.event_source = HG_SOURCE_UPROBE;
     evt->direction = direction;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    evt->pid = (__u32)pid_tgid;
-    evt->tgid = (__u32)(pid_tgid >> 32);
-    evt->timestamp_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&evt->process, sizeof(evt->process));
-    evt->padding = 0;
+    evt->hdr.pid = (__u32)pid_tgid;
+    evt->hdr.tgid = (__u32)(pid_tgid >> 32);
+    evt->hdr.timestamp_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(&evt->hdr.comm, sizeof(evt->hdr.comm));
+    evt->hdr.reserved = 0;
+    evt->padding      = 0;
     return 0;
 }
 
@@ -131,15 +132,15 @@ int https_guard_ssl_write(struct pt_regs *ctx)
 
     /* PURELY OBSERVATIONAL - no classification, no event_type, no severity.
      * Just capture raw data and let userspace decide what it means. */
-    evt->tls_version = read_tls_version(ssl);
+    evt->tls.version = read_tls_version(ssl);
 
     /* Capture a snippet of the plaintext payload for anomaly detection */
-    int copy_sz = num < (int)sizeof(evt->payload_snippet) - 1
+    int copy_sz = num < (int)sizeof(evt->tls.payload_snippet) - 1
                       ? num
-                      : (int)sizeof(evt->payload_snippet) - 1;
+                      : (int)sizeof(evt->tls.payload_snippet) - 1;
 
-    bpf_probe_read_user(evt->payload_snippet, copy_sz, buf);
-    evt->payload_snippet[copy_sz] = '\0';
+    bpf_probe_read_user(evt->tls.payload_snippet, copy_sz, buf);
+    evt->tls.payload_snippet[copy_sz] = '\0';
 
     bpf_ringbuf_submit(evt, 0);
     return 0;
@@ -224,14 +225,14 @@ int https_guard_ssl_read_exit(struct pt_regs *ctx)
     __builtin_memset(evt, 0, sizeof(*evt));
     fill_uprobe_event_fields(evt, HG_UPROBE_DIR_READ);
 
-    evt->tls_version = read_tls_version((const void *)ssl);
+    evt->tls.version = read_tls_version((const void *)ssl);
 
-    int copy_sz = num_read < (int)sizeof(evt->payload_snippet) - 1
+    int copy_sz = num_read < (int)sizeof(evt->tls.payload_snippet) - 1
                       ? num_read
-                      : (int)sizeof(evt->payload_snippet) - 1;
+                      : (int)sizeof(evt->tls.payload_snippet) - 1;
 
-    bpf_probe_read_user(evt->payload_snippet, copy_sz, (const void *)buf);
-    evt->payload_snippet[copy_sz] = '\0';
+    bpf_probe_read_user(evt->tls.payload_snippet, copy_sz, (const void *)buf);
+    evt->tls.payload_snippet[copy_sz] = '\0';
 
     bpf_ringbuf_submit(evt, 0);
     return 0;
