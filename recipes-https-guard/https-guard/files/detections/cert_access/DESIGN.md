@@ -15,19 +15,42 @@ adequate for a hint attached to a traffic event and useless for the question
 "should this program be reading the BMC's private key".
 
 And `/etc/ssl/certs/https/server.pem` is the asset where it matters. If a process
-other than bmcweb reads it, the key may already be compromised and **every
-connection ever protected by it is retroactively suspect** — no amount of traffic
-inspection recovers from that.
+outside the small set that legitimately touches it reads that file, the key may
+already be compromised and **every connection ever protected by it is
+retroactively suspect** — no amount of traffic inspection recovers from that.
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  bmcweb            → opens the key at startup. Expected.       │
-│                                                                │
-│  anything else     → the key is now assumed leaked.            │
-│    ...even if it called prctl(PR_SET_NAME, "bmcweb") first,    │
-│       which is exactly why comm is not the check.              │
-└────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  bmcweb                       → opens the key at startup.        │
+│                                  Expected.                        │
+│                                                                   │
+│  phosphor-certificate-manager → writes a new key/cert here on a  │
+│                                  Redfish/D-Bus certificate        │
+│                                  install, then restarts bmcweb.   │
+│                                  Expected.                        │
+│                                                                   │
+│  anything else                → the key is now assumed leaked.   │
+│    ...even if it called prctl(PR_SET_NAME, "bmcweb") first,      │
+│       which is exactly why comm is not the check.                │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+**Why `phosphor-certificate-manager` is on the allow list, not just bmcweb.**
+`bmcweb` is a *consumer* of `server.pem` — it reads the file at startup and,
+if it is entirely absent, falls back to generating a self-signed one so the
+WebUI stays reachable. It is not the component that manages certificate
+lifecycle. That belongs to `phosphor-certificate-manager`, the OpenBMC service
+behind the Redfish/D-Bus certificate-install API: when an operator uploads a
+new HTTPS certificate through Redfish or the WebUI, this service is what
+writes `/etc/ssl/certs/https/server.pem` and then restarts `bmcweb.service` so
+the new certificate takes effect. That write is exactly the kind of event this
+detector watches for, and it is routine, not an attack — so it has to be
+enumerated as an expected accessor rather than left to fall through to
+"anything else". Without it, every legitimate certificate rotation would raise
+a Critical `HttpsCertificateAccessViolation`, which is worse than a merely
+noisy false positive: an operator who has seen that "violation" fire for their
+own routine cert upload once is primed to dismiss it the next time it fires
+for real.
 
 ## How to detect — three attempts, in the order they were tried
 

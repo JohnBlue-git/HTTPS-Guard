@@ -37,7 +37,8 @@ public:
                              "' (PID " + std::to_string(evt.meta.pid) +
                              ", real executable '" + evt.real_exe_path +
                              "', cgroup " + std::to_string(evt.cgroup_id) +
-                             ") accessed the BMC's HTTPS certificate/key file; expected only bmcweb to do so." +
+                             ") accessed the BMC's HTTPS certificate/key file; expected only bmcweb or "
+                             "phosphor-certificate-manager to do so." +
                              (evt.shadow_mode
                                   ? " Shadow mode: access was observed but not blocked."
                                   : " Access was denied.");

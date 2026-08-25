@@ -782,8 +782,11 @@ interrupt context with no owning process. Only uprobe events carry a real PID.
 
 ### Certificate access
 
-`CertAccessDetector` fires when any process whose `/proc/<pid>/exe` is not
-`/usr/bin/bmcweb` opens `/etc/ssl/certs/https/server.pem`:
+`CertAccessDetector` fires when any process whose `/proc/<pid>/exe` is not one
+of the allowed executables — `/usr/bin/bmcweb` (serves the certificate) or
+`/usr/bin/phosphor-certificate-manager` (installs/replaces it via
+Redfish/D-Bus, then restarts `bmcweb.service`) — opens
+`/etc/ssl/certs/https/server.pem`:
 
 ```bash
 cat /etc/ssl/certs/https/server.pem > /dev/null

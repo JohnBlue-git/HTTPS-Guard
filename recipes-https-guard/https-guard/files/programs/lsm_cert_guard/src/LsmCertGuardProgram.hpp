@@ -3,6 +3,7 @@
 #include <array>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "BpfProgram.hpp"
 #include "CertAccessDetection.hpp"
@@ -15,15 +16,15 @@ namespace https_guard {
  * Attaches the BPF-LSM certificate-access guard (see lsm_cert_guard.bpf.h)
  * to the "file_open" LSM hook. Unlike the other hooks, this one needs no
  * runtime configuration (no interface, no library path) — the target
- * file and expected binary are compile-time constants inside the BPF
- * program itself, since the identity check has to run there.
+ * file is a compile-time constant inside the BPF program itself, since the
+ * path filter has to run there.
  */
 class LsmCertGuardProgram final : public BpfProgram {
 public:
-    /** `expected_exe` is the only executable allowed to open the HTTPS key. */
-    explicit LsmCertGuardProgram(std::string expected_exe) noexcept
+    /** `allowed_exes` are the executables allowed to open the HTTPS key. */
+    explicit LsmCertGuardProgram(std::vector<std::string> allowed_exes) noexcept
         : BpfProgram("lsm_cert_guard")
-        , cert_access_(std::move(expected_exe))
+        , cert_access_(std::move(allowed_exes))
     {
     }
 

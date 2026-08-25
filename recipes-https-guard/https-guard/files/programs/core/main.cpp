@@ -61,7 +61,8 @@ std::vector<std::unique_ptr<https_guard::BpfProgram>> buildHookModules(
     std::vector<std::unique_ptr<https_guard::BpfProgram>> hooks;
     hooks.push_back(std::make_unique<https_guard::SslUprobeProgram>(openssl_lib_path));
     hooks.push_back(std::make_unique<https_guard::XdpTlsProgram>(ifindex, expected_sni));
-    hooks.push_back(std::make_unique<https_guard::LsmCertGuardProgram>("/usr/bin/bmcweb"));
+    hooks.push_back(std::make_unique<https_guard::LsmCertGuardProgram>(
+        std::vector<std::string>{"/usr/bin/bmcweb", "/usr/bin/phosphor-certificate-manager"}));
     return hooks;
 }
 

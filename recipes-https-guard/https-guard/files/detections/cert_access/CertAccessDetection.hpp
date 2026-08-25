@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -50,9 +52,11 @@ class CertAccessDetection final : public IDetection {
 public:
     std::string_view name() const noexcept override { return "cert_access"; }
 
-    /** The only executable allowed to open the key. */
-    explicit CertAccessDetection(std::string expected_exe) noexcept
-        : expected_exe_(std::move(expected_exe))
+    /** The executables allowed to open the key -- bmcweb (serves it) and
+     * phosphor-certificate-manager (installs/replaces it via Redfish/D-Bus;
+     * see this directory's DESIGN.md for why it has to be on this list too). */
+    explicit CertAccessDetection(std::vector<std::string> allowed_exes) noexcept
+        : allowed_exes_(std::move(allowed_exes))
     {
     }
 
@@ -79,14 +83,16 @@ public:
         // exists only to give the (never-enabled) shadow-mode enforcement branch
         // something real to gate on. The two can disagree, and only this one is
         // worth acting on.
-        evt.identity_mismatch = (evt.real_exe_path != expected_exe_);
+        evt.identity_mismatch =
+            std::find(allowed_exes_.begin(), allowed_exes_.end(),
+                      evt.real_exe_path) == allowed_exes_.end();
 
         return rule_.evaluate(evt);
     }
 
 private:
-    std::string        expected_exe_;
-    CertAccessDetector rule_;
+    std::vector<std::string> allowed_exes_;
+    CertAccessDetector       rule_;
 };
 
 }  // namespace https_guard
