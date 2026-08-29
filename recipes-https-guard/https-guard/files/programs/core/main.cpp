@@ -10,11 +10,19 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 
-#include "https_guard_program.hpp"
+#include "HttpGuardProgram.hpp"
+#include "hg_event_source.h"
 #include "core/ActionLoop.hpp"
 #include "log/LogAction.hpp"
+#include "TlsVersionDetector.hpp"
+#include "PayloadAnomalyDetector.hpp"
+#include "CertAccessDetector.hpp"
+#include "SslUprobeProgram.hpp"
+#include "XdpTlsProgram.hpp"
+#include "LsmCertGuardProgram.hpp"
 
 namespace {
 
@@ -32,6 +40,45 @@ struct runtime_config {
     std::string openssl_lib_path;
     std::string output_path;
 };
+
+// Composition root: this is the one place that knows about every concrete
+// detector. Both event sources run the same rules in the same order today
+// (TLS version violation checked ahead of payload anomalies) — a future
+// hook-specific detector (e.g. cipher-suite checks for xdp_tls) would only
+// need to append to that hook's own vector here, not touch HttpGuardProgram.
+https_guard::HttpGuardProgram::DetectorRegistry buildDetectorRegistry()
+{
+    auto defaultRules = []() {
+        std::vector<std::unique_ptr<https_guard::IDetector>> rules;
+        rules.push_back(std::make_unique<https_guard::TlsVersionDetector>());
+        rules.push_back(std::make_unique<https_guard::PayloadAnomalyDetector>());
+        return rules;
+    };
+
+    https_guard::HttpGuardProgram::DetectorRegistry registry;
+    registry[HG_SOURCE_UPROBE] = defaultRules();
+    registry[HG_SOURCE_XDP]    = defaultRules();
+
+    std::vector<std::unique_ptr<https_guard::IDetector>> certAccessRules;
+    certAccessRules.push_back(std::make_unique<https_guard::CertAccessDetector>());
+    registry[HG_SOURCE_LSM_CERT_GUARD] = std::move(certAccessRules);
+
+    return registry;
+}
+
+// Composition root: this is the one place that knows about every concrete
+// hook module. HttpGuardProgram only ever sees them through IHookModule —
+// adding a new hook (e.g. an LSM cert-access guard) means adding one line
+// here, not touching HttpGuardProgram's attach or dispatch logic.
+std::vector<std::unique_ptr<https_guard::IHookModule>> buildHookModules(
+    const std::string& openssl_lib_path, unsigned int ifindex)
+{
+    std::vector<std::unique_ptr<https_guard::IHookModule>> hooks;
+    hooks.push_back(std::make_unique<https_guard::SslUprobeProgram>(openssl_lib_path));
+    hooks.push_back(std::make_unique<https_guard::XdpTlsProgram>(ifindex));
+    hooks.push_back(std::make_unique<https_guard::LsmCertGuardProgram>());
+    return hooks;
+}
 
 }  // namespace
 
@@ -70,10 +117,10 @@ int main(int argc, char** argv)
     https_guard::HttpGuardProgram program(
         cfg.bpf_object_path,
         action_loop,
-        cfg.openssl_lib_path,
-        if_nametoindex(cfg.iface.c_str()),
+        buildHookModules(cfg.openssl_lib_path, if_nametoindex(cfg.iface.c_str())),
         std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl),
-        cfg.output_path);
+        cfg.output_path,
+        buildDetectorRegistry());
     if (!program.loadFilter()) {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;

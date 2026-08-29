@@ -48,33 +48,55 @@ PACKAGECONFIG[journal-only] = ""
 PACKAGECONFIG[event-both] = ""
 
 SRC_URI = " \
-    file://https-guard-event-bridge.sh \
-    file://https-guard-event-bridge.service \
-    file://https-guard-daemon.sh \
-    file://https-guard-daemon.service \
-    file://simulated-event-generator.service \
-    file://simulated-event-generator.sh \
+    file://service/https-guard-event-bridge.sh \
+    file://service/https-guard-event-bridge.service \
+    file://service/https-guard-daemon.sh \
+    file://service/https-guard-daemon.service \
+    file://service/simulated-event-generator.service \
+    file://service/simulated-event-generator.sh \
     file://https-guard.conf \
     file://CMakeLists.txt \
     file://scripts/gen_ssl_offset.c \
-    file://https_guard/events.h \
-    file://https_guard/https_guard.bpf.c \
-    file://https_guard/redfish_event_message.hpp \
-    file://https_guard/pattern_detector.hpp \
-    file://https_guard/tls_version.hpp \
-    file://https_guard/hg_event.hpp \
-    file://https_guard/proc_peer_resolver.hpp \
-    file://https_guard/main.cpp \
-    file://https_guard/https_guard_program.hpp \
-    file://https_guard/https_guard_program.cpp \
-    file://ebpf/bpf_program.hpp \
-    file://ebpf/bpf_program.cpp \
+    file://programs/CMakeLists.txt \
+    file://programs/core/hg_event_source.h \
+    file://programs/core/https_guard.bpf.c \
+    file://programs/core/main.cpp \
+    file://programs/core/HttpGuardProgram.hpp \
+    file://programs/core/HttpGuardProgram.cpp \
+    file://programs/core/IHookModule.hpp \
+    file://programs/core/BpfProgram.hpp \
+    file://programs/core/BpfProgram.cpp \
+    file://programs/ssl_uprobe/proc_peer_resolver.hpp \
+    file://programs/ssl_uprobe/ssl_uprobe.bpf.h \
+    file://programs/ssl_uprobe/ssl_uprobe_event.h \
+    file://programs/ssl_uprobe/parse_uprobe_event.hpp \
+    file://programs/ssl_uprobe/SslUprobeProgram.hpp \
+    file://programs/ssl_uprobe/SslUprobeProgram.cpp \
+    file://programs/xdp_tls/xdp_tls.bpf.h \
+    file://programs/xdp_tls/xdp_tls_event.h \
+    file://programs/xdp_tls/XdpTlsProgram.hpp \
+    file://programs/xdp_tls/XdpTlsProgram.cpp \
+    file://programs/lsm_cert_guard/lsm_cert_guard.bpf.h \
+    file://programs/lsm_cert_guard/lsm_cert_guard_event.h \
+    file://programs/lsm_cert_guard/LsmCertGuardProgram.hpp \
+    file://programs/lsm_cert_guard/LsmCertGuardProgram.cpp \
+    file://programs/utils/bounded_string.hpp \
+    file://detectors/CMakeLists.txt \
+    file://detectors/core/hg_event.hpp \
+    file://detectors/core/IDetector.hpp \
+    file://detectors/core/Verdict.hpp \
+    file://detectors/tls_version/TlsVersionDetector.hpp \
+    file://detectors/tls_version/tls_version.hpp \
+    file://detectors/payload_anomaly/PayloadAnomalyDetector.hpp \
+    file://detectors/cert_access/CertAccessDetector.hpp \
+    file://actions/CMakeLists.txt \
     file://actions/core/main.cpp \
     file://actions/core/ActionLoop.hpp \
     file://actions/core/ActionLoop.cpp \
     file://actions/log/async_mutex.hpp \
     file://actions/log/LogAction.hpp \
     file://actions/log/LogAction.cpp \
+    file://actions/log/redfish_event_message.hpp \
     file://actions/blocklist/Blocklist.hpp \
     file://actions/blocklist/Blocklist.cpp \
     file://actions/blocklist/blocklist.bpf.h \
@@ -84,6 +106,9 @@ SRC_URI = " \
     file://actions/tcp/TcpDestroyer.cpp \
     file://actions/tcp/BlockTcpAction.hpp \
     file://actions/tcp/BlockTcpAction.cpp \
+    file://tests/CMakeLists.txt \
+    file://tests/test_detectors.cpp \
+    file://tests/test_uprobe_parsing.cpp \
 "
 
 S = "${UNPACKDIR}"
@@ -151,7 +176,11 @@ do_configure:prepend() {
     echo "gen_ssl_offset built successfully"
 }
 
-# Override do_compile to generate ssl_version_offset.h before CMake runs
+# Override do_compile to generate ssl_version_offset.h before CMake runs.
+# Written under programs/ because that's where programs/CMakeLists.txt's
+# BPF compile step (-I${CMAKE_CURRENT_BINARY_DIR}) now looks for it, since
+# that CMakeLists.txt lives in the programs/ subdirectory and CMake mirrors
+# the source tree into the binary tree.
 do_compile:prepend() {
     if [ "${HTTPS_GUARD_BUILD_BPF}" != "ON" ]; then
         return 0
@@ -159,11 +188,12 @@ do_compile:prepend() {
 
     # Generate ssl_version_offset.h using the pre-built host tool
     echo "Generating ssl_version_offset.h..."
-    ${WORKDIR}/gen_ssl_offset > ${B}/ssl_version_offset.h || \
+    mkdir -p ${B}/programs
+    ${WORKDIR}/gen_ssl_offset > ${B}/programs/ssl_version_offset.h || \
         bbfatal "Failed to generate ssl_version_offset.h"
-    
+
     echo "ssl_version_offset.h generated successfully"
-    cat ${B}/ssl_version_offset.h
+    cat ${B}/programs/ssl_version_offset.h
 }
 
 # ---------------------------------------------------------------------------
@@ -207,9 +237,9 @@ SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 
 do_install() {
     install -d ${D}${sbindir}
-    install -m 0755 ${S}/https-guard-event-bridge.sh   ${D}${sbindir}/https-guard-event-bridge
-    install -m 0755 ${S}/simulated-event-generator.sh ${D}${sbindir}/simulated-event-generator
-    install -m 0755 ${S}/https-guard-daemon.sh          ${D}${sbindir}/https-guard-daemon
+    install -m 0755 ${S}/service/https-guard-event-bridge.sh   ${D}${sbindir}/https-guard-event-bridge
+    install -m 0755 ${S}/service/simulated-event-generator.sh ${D}${sbindir}/simulated-event-generator
+    install -m 0755 ${S}/service/https-guard-daemon.sh          ${D}${sbindir}/https-guard-daemon
 
     # install compiled daemon if present
     if [ -x "${B}/https_guardd" ]; then
@@ -227,9 +257,9 @@ do_install() {
     fi
 
     install -d ${D}${systemd_system_unitdir}
-    install -m 0644 ${S}/https-guard-event-bridge.service   ${D}${systemd_system_unitdir}/
-    install -m 0644 ${S}/simulated-event-generator.service ${D}${systemd_system_unitdir}/
-    install -m 0644 ${S}/https-guard-daemon.service          ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/service/https-guard-event-bridge.service   ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/service/simulated-event-generator.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/service/https-guard-daemon.service          ${D}${systemd_system_unitdir}/
 
     # -----------------------------------------------------------------------
     # Install config file with event mode stamped from PACKAGECONFIG.

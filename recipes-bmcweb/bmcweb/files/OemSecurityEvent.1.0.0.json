@@ -29,6 +29,54 @@
       "NumberOfArgs": 1,
       "ParamTypes": ["string"],
       "Resolution": "None."
+    },
+    "HttpsCertificateAccessViolation": {
+      "Description": "An unrecognized process attempted to access the BMC's HTTPS certificate or private key file.",
+      "Message": "%1",
+      "Severity": "Critical",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Verify the accessing process is authorized; investigate for key theft or process impersonation."
+    },
+    "HttpsWeakCipherSuiteDetected": {
+      "Description": "An incoming HTTPS connection offered a cryptographically weak cipher suite.",
+      "Message": "%1",
+      "Severity": "Warning",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Review client TLS configuration; disable support for weak cipher suites if this traffic is expected to continue."
+    },
+    "HttpsSniAnomalyDetected": {
+      "Description": "An incoming HTTPS connection's TLS Server Name Indication did not match the expected hostname.",
+      "Message": "%1",
+      "Severity": "Warning",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Verify the client is targeting the correct BMC hostname; investigate for domain fronting or misdirected traffic."
+    },
+    "HttpsConnectionRateViolation": {
+      "Description": "A source exceeded the configured connection-rate threshold, indicating possible SYN flood, port scan, or volumetric abuse.",
+      "Message": "%1",
+      "Severity": "Warning",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Investigate the source IP; the connection has been blocklisted if enforcement is enabled."
+    },
+    "HttpsSlowlorisDetected": {
+      "Description": "A source held an unusually high number of slow, incomplete HTTPS connections open, indicative of a Slowloris-style resource-exhaustion attempt.",
+      "Message": "%1",
+      "Severity": "Warning",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Investigate the source IP; consider tightening connection-timeout settings."
+    },
+    "HttpsTlsRenegotiationStorm": {
+      "Description": "A source initiated an unusually high number of TLS handshakes within a short window, indicative of a renegotiation-based denial-of-service attempt.",
+      "Message": "%1",
+      "Severity": "Warning",
+      "NumberOfArgs": 1,
+      "ParamTypes": ["string"],
+      "Resolution": "Investigate the source IP; the connection has been blocklisted if enforcement is enabled."
     }
   }
 }

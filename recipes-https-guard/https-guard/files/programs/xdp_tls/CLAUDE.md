@@ -1,0 +1,7 @@
+# xdp_tls/ — AUXILIARY hook
+
+XDP program on the NIC RX path — inspects TLS ClientHello and plaintext-HTTP-on-443 traffic at the wire, before any TCP/TLS handshake completes. The only hook whose synchronous enforcement power (`XDP_DROP` for a known-bad source or a downgraded ClientHello) is actually reachable in practice, and the only place `blocklist_check()` (shared with `../../actions/blocklist/`) runs — `../lsm_cert_guard/` also decides synchronously in-kernel by design, but currently can't attach at all on ARM32/AST2600 (no BPF trampoline support), so its deny branch is unreachable there regardless of its own shadow-mode flag.
+
+**Read `DESIGN.md` in this directory before touching this hook's logic** — it covers why wire-level inspection catches things the uprobe fundamentally can't, the exact ClientHello byte layout this hook parses, the two-tier synchronous/asynchronous enforcement flow with diagrams, and known gaps: no cipher-suite/SNI inspection yet (planned as a direct extension of the parsing already here), no rate-based detection yet (planned as a separate, stateful mechanism), and an unverified assumption about whether this hook's `XDP_DROP` path actually fires under QEMU SLIRP despite the attach call succeeding there.
+
+`XdpTlsProgram.{hpp,cpp}` implements `IHookModule` (see `../CLAUDE.md`); `xdp_tls.bpf.h` / `xdp_tls_event.h` are the BPF-side program and its raw event struct, including the native→generic→skip attach fallback's BPF-side half (the attach calls themselves are in `XdpTlsProgram.cpp`).

@@ -1,0 +1,38 @@
+# 03 — BPF-LSM certificate-access guard
+
+**What to build:** A new hook (`programs/lsm_cert_guard/`, following the `IHookModule` shape) that observes — and eventually can deny — access to the BMC's HTTPS certificate/key file (`/etc/ssl/certs/https/server.pem`), verifying the accessing process's identity more robustly than a self-reported process-comm string. Ship it defaulting to shadow mode: it observes and logs what it would have done, but does not actually deny any file open, until the maintainer has field evidence it never misfires against bmcweb's own legitimate access.
+
+**Blocked by:** 01 — Extend the OEM security event message registry
+
+**Status:** ready-for-agent
+
+- [x] The kernel target actually supports BPF LSM programs attaching to the file-open path in the "bpf" LSM slot (`CONFIG_BPF_LSM=y` is already set in `recipes-kernel/linux/bpf-kernel-config.cfg` — confirm the *active* LSM chain includes `bpf`, e.g. via the `lsm=` kernel cmdline parameter or its Kconfig default, before assuming enforcement mode is even reachable on this platform)
+- [x] A hook exists that filters on the exact certificate/key file path and reports at least: the accessing PID, its real executable path (via `/proc/<pid>/exe`, not just `comm`), and its cgroup
+- [x] Process identity is checked against more than a self-reported comm string — some combination of real binary path, cgroup, and/or UID, chosen by this ticket's implementer against what the target kernel actually makes available
+- [x] A shadow-mode flag (default on) makes the hook observe-and-log only; enforcement (denying the open) is implemented but not reachable by default
+- [x] A new detector (or equivalent classification logic) produces the Critical verdict from ticket 01's new message ID when an unrecognized process accesses the file
+- [x] Unit tests cover the identity-check logic against synthetic input (a recognized-bmcweb case, an unrecognized-process case) — the LSM attach mechanics themselves aren't unit-testable and remain manual/QEMU-verified
+- [ ] Manually verified on real QEMU/hardware that shadow mode never denies bmcweb's own legitimate certificate access across a normal daemon lifecycle (multiple restarts, not just one boot) — see Comments: this specific criterion turned out to be unverifiable on this project's actual target, for a reason worth reading before assuming it's just not done yet
+- [x] The rollout plan for eventually flipping shadow mode off is documented (even if flipping it is explicitly not done as part of this ticket — see the spec's Out of Scope)
+
+## Comments
+
+**Blocker found and fixed before writing any hook code:** checked the actual kernel this platform boots (not just the Kconfig fragment) three independent ways — target `/sys/kernel/security` (securityfs wasn't even a registered filesystem type), the real merged `.config` used for the current build (`CONFIG_SECURITY`, `CONFIG_LSM`, `CONFIG_BPF_LSM` were all completely absent — not even as `# ... is not set`, meaning Kconfig considered them unreachable, not just unset), and the actual kernel build output (`security/` only contained the handful of files that always build regardless of LSM support). All three agreed: `CONFIG_BPF_LSM=y` in `bpf-kernel-config.cfg` was dead — its prerequisite `CONFIG_SECURITY` was never enabled, so the entire generic LSM framework was compiled out, not just "bpf" missing from the active chain.
+
+Fixed by adding `CONFIG_SECURITY=y` and an explicit `CONFIG_LSM="bpf"` (no other LSM needed for this project) to `bpf-kernel-config.cfg`. Rebuilt the kernel and full image, booted fresh QEMU, and confirmed via `dmesg`: `LSM: initializing lsm=capability,bpf` followed by `LSM support for eBPF active`. The gating fact is now empirically confirmed, not assumed.
+
+**A second, more fundamental blocker found while implementing the identity check — full story in `programs/lsm_cert_guard/DESIGN.md`, summarized here.** Three designs were actually tried, in order, each failing later than the one before:
+
+1. Resolve the real exe path in-kernel via a manual `task->mm->exe_file` walk, pass it to `bpf_d_path()`. Rejected by the **verifier**: pointer trust drops after the second hop from `bpf_get_current_task_btf()`, and `bpf_d_path()` requires a trusted/RCU/argument pointer.
+2. The kernel's own recommended fix: `bpf_get_task_exe_file()` + `bpf_path_d_path()` (both kfuncs, per the kernel's own `verifier_vfs_accept.c` selftest and `fs/bpf_fs_kfuncs.c`'s doc comments). Passes the verifier. Rejected at **load time**: `-ENOTSUPP: JIT does not support calling kernel function` — the ARM32 BPF JIT (`arch/arm/net/`) has no kfunc-call codegen at all, confirmed by its absence from the kernel source (present for arm64/x86/riscv/s390/powerpc/loongarch/parisc).
+3. **Shipped:** keep the BPF side to classic helpers only (comm-based pre-check, cgroup, PID — no exe-path resolution in-kernel at all); do the real check in userspace via `/proc/<pid>/exe` in `LsmCertGuardProgram::parseEvent()`, exactly the mechanism the ticket itself suggested. Loads and verifies cleanly.
+
+Then a **fourth, independent problem** surfaced at attach time, regardless of what the program does internally: `bpf_program__attach_lsm()` returns `-ENOTSUPP` on this hardware. Confirmed root cause: `BPF_PROG_TYPE_LSM` attach requires the BPF trampoline mechanism (same as `fentry`/`fexit`), and ARM32 (`arch/arm/net/`) never implemented `arch_prepare_bpf_trampoline()` — absent from the kernel source entirely, versus present for every other architecture checked. **This is not fixable at the BPF-program level.** No hook shape can attach a `BPF_PROG_TYPE_LSM` program on this project's actual target hardware (AST2600, ARMv7/ARM32).
+
+Given that, `LsmCertGuardProgram::attach()` returns `false` non-fatally (same degrade-gracefully pattern `xdp_tls` already uses) — the daemon runs fine on 2 of 3 hooks. This is why the last unchecked box above can't be verified as literally asked: shadow mode's "never denies bmcweb's own access" can't be demonstrated on this hardware, because the hook that would need to deny it never attaches at all — there's nothing there to *not* deny. What *was* verified: the daemon starts, logs the non-fatal attach failure, and runs normally across multiple restarts, and `curl -sk https://127.0.0.1/redfish/v1/` continued returning `200` throughout — i.e., adding this hook introduces no regression to bmcweb's actual certificate access, which is the practical safety property that mattered here even though the originally-asked verification method doesn't apply.
+
+Real security consequence, documented in `DESIGN.md`'s "What actually enforces" and "Rollout plan" sections rather than glossed over: on this hardware, this hook can only ever alert (via `CertAccessDetector`'s Critical Redfish message, driven by the real `/proc/<pid>/exe` check), never synchronously block. A genuine in-kernel deny for this check is not achievable here with BPF LSM, full stop — not a shadow-mode nuance, a hardware/JIT capability gap.
+
+12/12 detector unit tests pass (9 pre-existing + 3 new `CertAccessDetector` cases), plus the 3 pre-existing uprobe-parsing tests — 15/15 total, compiled and run directly with g++ (`-Wall -Wextra`, zero warnings; caught and fixed one real test bug in the process, a message-text case mismatch).
+
+Updated `CLAUDE.md` across the tree (root, `programs/`, `detectors/`, `programs/xdp_tls/`, `programs/ssl_uprobe/`, new `programs/lsm_cert_guard/`) and `programs/ssl_uprobe/DESIGN.md` to stop describing the already-shipped `SSL_read` mirror (ticket 02) as "planned" — a staleness gap a user caught mid-session, not something self-identified.

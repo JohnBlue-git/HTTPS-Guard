@@ -40,150 +40,31 @@ else()
     message(STATUS "Using fetched Boost headers: ${BOOST_INCLUDE_DIR}")
 endif()
 
-if(HTTPS_GUARD_BUILD_BPF)
-    if("${HTTPS_GUARD_TARGET_VMLINUX}" STREQUAL "")
-        message(FATAL_ERROR "HTTPS_GUARD_TARGET_VMLINUX must point to the target kernel vmlinux when HTTPS_GUARD_BUILD_BPF is enabled")
-    endif()
+# Each top-level concern owns its own CMakeLists.txt and produces one
+# library target: actions_lib, detectors_lib, programs_lib (the latter
+# also owns the BPF object build, since that's what it compiles).  Adding
+# a source file to one concern never requires touching this file.
+add_subdirectory(actions)
+add_subdirectory(detectors)
+add_subdirectory(programs)
 
-    if(NOT EXISTS "${HTTPS_GUARD_TARGET_VMLINUX}")
-        message(FATAL_ERROR "Target kernel vmlinux not found: ${HTTPS_GUARD_TARGET_VMLINUX}")
-    endif()
-
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|armv[0-9])")
-        set(HTTPS_GUARD_BPF_TARGET_ARCH arm)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
-        set(HTTPS_GUARD_BPF_TARGET_ARCH arm64)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86|x86_64)")
-        set(HTTPS_GUARD_BPF_TARGET_ARCH x86)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(powerpc|ppc64|ppc64le)")
-        set(HTTPS_GUARD_BPF_TARGET_ARCH powerpc)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv64")
-        set(HTTPS_GUARD_BPF_TARGET_ARCH riscv)
-    else()
-        message(FATAL_ERROR "Unsupported processor for BPF target: ${CMAKE_SYSTEM_PROCESSOR}")
-    endif()
-
-    set(HTTPS_GUARD_BPF_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/https_guard.bpf.o)
-    set(HTTPS_GUARD_VMLINUX_HEADER ${CMAKE_CURRENT_BINARY_DIR}/vmlinux.h)
-
-    add_custom_command(
-        OUTPUT ${HTTPS_GUARD_VMLINUX_HEADER}
-        COMMAND ${CMAKE_COMMAND} -E rm -f ${HTTPS_GUARD_VMLINUX_HEADER}
-        COMMAND sh -c "${HTTPS_GUARD_BPFTOOL_EXECUTABLE} btf dump file '${HTTPS_GUARD_TARGET_VMLINUX}' format c > '${HTTPS_GUARD_VMLINUX_HEADER}'"
-        DEPENDS ${HTTPS_GUARD_TARGET_VMLINUX}
-        VERBATIM
-        COMMENT "Generating target-kernel vmlinux.h for CO-RE"
-    )
-
-    # Userspace struct access (ssl_st, OpenSSL):
-    #
-    # We do NOT use CO-RE (bpf_core_read) for userspace structs because
-    # CO-RE relocations require the target type to exist in the kernel's
-    # BTF — but ssl_st is a userspace struct from libssl.so, not a kernel
-    # struct.  Any CO-RE relocation for ssl_st fields would fail at BPF
-    # program load time with "invalid CO-RE relocation".
-    #
-    # Instead we generate a header with the compile-time offset of
-    # ssl_st.version using offsetof() from the actual OpenSSL header,
-    # then use bpf_probe_read_user() with that offset to read the
-    # TLS version directly from userspace memory.
-    # ------------------------------------------------------------------
-    # When cross-compiling (Yocto), gen_ssl_offset is built by the bitbake
-    # recipe (https-guard-openbmc.bb) using the host compiler, and the
-    # generated ssl_version_offset.h is passed in via HTTPS_GUARD_SSL_OFFSET_HEADER.
-    # When not cross-compiling, we build it here with CMake.
-    # ------------------------------------------------------------------
-    set(HTTPS_GUARD_SSL_OFFSET_BINARY ${CMAKE_CURRENT_BINARY_DIR}/gen_ssl_offset)
-    set(HTTPS_GUARD_SSL_OFFSET_HEADER ${CMAKE_CURRENT_BINARY_DIR}/ssl_version_offset.h)
-
-    if(NOT CMAKE_CROSSCOMPILING)
-        # Native build: compile gen_ssl_offset with the regular compiler
-        add_custom_command(
-            OUTPUT ${HTTPS_GUARD_SSL_OFFSET_BINARY}
-            COMMAND ${CMAKE_C_COMPILER}
-                    -o ${HTTPS_GUARD_SSL_OFFSET_BINARY}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_ssl_offset.c
-            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_ssl_offset.c
-            VERBATIM
-            COMMENT "Building ssl_st offset detection helper"
-        )
-
-        add_custom_command(
-            OUTPUT ${HTTPS_GUARD_SSL_OFFSET_HEADER}
-            COMMAND ${HTTPS_GUARD_SSL_OFFSET_BINARY} > ${HTTPS_GUARD_SSL_OFFSET_HEADER}
-            DEPENDS ${HTTPS_GUARD_SSL_OFFSET_BINARY}
-            VERBATIM
-            COMMENT "Generating ssl_version_offset.h from actual OpenSSL headers"
-        )
-    else()
-        # Cross-compiling: expect the recipe to provide ssl_version_offset.h
-        # The bitbake recipe generates this file before CMake runs.
-        if(NOT EXISTS "${HTTPS_GUARD_SSL_OFFSET_HEADER}")
-            message(WARNING "ssl_version_offset.h not found. Cross-compilation requires the bitbake recipe to generate it.")
-        endif()
-    endif()
-
-    set(HTTPS_GUARD_BPF_FLAGS
-        -target bpf
-        -D__TARGET_ARCH_${HTTPS_GUARD_BPF_TARGET_ARCH}
-        -O2
-        -g
-        -I${CMAKE_CURRENT_BINARY_DIR}
-        -I${CMAKE_CURRENT_SOURCE_DIR}/https_guard
-    )
-
-    if(LIBBPF_INCLUDE_DIRS)
-        list(APPEND HTTPS_GUARD_BPF_FLAGS -I${LIBBPF_INCLUDE_DIRS})
-    endif()
-
-    if(HTTPS_GUARD_BPF_SYSROOT_INCLUDE)
-        list(APPEND HTTPS_GUARD_BPF_FLAGS -I${HTTPS_GUARD_BPF_SYSROOT_INCLUDE})
-    endif()
-
-    foreach(prefix_map_var IN ITEMS
-            HTTPS_GUARD_BPF_SOURCE_PREFIX_MAP
-            HTTPS_GUARD_BPF_BINARY_PREFIX_MAP
-            HTTPS_GUARD_BPF_SYSROOT_PREFIX_MAP
-            HTTPS_GUARD_BPF_SYSROOT_NATIVE_PREFIX_MAP)
-        if(NOT "${${prefix_map_var}}" STREQUAL "")
-            list(APPEND HTTPS_GUARD_BPF_FLAGS -ffile-prefix-map=${${prefix_map_var}})
-        endif()
-    endforeach()
-
-    add_custom_command(
-        OUTPUT ${HTTPS_GUARD_BPF_OBJECT}
-        COMMAND ${HTTPS_GUARD_BPF_CLANG_EXECUTABLE} ${HTTPS_GUARD_BPF_FLAGS}
-                -c ${CMAKE_CURRENT_SOURCE_DIR}/https_guard/https_guard.bpf.c
-                -o ${HTTPS_GUARD_BPF_OBJECT}
-        DEPENDS
-            ${HTTPS_GUARD_VMLINUX_HEADER}
-            ${HTTPS_GUARD_SSL_OFFSET_HEADER}
-            ${CMAKE_CURRENT_SOURCE_DIR}/https_guard/https_guard.bpf.c
-        VERBATIM
-        COMMENT "Compiling HTTPS-Guard BPF object"
-    )
-
-
-    add_custom_target(https_guard_bpf ALL DEPENDS ${HTTPS_GUARD_BPF_OBJECT})
+# Tests are a host-side development tool (no kernel/BPF/QEMU dependency —
+# see tests/CMakeLists.txt), not something that needs to run on the BMC
+# target, so default them off when cross-compiling for the target image.
+if(CMAKE_CROSSCOMPILING)
+    option(HTTPS_GUARD_BUILD_TESTS "Build the HTTPS-Guard unit test binary" OFF)
+else()
+    option(HTTPS_GUARD_BUILD_TESTS "Build the HTTPS-Guard unit test binary" ON)
+endif()
+if(HTTPS_GUARD_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
 
-add_executable(action_runner
-    actions/core/main.cpp
-    actions/core/ActionLoop.cpp
-)
-
 add_executable(https_guardd
-    https_guard/main.cpp
-    https_guard/https_guard_program.cpp
-    actions/core/ActionLoop.cpp
-    actions/log/LogAction.cpp
-    actions/blocklist/Blocklist.cpp
-    actions/blocklist/BlocklistAction.cpp
-    actions/tcp/BlockTcpAction.cpp
-    actions/tcp/TcpDestroyer.cpp
-    ebpf/bpf_program.cpp
+    programs/core/main.cpp
 )
-
+target_link_libraries(https_guardd PRIVATE programs_lib detectors_lib actions_lib)
 
 if(HTTPS_GUARD_BUILD_BPF)
     add_dependencies(https_guardd https_guard_bpf)
@@ -192,13 +73,6 @@ endif()
 foreach(target IN ITEMS https_guardd action_runner)
     target_include_directories(${target}
         PRIVATE
-        https_guard
-        actions
-        actions/core
-        actions/blocklist
-        actions/tcp
-        actions/log
-        ebpf
         ${LIBBPF_INCLUDE_DIRS}
         ${nlohmann_json_INCLUDE_DIRS}
         ${BOOST_INCLUDE_DIR}

@@ -1,15 +1,20 @@
 # HTTPS-Guard — Design Reference
 
-> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html).
+> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html) (predates the current file layout — see the [Doc Rewrites ticket](.scratch/extend-detection-coverage/issues/07-doc-rewrites.md) once it lands).
 
-This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline: kernel-space eBPF programs (uprobe primary, XDP auxiliary) observe traffic and submit events via a ring buffer; the userspace daemon classifies events and triggers countermeasures.
+This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline, and the source tree is organized around exactly those three stages:
+
+- **`programs/`** (Detect) — attaches BPF hooks (uprobe primary, XDP auxiliary) and parses their raw ring-buffer events into a common representation. Purely observational; makes no security decisions.
+- **`detectors/`** (Classify) — pure, synchronous rules that turn a parsed event into a verdict (severity, message, actionability), or no verdict at all.
+- **`actions/`** (Dispatch) — asynchronous countermeasures (log, kill the TCP connection, blocklist the source) triggered by an actionable verdict.
 
 ## Table of Contents
 
 - [Source Code Structure](#source-code-structure)
 - [Build System](#build-system)
-- [eBPF Programs](#ebpf-programs)
-- [Userspace Daemon](#userspace-daemon)
+- [The Detect Layer: `programs/`](#the-detect-layer-programs)
+- [The Classify Layer: `detectors/`](#the-classify-layer-detectors)
+- [The Dispatch Layer: `actions/`](#the-dispatch-layer-actions)
 - [Event Processing Pipeline](#event-processing-pipeline)
 - [Security Model](#security-model)
 - [Configuration](#configuration)
@@ -19,68 +24,87 @@ This document covers the complete source code under `recipes-https-guard/https-g
 
 ```
 files/
-├── CMakeLists.txt                          # CMake build definition
+├── CMakeLists.txt                          # Root: project setup, deps, add_subdirectory(actions|detectors|programs|tests)
 ├── https-guard.conf                        # EnvironmentFile for systemd units
-├── https-guard-daemon.service              # systemd unit for the eBPF daemon
-├── https-guard-daemon.sh                   # Shell wrapper that launches https-guardd
-├── https-guard-event-bridge.service        # systemd unit for the event bridge
-├── https-guard-event-bridge.sh             # Shell bridge: tails log → D-Bus/journal/redfish
-├── simulated-event-generator.service       # systemd unit for synthetic event generator
-├── simulated-event-generator.sh            # Shell script that emits simulated events
 ├── scripts/
 │   └── gen_ssl_offset.c                    # Build-time ssl_st.version offset detector
-├── https_guard/
-│   ├── events.h                            # Shared event structs & enums (BPF + C++)
-│   ├── https_guard.bpf.c                   # eBPF programs (uprobe primary + XDP auxiliary)
-│   ├── https_guard_program.hpp             # BPF object loader / ring-buffer adapter
-│   ├── https_guard_program.cpp             # BPF lifecycle + event classification + PID→socket
-│   ├── main.cpp                            # C++ daemon entry point
-│   ├── pattern_detector.hpp                # User-space HTTP anomaly rules (inline)
-│   ├── proc_peer_resolver.hpp              # /proc/<pid>/net/tcp parser for PID→socket (inline)
-│   ├── redfish_event_message.hpp           # Redfish Event message with formatting (inline)
-│   └── tls_version.hpp                     # TLS version helpers (inline)
-├── actions/
+├── service/
+│   ├── https-guard-daemon.{service,sh}
+│   ├── https-guard-event-bridge.{service,sh}
+│   └── simulated-event-generator.{service,sh}
+├── programs/                               # Detect layer
+│   ├── CMakeLists.txt                      # programs_lib (OBJECT) + the BPF object build
 │   ├── core/
-│   │   ├── ActionLoop.hpp                  # Boost.Asio-based event dispatcher interface
-│   │   ├── ActionLoop.cpp                  # Boost.Asio-based event dispatcher implementation
-│   │   └── main.cpp                        # ActionLoop smoke-test / demo entry point
+│   │   ├── BpfProgram.{hpp,cpp}            # Generic BPF lifecycle wrapper — knows nothing product-specific
+│   │   ├── IHookModule.hpp                 # attach() / eventSource() / parseEvent() — one per hook family
+│   │   ├── HttpGuardProgram.{hpp,cpp}      # Orchestrator: loops over hook modules, runs the detector registry
+│   │   ├── hg_event_source.h               # Shared `enum hg_event_source` (BPF C and C++ both compile this)
+│   │   ├── https_guard.bpf.c               # Thin aggregator: ring buffer map + #includes each hook's .bpf.h
+│   │   └── main.cpp                        # Composition root — the only place that knows every concrete hook/detector
+│   ├── ssl_uprobe/                         # PRIMARY hook — see programs/ssl_uprobe/DESIGN.md
+│   │   ├── SslUprobeProgram.{hpp,cpp}      # IHookModule: attaches the uprobe, parses uprobe_event
+│   │   ├── ssl_uprobe.bpf.h                # SEC("uprobe/ssl_write") program body
+│   │   ├── ssl_uprobe_event.h              # struct uprobe_event (BPF + C++ shared layout)
+│   │   └── proc_peer_resolver.hpp          # /proc/<pid>/net/tcp parser, PID → socket 4-tuple
+│   ├── xdp_tls/                            # AUXILIARY hook — see programs/xdp_tls/DESIGN.md
+│   │   ├── XdpTlsProgram.{hpp,cpp}         # IHookModule: attaches XDP (native → generic → skip), parses xdp_event
+│   │   ├── xdp_tls.bpf.h                   # SEC("xdp") program body
+│   │   └── xdp_tls_event.h                 # struct xdp_event
+│   └── utils/
+│       └── bounded_string.hpp              # Fixed-size char[] → std::string, shared by both hook modules
+├── detectors/                               # Classify layer
+│   ├── CMakeLists.txt                      # detectors_lib (INTERFACE — header-only)
+│   ├── core/
+│   │   ├── IDetector.hpp                   # evaluate(const hg_event&) -> std::optional<Verdict>
+│   │   ├── hg_event.hpp                    # Common parsed-event representation (no classification fields)
+│   │   └── Verdict.hpp                     # {severity, message_id, message, actionable} — a detector's output
+│   ├── tls_version/
+│   │   ├── TlsVersionDetector.hpp          # Flags TLS < 1.2, or any hook-provided tls_violation_hint
+│   │   └── tls_version.hpp                 # TlsVersion: numeric code → display string
+│   └── payload_anomaly/
+│       └── PayloadAnomalyDetector.hpp       # SQLi / path-traversal substring rules
+├── actions/                                 # Dispatch layer
+│   ├── CMakeLists.txt                      # actions_lib (OBJECT) + the action_runner smoke-test binary
+│   ├── core/
+│   │   ├── ActionLoop.{hpp,cpp}            # Boost.Asio-based async action dispatcher
+│   │   └── main.cpp                        # action_runner entry point
 │   ├── blocklist/
-│   │   ├── blocklist.bpf.h                 # BPF-side blocklist header (XDP_DROP check)
-│   │   ├── Blocklist.hpp                   # Singleton blocklist manager (BPF map wrapper)
-│   │   ├── Blocklist.cpp                   # Blocklist singleton implementation
-│   │   ├── BlocklistAction.hpp             # Countermeasure action: add src IP to blocklist
-│   │   └── BlocklistAction.cpp             # BlocklistAddAction implementation
+│   │   ├── blocklist.bpf.h                 # BPF-side XDP_DROP check (shared with programs/xdp_tls)
+│   │   ├── Blocklist.{hpp,cpp}             # Singleton BPF map wrapper
+│   │   └── BlocklistAction.{hpp,cpp}       # BlocklistAddAction
 │   ├── tcp/
-│   │   ├── BlockTcpAction.hpp              # Countermeasure action: kill TCP 4-tuple via SOCK_DESTROY
-│   │   ├── BlockTcpAction.cpp              # BlockTcpAction implementation (Netlink async)
-│   │   ├── TcpDestroyer.hpp                # RAII wrapper: Netlink SOCK_DESTROY lifecycle
-│   │   └── TcpDestroyer.cpp                # TcpDestroyer implementation
+│   │   ├── TcpDestroyer.{hpp,cpp}          # Netlink SOCK_DESTROY, RAII lifecycle
+│   │   └── BlockTcpAction.{hpp,cpp}
 │   └── log/
 │       ├── async_mutex.hpp                 # AsyncFileStreamManager (coroutine-safe file I/O)
-│       ├── LogAction.hpp                   # Async file-logging action interface
-│       └── LogAction.cpp                   # Async file-logging action implementation
-└── ebpf/
-    ├── bpf_program.hpp                     # BPF program attachment wrapper
-    └── bpf_program.cpp                     # BPF program wrapper implementation
+│       ├── LogAction.{hpp,cpp}
+│       └── redfish_event_message.hpp       # Verdict + hg_event → Redfish JSON
+└── tests/
+    ├── CMakeLists.txt                      # doctest via FetchContent; host-only, off when cross-compiling
+    ├── test_placeholder.cpp                # Proves the harness runs end-to-end
+    └── test_detectors.cpp                  # Unit tests for both IDetector implementations
 ```
 
 ## Build System
 
 ### CMakeLists.txt
 
-The build system handles both the C++ daemon and BPF object compilation:
+One `CMakeLists.txt` per top-level concern (`actions`, `detectors`, `programs`, `tests`), each producing one library target (`actions_lib`, `detectors_lib`, `programs_lib`) plus the root file tying them into the final executables. Adding a source file to one concern never requires touching another concern's build file.
 
 **Key features:**
 - Cross-compilation support for ARM 32-bit (ASpeed AST2600)
 - BPF object compilation with clang targeting `bpf`
 - CO-RE (Compile Once - Run Everywhere) via vmlinux.h
 - Native host tool compilation (gen_ssl_offset) for OpenSSL struct offset detection
-- Automatic Boost header fetching if not available in sysroot
+- Automatic Boost/doctest header fetching if not available in sysroot
 
 **Build targets:**
-- `https_guardd` - Main daemon binary
-- `action_runner` - Test harness for ActionLoop
-- `https_guard.bpf.o` - BPF object (when `HTTPS_GUARD_BUILD_BPF=ON`)
+- `https_guardd` - Main daemon binary (root `CMakeLists.txt`)
+- `action_runner` - Test harness for ActionLoop (`actions/CMakeLists.txt`)
+- `https_guard.bpf.o` - BPF object, when `HTTPS_GUARD_BUILD_BPF=ON` (`programs/CMakeLists.txt`)
+- `https_guard_tests` - doctest unit tests, when `HTTPS_GUARD_BUILD_TESTS=ON` (default off when cross-compiling — see `tests/CMakeLists.txt`)
+
+**A cross-compile trap worth knowing about:** a target's default output directory mirrors the *source* subdirectory it's defined in (`CMAKE_CURRENT_BINARY_DIR`), not the top-level build root. Moving a target's `add_executable`/custom-command into a concern's own `CMakeLists.txt` silently moves its output too. Three things the BitBake recipe expects to find flat under `${B}` are pinned back to `${CMAKE_BINARY_DIR}` explicitly for this reason: `https_guard.bpf.o` (`programs/CMakeLists.txt`), `action_runner`'s `RUNTIME_OUTPUT_DIRECTORY` (`actions/CMakeLists.txt`), and `ssl_version_offset.h`'s write location in the recipe's own `do_compile:prepend()`. `https_guardd` is unaffected — its `add_executable` stays in the root `CMakeLists.txt`, where `CMAKE_CURRENT_BINARY_DIR` already equals `CMAKE_BINARY_DIR`.
 
 **BPF compilation flags:**
 ```cmake
@@ -104,8 +128,8 @@ A build-time host tool that determines the offset of `ssl_st.version` in OpenSSL
 **How it works:**
 1. Compiled with native compiler during `do_configure:prepend` in the bitbake recipe
 2. Uses hardcoded architecture-specific offsets (empirically determined)
-3. Generates `ssl_version_offset.h` with `#define SSL_VERSION_OFFSET <N>`
-4. This header is included by `https_guard.bpf.c` to read `ssl->version` at the correct offset
+3. Generates `ssl_version_offset.h` with `#define SSL_VERSION_OFFSET <N>`, written under `programs/` to match where `programs/ssl_uprobe/ssl_uprobe.bpf.h`'s `#include` looks for it
+4. Included by `programs/ssl_uprobe/ssl_uprobe.bpf.h` to read `ssl->version` at the correct offset
 
 **Output:**
 ```c
@@ -115,173 +139,76 @@ A build-time host tool that determines the offset of `ssl_st.version` in OpenSSL
 #endif
 ```
 
-## eBPF Programs
+## The Detect Layer: `programs/`
 
-### https_guard.bpf.c
+### `IHookModule` — the interface every hook implements
 
-Single C file containing two independent eBPF programs that share a ring buffer:
-
-#### 1. Uprobe: `https_guard_ssl_write` (PRIMARY)
-
-**Hook:** `SSL_write(SSL *ssl, const void *buf, int num)` in OpenSSL
-
-**What it captures:**
-- **TLS version** - Reads `ssl->version` using `bpf_probe_read_user()` at `SSL_VERSION_OFFSET` (36 bytes on ARM 32-bit)
-- **Plaintext payload** - Copies up to 127 bytes from `buf` into `evt->payload_snippet`
-- **Process info** - PID, TGID, and process name via `bpf_get_current_comm()`
-
-**What it does NOT do:**
-- Does NOT classify events (no event_type, no severity)
-- Does NOT make security decisions
-- Does NOT access socket info (not available from uprobe context)
-
-**Design principle:** PURELY OBSERVATIONAL
-
-**Event struct:** `struct uprobe_event` (~176 bytes)
-```c
-struct uprobe_event {
-    uint32_t event_source;      // HG_SOURCE_UPROBE
-    uint32_t reserved;          // Padding
-    uint64_t timestamp_ns;
-    uint32_t pid;
-    uint32_t tgid;
-    uint16_t tls_version;       // Raw TLS version from ssl->version
-    uint16_t padding;
-    char process[16];
-    char payload_snippet[128];
+```cpp
+class IHookModule {
+public:
+    virtual bool attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept = 0;
+    virtual hg_event_source eventSource() const noexcept = 0;
+    virtual std::optional<hg_event> parseEvent(const void* data, size_t size) const noexcept = 0;
 };
 ```
 
-**Return value:** Always returns 0 (pass) - defers all decisions to userspace
+A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into the shared `hg_event` representation. It never classifies (that's `detectors/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
 
-#### 2. XDP: `https_guard_xdp` (AUXILIARY)
+Two hooks exist today, each documented in depth in its own `DESIGN.md`:
 
-**Hook:** Network driver RX path (or generic SKB mode)
+| Hook | Role | Deep dive |
+|------|------|-----------|
+| `ssl_uprobe` | PRIMARY — uprobe on OpenSSL `SSL_write()` | [programs/ssl_uprobe/DESIGN.md](recipes-https-guard/https-guard/files/programs/ssl_uprobe/DESIGN.md) |
+| `xdp_tls` | AUXILIARY — XDP on the NIC RX path | [programs/xdp_tls/DESIGN.md](recipes-https-guard/https-guard/files/programs/xdp_tls/DESIGN.md) |
 
-**What it inspects:**
-1. **Ethernet + IP + TCP headers** - Filters to IPv4/TCP on port 443
-2. **TLS ClientHello** - Identifies ContentType 0x16 (Handshake)
-3. **TLS version** - Extracts version from ClientHello fixed portion
-4. **Plaintext HTTP** - Detects HTTP methods (GET, POST, PUT, DELETE, HEAD) on port 443
+### `https_guard.bpf.c` — the aggregator
 
-**Minimal classification:**
-- Sets `is_violation` flag (1 if TLS < 1.2, 0 otherwise)
-- This is the ONLY classification in BPF - all other decisions happen in userspace
+Both hooks' BPF program bodies live in their own `<hook>.bpf.h`, but clang only ever compiles one translation unit: `programs/core/https_guard.bpf.c`. It declares the shared ring buffer map and the `enum hg_event_source` discriminator, then `#include`s each hook's header — so the result is a single BPF object with one ring buffer, one blocklist map, and one load/verify pass, regardless of how many hook headers get added.
 
-**Enforcement:**
-- **Synchronous:** `blocklist_check(ip->saddr)` → XDP_DROP for active blocklist entries
-- **Synchronous:** `is_violation == 1` → XDP_DROP for TLS version violations
-- **Asynchronous:** All other events → XDP_PASS + ring buffer submission
+### `HttpGuardProgram` — the orchestrator
 
-**Event struct:** `struct xdp_event` (~224 bytes)
-```c
-struct xdp_event {
-    uint32_t event_source;      // HG_SOURCE_XDP
-    uint32_t is_violation;      // 1 if TLS < 1.2, 0 otherwise
-    uint64_t timestamp_ns;
-    uint32_t pid;
-    uint32_t tgid;
-    uint32_t src_ip_v4;
-    uint32_t dst_ip_v4;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t tls_version;
-    uint16_t padding;
-    char process[16];
-    char source_ip[32];
-    char payload_snippet[128];
+The sole `BpfProgram` subclass. It holds a `vector<unique_ptr<IHookModule>>` and a `DetectorRegistry` (`unordered_map<hg_event_source, vector<unique_ptr<IDetector>>>`), both constructed and injected by `main.cpp` — it never constructs a concrete hook or detector itself. `attachProgram()` loops over the hooks calling `attach()`, requiring at least one to succeed; the ring-buffer callback reads the raw `event_source` discriminator, finds the hook whose `eventSource()` matches, calls its `parseEvent()`, then runs that source's registered detectors in order and dispatches on the resulting `Verdict`.
+
+Because everything is expressed through `IHookModule`/`IDetector`, adding a new hook (e.g. the planned BPF-LSM certificate-access guard) or a new detection rule never requires touching `HttpGuardProgram` — only `main.cpp`'s composition root grows by a line.
+
+## The Classify Layer: `detectors/`
+
+### `IDetector` and `Verdict`
+
+```cpp
+struct Verdict {
+    std::string severity;
+    std::string message_id;
+    std::string message;
+    bool        actionable = false;
+};
+
+class IDetector {
+public:
+    virtual std::optional<Verdict> evaluate(const hg_event& evt) const = 0;
 };
 ```
 
-**Return values:**
-- `XDP_DROP` - For blocklist hits and TLS version violations
-- `XDP_PASS` - For all other traffic
+A detector is a pure, synchronous function: given an already-parsed event, decide whether its rule matches and, if so, produce the `Verdict` to act on. No I/O, no BPF/socket access, no knowledge of which hook produced the event. `evaluate()` takes `hg_event` by `const&` and never mutates it — `hg_event` stays purely "what was observed," `Verdict` is purely "what a detector decided," and the two are never conflated.
 
-### Blocklist Integration (blocklist.bpf.h)
+### The registry
 
-Hybrid enforcement mechanism that enables synchronous XDP_DROP for known threats:
+`HttpGuardProgram::DetectorRegistry` maps each `hg_event_source` to an ordered list of detectors. Both existing sources run the same two rules today, in the same priority order:
 
-```c
-static __always_inline int blocklist_check(__u32 src_ip)
-{
-    // 1. Look up src_ip in BPF hash map
-    // 2. If found and not expired → XDP_DROP
-    // 3. If found and expired → delete entry, return XDP_PASS
-    // 4. If not found → XDP_PASS
-}
-```
+1. **`TlsVersionDetector`** — flags a negotiated version below TLS 1.2. `tls_version == 0` alone means "not observed" (the uprobe never resolves `ssl->version` before a violation) and is not itself a violation — *unless* the producing hook already determined otherwise via `hg_event.tls_violation_hint` (only `xdp_tls` sets this, since its BPF side already classifies `is_violation` from the wire — see its own `DESIGN.md`). Without that hint, a hook-agnostic zero-check would wrongly treat a genuinely-parsed `0x0000` `legacy_version` as "no data" instead of a violation — this exact bug shipped once and was caught by `/code-review`; the hint field exists specifically to prevent it recurring.
+2. **`PayloadAnomalyDetector`** — SQLi / path-traversal / known attack-signature substrings in `payload_snippet`, case-insensitive.
 
-**Map:** `BPF_MAP_TYPE_HASH` with 1024 max entries
-- Key: Source IP (network byte order, 4 bytes)
-- Value: Expiry timestamp (nanoseconds, 8 bytes)
+The orchestrator runs a source's list in order and stops at the first match; no match falls back to an `OK` / `HttpsTrafficObserved` verdict built inline in `HttpGuardProgram`, not by a detector (there is nothing to detect in that case).
 
-## Userspace Daemon
+## The Dispatch Layer: `actions/`
 
-### main.cpp
+Unchanged in shape by the `programs`/`detectors` split — still three single-responsibility, asynchronously-dispatched countermeasures run through `ActionLoop`:
 
-Entry point that orchestrates the full eBPF lifecycle:
+- **`LogAction`** — writes the formatted Redfish event JSON to the event log file (always dispatched, regardless of severity).
+- **`BlockTcpAction`** — `SOCK_DESTROY` via `NETLINK_INET_DIAG` for the exact 4-tuple (`TcpDestroyer`).
+- **`BlocklistAddAction`** — writes an expiry into the shared BPF blocklist map, which `xdp_tls`'s synchronous `blocklist_check()` reads on every subsequent packet.
 
-**Initialization sequence:**
-1. Parse CLI arguments (interface, OpenSSL lib path, output log, BPF object)
-2. Seed ActionLoop with LogAction
-3. Load and verify BPF object via libbpf
-4. Create HttpGuardProgram (attaches uprobe + XDP, adopts blocklist map)
-5. Open ring buffer consumer with `on_event` callback
-6. Poll loop: `ring_buffer__poll()` every 200ms
-
-### https_guard_program.cpp
-
-BPF program lifecycle manager and event classifier:
-
-**Responsibilities:**
-- Attach/detach uprobe and XDP programs
-- Handle XDP fallback (native → generic SKB mode)
-- Ring buffer event processing (`ringBufferHandler`)
-- Event classification (determine event_type and severity)
-- PID-to-socket correlation via ProcPeerResolver
-- Enforcement action dispatch
-
-**Event classification logic:**
-
-**Uprobe events (HG_SOURCE_UPROBE):**
-```cpp
-if (tls_version < 0x0303) {
-    event_type = HG_EVENT_TLS_VERSION_VIOLATION;
-    severity = Critical;
-    actionable = true;
-    // → BlockTcpAction + BlocklistAddAction
-} else {
-    // Apply anomaly detection to payload
-    if (suspicious) {
-        event_type = HG_EVENT_HTTP_ANOMALY_DETECTED;
-        severity = Warning;
-    } else {
-        event_type = HG_EVENT_HTTP_PAYLOAD_OBSERVED;
-        severity = Informational;
-    }
-}
-```
-
-**XDP events (HG_SOURCE_XDP):**
-```cpp
-if (is_violation) {
-    event_type = HG_EVENT_TLS_VERSION_VIOLATION;
-    severity = Critical;
-    // Already dropped by XDP, just log
-} else if (payload_snippet[0] != '\0') {
-    // Apply anomaly detection
-    if (suspicious) {
-        event_type = HG_EVENT_HTTP_ANOMALY_DETECTED;
-        severity = Warning;
-    } else {
-        event_type = HG_EVENT_HTTP_PAYLOAD_OBSERVED;
-        severity = Informational;
-    }
-} else {
-    event_type = HG_EVENT_TLS_HANDSHAKE_METADATA;
-    severity = Informational;
-}
-```
+The last two only fire when a `Verdict::actionable` is true and `hg_event::src_ip_v4` is non-zero (uprobe events need `ProcPeerResolver` to have found a socket first; `xdp_tls` events always carry it from the packet headers).
 
 ## Event Processing Pipeline
 
@@ -291,34 +218,32 @@ if (is_violation) {
 BPF Event (ring buffer)
     │
     ▼
-ringBufferHandler()
+HttpGuardProgram::ringBufferHandler()
     │
-    ├─ Read event_source discriminator
+    ├─ Read the raw uint32_t event_source discriminator
     │
-    ├─ if HG_SOURCE_UPROBE:
-    │   ├─ Extract tls_version, payload_snippet
-    │   ├─ Classify based on tls_version
-    │   ├─ ProcPeerResolver::getTcpSockets(pid)
-    │   │   └─ Read /proc/<pid>/net/tcp
-    │   │   └─ Parse hex format "AABBCCDD:PPPP"
-    │   │   └─ Return socket 4-tuple
-    │   └─ Enforcement:
-    │       ├─ LogAction (always)
-    │       ├─ BlockTcpAction(src_ip, dst_ip, src_port, dst_port)
-    │       │   └─ TcpDestroyer::execute()
-    │       │       └─ SOCK_DESTROY via NETLINK_INET_DIAG
-    │       └─ BlocklistAddAction(src_ip, ttl)
-    │           └─ Blocklist::add()
-    │               └─ bpf_map_update_elem()
+    ├─ Find the IHookModule whose eventSource() matches
+    │   └─ (none found → log + skip)
     │
-    └─ if HG_SOURCE_XDP:
-        ├─ Extract is_violation, socket info, payload
-        ├─ Classify based on is_violation + payload
-        └─ Enforcement:
-            ├─ LogAction (always)
-            ├─ BlockTcpAction (direct 4-tuple from event)
-            └─ BlocklistAddAction (if actionable)
+    ├─ hookModule->parseEvent(data, size) -> optional<hg_event>
+    │   └─ nullopt (undersized/malformed) → skip
+    │
+    ├─ Run detectors_[event_source] in order, stop at first match
+    │   ├─ TlsVersionDetector::evaluate(evt)      -> optional<Verdict>
+    │   └─ PayloadAnomalyDetector::evaluate(evt)  -> optional<Verdict>
+    │   └─ (no match → inline "OK / traffic observed" Verdict)
+    │
+    ├─ if Verdict::actionable && evt.src_ip_v4 != 0:
+    │   ├─ BlockTcpAction(src_ip, dst_ip, src_port, dst_port)
+    │   │   └─ TcpDestroyer::execute() → SOCK_DESTROY via NETLINK_INET_DIAG
+    │   └─ BlocklistAddAction(src_ip, ttl)
+    │       └─ Blocklist::add() → bpf_map_update_elem()
+    │
+    └─ LogAction (always, regardless of severity)
+        └─ RedfishEventMessage(evt, verdict) → JSON → event log file
 ```
+
+Per-hook specifics — exactly what each `parseEvent()` extracts, and each hook's own attach fallback — live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
 
 ### ActionLoop - Async Dispatcher
 
@@ -327,7 +252,7 @@ Decouples event callback processing from I/O using Boost.Asio:
 ```
 Main thread (ring_buffer__poll)
     │
-    └─ on_event() callback
+    └─ ringBufferHandler() callback
         ├─ pushAction(LogAction)          → ActionLoop queue
         ├─ pushAction(BlocklistAddAction) → ActionLoop queue
         └─ pushAction(BlockTcpAction)     → ActionLoop queue
@@ -406,17 +331,18 @@ The eBPF hook defers the decision: it submits an observation to a ring buffer an
                                               │  asynchronous
                                               ▼
                             ┌──────────────────────────────────────┐
-                            │  Userspace daemon                    │
+                            │  Userspace daemon (HttpGuardProgram)  │
                             │                                      │
                             │  ring_buffer__poll() loop            │
-                            │    → on_event() callback             │
-                            │      → pattern_detector (complex     │
-                            │        rules, regex, state machine)  │
-                            │      → classifier                    │
+                            │    → find the owning IHookModule     │
+                            │      → parseEvent()                  │
+                            │        → run detectors_[source]      │
+                            │          (complex rules, regex,      │
+                            │           cross-field logic)         │
+                            │          → Verdict                   │
                             │      → countermeasure:               │
                             │          • SOCK_DESTROY TCP conn     │
                             │          • update eBPF blocklist     │
-                            │          • kill process (optional)   │
                             │          • log / alert               │
                             └──────────────────────────────────────┘
 ```
@@ -448,19 +374,16 @@ Packet arrives on port 443
   │ Tier 2: Uprobe + XDP detection │  ← Asynchronous
   │  ├── SSL_write → ring buffer   │
   │  ├── ClientHello → ring buffer │
-  │  ├── XDP: version viol → DROP  │
+  │  ├── XDP: version viol → DROP │
   │  └── XDP_PASS (always uprobe)  │
   └──────────┬─────────────────────┘
              │
              ▼
   ┌────────────────────────────────┐
   │ Userspace daemon               │
-  │  → classify event              │
-  │  → for uprobe events:          │
-  │    → ProcPeerResolver(pid)     │
-  │    → read /proc/<pid>/net/tcp  │
-  │    → get socket 4-tuple        │
-  │  → if actionable:              │
+  │  → parseEvent() via IHookModule│
+  │  → classify via detectors_[]   │
+  │  → if Verdict.actionable:      │
   │    → BlockTcpAction(src,dst)   │
   │    → SOCK_DESTROY connection   │
   │    → BlocklistAddAction(src_ip)│
@@ -476,36 +399,22 @@ Packet arrives on port 443
 | HTTPS-Guard's use | Blocklist enforcement only | Primary detection path |
 | Enforcement action | `XDP_DROP` (proactive, XDP platforms only) | `SOCK_DESTROY` + blocklist write (reactive, all platforms) |
 
-Evidence in the source:
-
-| Location | Evidence |
-|----------|----------|
-| `https_guard/https_guard.bpf.c:217-292` | Uprobe `SSL_write`: purely observational — reads `ssl->version` via `bpf_probe_read_user()` at offset 36, captures a payload snippet, submits `uprobe_event` (no event_type, no severity), returns 0 |
-| `https_guard/https_guard.bpf.c:370-518` | XDP: minimal classification — sets `is_violation` (1 if TLS < 1.2), includes socket info, submits `xdp_event`; returns `XDP_DROP` for violations and blocklist hits |
-| `https_guard/https_guard.bpf.c:56` | `blocklist_check(ip->saddr)` — must stay in BPF for line-rate; active entries drop before any inspection |
-| `actions/blocklist/blocklist.bpf.h:22-36` | `blocklist_check()` — drops active entries, prunes expired ones via `bpf_map_delete_elem()` |
-| `https_guard/events.h:23-34` | `enum hg_event_source` discriminator (`HG_SOURCE_UPROBE=1`, `HG_SOURCE_XDP=2`) — first field in every event struct |
-| `https_guard/https_guard_program.cpp:144-346` | `ringBufferHandler()` — the only place classification happens: reads the discriminator, applies anomaly detection, dispatches actions |
-| `actions/blocklist/Blocklist.cpp:46-61` | `Blocklist::add()` — computes expiry, writes via `bpf_map_update_elem()`, the write Tier 1 later reads |
-| `actions/tcp/TcpDestroyer.cpp:69-182` | `TcpDestroyer::execute()` — sends `SOCK_DESTROY` via `NETLINK_INET_DIAG` for the exact TCP 4-tuple |
-| `https_guard/pattern_detector.hpp` | SQLi / path-traversal string matching — impossible under verifier limits, runs entirely in userspace |
-
 Key design decisions this leads to:
 
-1. **BPF is observational** — no `event_type`/`severity` fields exist in either BPF struct.
-2. **Userspace is intelligent** — all classification, anomaly detection, and policy live in `https_guard_program.cpp`.
-3. **Different structs per hook** — `uprobe_event` (176B) has no socket info; `xdp_event` (224B) does.
+1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `hg_event.tls_violation_hint`, not baked into any detector's logic.
+2. **Userspace is intelligent** — all classification lives behind `IDetector`, all hook-attach/parse logic behind `IHookModule`; neither knows about the other.
+3. **Different structs per hook** — `uprobe_event` has no socket info; `xdp_event` does (available from packet headers, unlike from uprobe context).
 4. **No CO-RE for userspace structs** — `ssl_st` is a userspace type, not in kernel BTF, hence `gen_ssl_offset.c`.
 
 ### Platform-Adaptive Enforcement
 
-The uprobe attaches unconditionally and never fails. XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available:
+The uprobe attaches unconditionally; failing to attach it is logged as required but does not by itself stop the daemon (only zero hooks attaching does). XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available. `HttpGuardProgram::attachProgram()` requires at least one hook of any kind to succeed; the summary line it logs (`"https_guard: enforcement active via N of M hook(s)"`) is intentionally hook-agnostic — the orchestrator has no hook names to report, only the generic `IHookModule` interface. Each hook still logs its own specific attach outcome internally (see the per-hook `DESIGN.md`s).
 
-**x86 servers / QEMU TAP+BRIDGE with virtio-net** — both programs load. XDP proactively drops TLS violations at the wire, the uprobe still resolves PID→socket for enforcement, and the blocklist protects future connections from repeat offenders. Generic (SKB) XDP hooks `netif_receive_skb()` in software, so `virtio-net-device` attaches successfully even without native driver support.
+**x86 servers / QEMU TAP+BRIDGE with virtio-net** — both hooks load. XDP proactively drops TLS violations at the wire, the uprobe still resolves PID→socket for enforcement, and the blocklist protects future connections from repeat offenders. Generic (SKB) XDP hooks `netif_receive_skb()` in software, so `virtio-net-device` attaches successfully even without native driver support.
 
-**AST2600 (johnblue) in bridge mode** — see [the top-level README](README.md#bridge-mode-recommended-for-xdp) for the TAP/bridge setup. The built-in `ftgmac100` may support native XDP if `CONFIG_XDP` is enabled in the kernel config; if not, the daemon falls back to uprobe-only below. Verified on the kernel actually shipped: `CONFIG_BPF=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_UPROBE_EVENTS=y`, but `CONFIG_XDP` absent — `ip link show eth0` shows no `xdp`/`prog/xdp` line, and the daemon logs `"https_guard: enforcement active via uprobe(SSL_write)"`.
+**AST2600 (johnblue)** — see [the top-level README](README.md#bridge-mode-recommended-for-xdp) for the TAP/bridge setup. Verified via a real QEMU boot (SLIRP mode) on the actual shipped kernel: both the uprobe *and* XDP (native mode) attached successfully — `journalctl` showed `"https_guard: enforcement active via 2 of 2 hook(s)"`. (Earlier notes on this machine assumed XDP would be uprobe-only under SLIRP; this build's kernel/QEMU combination supports native XDP attach even there — the attach *succeeding* doesn't necessarily mean real hardware offload semantics are exercised, since SLIRP's backend isn't a real NIC, but the driver-level `ndo_bpf` registration itself went through.)
 
-**QEMU SLIRP, or any platform without XDP** — native XDP fails (no `ndo_bpf`); generic XDP also fails (SLIRP has no real netdev). Both failures are logged but non-fatal. TLS violations are still caught, just reactively:
+**Any platform where XDP genuinely can't attach** — both native and generic XDP fail; both failures are logged but non-fatal, and detection continues via the uprobe alone:
 
 ```
 Process calls SSL_write(ssl, buf, num)
@@ -517,15 +426,15 @@ Process calls SSL_write(ssl, buf, num)
        │     on ARM 32-bit OpenSSL 3.x) using bpf_probe_read_user()
        │     → extracts lower 16 bits (e.g. 0x0303 = TLS 1.2)
        │
-       ├── If version < 0x0303 (TLS 1.2):
-       │     → HG_EVENT_TLS_VERSION_VIOLATION, Severity: CRITICAL
+       ├── If version < 0x0303 (TLS 1.2) and version > 0:
+       │     → TlsVersionDetector: Verdict{Critical, HttpsTlsVersionViolation, actionable=true}
        │
        └── Submits event to ring buffer (PID + TLS version, no socket info)
        │
        ▼
   Userspace daemon receives event
        │
-       ├── ProcPeerResolver::getTcpSockets(pid)
+       ├── SslUprobeProgram::parseEvent() → ProcPeerResolver::getTcpSockets(pid)
        │     → reads /proc/<pid>/net/tcp, parses "AABBCCDD:PPPP"
        │     → returns socket 4-tuple
        │
@@ -543,16 +452,12 @@ Process calls SSL_write(ssl, buf, num)
   scanning code in gen_ssl_offset.c.
 ```
 
-**Caveat when testing with `curl`:** OpenSSL 3.x removed TLS 1.0/1.1 support at compile time, so `--tlsv1.0`/`--tlsv1.1` are silently ignored — curl always negotiates TLS 1.3 regardless of the flag:
+**Caveat when testing with `curl`:** OpenSSL 3.x removed TLS 1.0/1.1 support at compile time, so `--tlsv1.0`/`--tlsv1.1` are silently ignored — curl always negotiates TLS 1.3 regardless of the flag. Confirmed live against a real QEMU boot:
 
 ```
-curl -4 --tlsv1.0 -v -ku root:0penBmc https://localhost/redfish/v1
-...
-* TLSv1.3 (OUT), TLS handshake, Client hello (1):
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / ...
+$ curl -sk https://<bmc>/redfish/v1 -u root:0penBmc --tlsv1.2
 ```
-
-The uprobe will read `0x0304` (TLS 1.3) for every curl connection on this platform; testing the actual TLS < 1.2 violation path requires a legacy TLS client.
+still produces a `tls_version=772` (0x0304 = TLS 1.3) uprobe event, classified `OK` / `HttpsTrafficObserved`. Testing the actual TLS < 1.2 violation path requires a legacy TLS client; the unit tests in `detectors/` cover that path directly against synthetic input instead (see `tests/test_detectors.cpp`).
 
 ## Configuration
 
@@ -610,28 +515,22 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
    - Locates target kernel vmlinux
    - Creates symlink: `${WORKDIR}/target-kernel-vmlinux`
    - Compiles `gen_ssl_offset.c` with native compiler (BUILD_CC)
-   - Generates `ssl_version_offset.h`
 
 3. `do_compile:prepend()`
-   - Runs `gen_ssl_offset` to produce `ssl_version_offset.h`
-   - Passes to CMake for BPF compilation
+   - Runs `gen_ssl_offset` to produce `${B}/programs/ssl_version_offset.h` (note the `programs/` prefix — see the cross-compile trap called out under [Build System](#build-system))
 
 4. `do_compile`
    - CMake builds C++ daemon and BPF object
 
 5. `do_install`
-   - Installs binaries to `${sbindir}`
+   - Installs binaries to `${sbindir}` (`https-guardd`, `action_runner`, and the shell wrappers)
    - Installs BPF object to `${datadir}/https-guard/`
    - Installs systemd units to `${systemd_system_unitdir}`
    - Installs config to `${sysconfdir}/default/https-guard`
    - Stamps event mode into config from PACKAGECONFIG
 
-**SRC_URI includes:**
-- All shell scripts and systemd units
-- CMakeLists.txt
-- All C++ source/headers under `https_guard/`, `actions/`, `ebpf/`
-- `scripts/gen_ssl_offset.c`
+**SRC_URI includes:** all shell scripts and systemd units under `service/`, `CMakeLists.txt` (root and per-concern), every C++ source/header under `programs/`, `detectors/`, `actions/`, `tests/`, and `scripts/gen_ssl_offset.c`.
 
 ## Development
 
-For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md).
+For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md). For per-hook detection rationale and diagrams, see `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.

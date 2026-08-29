@@ -10,7 +10,7 @@ HTTPS-Guard is an eBPF-based network security observability and enforcement tool
 - [Building HTTPS-Guard](#building-https-guard)
 - [QEMU Configuration](#qemu-configuration)
   - [Bridge Mode (Recommended for XDP)](#bridge-mode-recommended-for-xdp)
-  - [SLIRP Mode (Default, Uprobe-Only)](#slirp-mode-default-uprobe-only)
+  - [SLIRP Mode (Default)](#slirp-mode-default)
   - [Port Forwarding Limitations](#port-forwarding-limitations)
 - [Deployment](#deployment)
 - [Monitoring Redfish Events](#monitoring-redfish-events)
@@ -64,12 +64,13 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 │  │              https-guardd daemon                         │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
 │  │  │ ring_buffer__poll()                                │  │  │
-│  │  │   → on_event()                                     │  │  │
-│  │  │     → Classify event (event_type, severity)        │  │  │
-│  │  │     → Anomaly detection (pattern_detector)         │  │  │
-│  │  │     → PID→socket (ProcPeerResolver)                │  │  │
-│  │  │     → Enforcement actions:                         │  │  │
-│  │  │       • LogAction (file write)                     │  │  │
+│  │  │   → find owning IHookModule, parseEvent()          │  │  │
+│  │  │     → PID→socket (ProcPeerResolver, uprobe only)   │  │  │
+│  │  │   → run detectors_[source] → Verdict               │  │  │
+│  │  │     • TlsVersionDetector (< TLS 1.2)                │  │  │
+│  │  │     • PayloadAnomalyDetector (SQLi/traversal)       │  │  │
+│  │  │   → Enforcement actions (if actionable):           │  │  │
+│  │  │       • LogAction (file write, always)             │  │  │
 │  │  │       • BlockTcpAction (SOCK_DESTROY)              │  │  │
 │  │  │       • BlocklistAddAction (BPF map update)        │  │  │
 │  │  └────────────────────────────────────────────────────┘  │  │
@@ -105,17 +106,17 @@ meta-https-guard/
 
 ### Component roles
 
-The source under `files/` is split into five components:
+The source under `files/` is organized around the **Detect → Classify → Dispatch** pipeline, one top-level directory per stage:
 
 | Component | Path | Role |
 |-----------|------|------|
-| **eBPF programs** | `https_guard/https_guard.bpf.c` | Uprobe on `SSL_write()` captures TLS version + payload; XDP inspects ClientHello and enforces the blocklist |
-| **C++ daemon** (`https-guardd`) | `https_guard/` | Loads the BPF object, polls the ring buffer, classifies events, resolves PID→socket, dispatches actions |
-| **Enforcement actions** | `actions/` | Three async countermeasures: `LogAction` (file write), `BlockTcpAction` (SOCK_DESTROY via Netlink), `BlocklistAddAction` (BPF map update) |
-| **BPF wrapper** | `ebpf/` | RAII wrapper for BPF program load / attach / detach lifecycle |
-| **Event bridge** | `https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
+| **Detect** | `programs/` | Attaches BPF hooks and parses their raw events. `ssl_uprobe/` (uprobe on `SSL_write()`, PRIMARY) and `xdp_tls/` (XDP ClientHello inspection + blocklist enforcement, AUXILIARY) each implement the `IHookModule` interface; `core/` holds the generic BPF lifecycle wrapper and the orchestrator (`HttpGuardProgram`) that dispatches between them |
+| **Classify** | `detectors/` | Pure classification rules behind `IDetector`: `tls_version/` (TLS-version-violation check) and `payload_anomaly/` (SQLi/path-traversal signatures), run through a registry keyed by which hook produced the event |
+| **Dispatch** | `actions/` | Three async countermeasures run through `ActionLoop`: `log/` (file write), `tcp/` (SOCK_DESTROY via Netlink), `blocklist/` (BPF map update) |
+| **Tests** | `tests/` | doctest-based unit tests for the `detectors/` layer — no kernel/BPF/root/QEMU dependency |
+| **Event bridge** | `service/https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
-> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md) (or [DESIGN.html](DESIGN.html) for the diagram-first version).
+> For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md). Per-hook detection rationale and diagrams live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.
 
 ## Building HTTPS-Guard
 
@@ -270,7 +271,7 @@ journalctl -u https-guard-daemon -l | grep -i xdp
 # If neither: daemon is running uprobe-only (kernel lacks CONFIG_XDP)
 ```
 
-### SLIRP Mode (Default, Uprobe-Only)
+### SLIRP Mode (Default)
 
 SLIRP is the default QEMU networking mode. It uses user-mode networking and does **not** expose a real NIC to the guest.
 
@@ -283,15 +284,18 @@ runqemu johnblue nographic slirp
 **Characteristics:**
 - ✅ Easy to use, no host setup required
 - ✅ Uprobe detection works perfectly
-- ❌ No XDP support (no real netdev)
 - ❌ No promiscuous mode
 - ❌ Limited to user-mode networking
 
-**Verify uprobe-only mode:**
+**XDP under SLIRP — verify on your own kernel build, don't assume:** this section previously stated XDP cannot attach under SLIRP (no real netdev). A live QEMU boot on this project's own build showed the opposite — `journalctl` logged `"https_guard: XDP attached in native mode"` even under plain SLIRP. Attach succeeding doesn't necessarily mean line-rate `XDP_DROP` enforcement is exercised the same way it would be against a real NIC (SLIRP's backend still isn't real hardware), and this wasn't independently confirmed either way — only that the daemon and OS agree the program is attached. Treat the SLIRP/XDP relationship as kernel-build-dependent until someone verifies the drop path specifically, not as a fixed platform limitation.
+
+**Check what actually attached:**
 
 ```bash
 journalctl -u https-guard-daemon -l | grep "enforcement active"
-# Expected: "https_guard: enforcement active via uprobe(SSL_write)"
+# "https_guard: enforcement active via N of M hook(s)" — N/M depends on
+# what actually attached on your kernel; it is not hardcoded to any
+# specific hook combination (see programs/core/HttpGuardProgram.cpp).
 ```
 
 ### Port Forwarding Limitations
@@ -308,7 +312,7 @@ runqemu johnblue nographic \
 - Native XDP: NIC driver with `ndo_bpf` support
 - Generic XDP: Real netdev with `netif_receive_skb()` hook
 
-SLIRP provides neither. For XDP functionality on AST2600, use bridge mode with ftgmac100 as described in the [Bridge Mode](#bridge-mode-recommended-for-xdp) section above.
+The reasoning above is why SLIRP is *documented* as providing neither — but see the [XDP under SLIRP](#slirp-mode-default) note above: an actual boot on this project's kernel showed the attach call itself succeeding under SLIRP regardless. Port forwarding is still a separate, unaffected problem either way (it doesn't change what backend `eth0` has), so bridge mode remains the recommended path for anything you want to depend on XDP actually running — see [Bridge Mode](#bridge-mode-recommended-for-xdp) above.
 
 ## Deployment
 
@@ -514,9 +518,11 @@ busctl call xyz.openbmc_project.Logging /xyz/openbmc_project/logging/entry \
 | Platform | NIC | Uprobe | XDP Native | XDP Generic | Status |
 |----------|-----|--------|------------|-------------|--------|
 | ASpeed AST2600 (johnblue) | ftgmac100 | ✅ | ✅* | ❌ | Full (bridge mode) |
-| QEMU SLIRP | ftgmac100 (emulated) | ✅ | ❌ | ❌ | Uprobe-only |
+| QEMU SLIRP | ftgmac100 (emulated) | ✅ | ❔** | ❌ | At least uprobe; verify XDP on your build |
 | QEMU TAP+BRIDGE | virtio-net-* | ✅ | ✅ | ✅ | Full support |
 | x86_64 (native) | ixgbe, mlx5, etc. | ✅ | ✅ | ✅ | Full support |
+
+\*\* Documented as unsupported (SLIRP has no real netdev), but a live boot on this project's kernel logged a successful native-mode attach anyway — see the [XDP under SLIRP](#slirp-mode-default) note. Not reliable enough to plan around either way without checking your own kernel.
 
 \* XDP on AST2600 requires bridge mode. Pass `-netdev tap,id=net0,ifname=tap-httpsguard,script=no,downscript=no -net nic,netdev=net0` to runqemu (not SLIRP).
 

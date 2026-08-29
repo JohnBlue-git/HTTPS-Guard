@@ -1,7 +1,7 @@
 #include <utility>
 #include <iostream>
 
-#include "bpf_program.hpp"
+#include "BpfProgram.hpp"
 
 namespace https_guard {
 

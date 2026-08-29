@@ -13,9 +13,9 @@ specific to the HTTPS-Guard OEM extension in this layer, not a general
 bmcweb improvement, so it is not intended for upstream submission.
 
 ---
- .../oem_security_event_message_registry.hpp   | 88 +++++++++++++++++++
- redfish-core/include/registries_selector.hpp  |  2 +
- 2 files changed, 90 insertions(+)
+ .../oem_security_event_message_registry.hpp   | 160 +++++++++++++++++++++++
+ redfish-core/include/registries_selector.hpp  |   2 +
+ 2 files changed, 162 insertions(+)
  create mode 100644 redfish-core/include/registries/oem_security_event_message_registry.hpp
 
 diff --git a/redfish-core/include/registries/oem_security_event_message_registry.hpp b/redfish-core/include/registries/oem_security_event_message_registry.hpp
@@ -23,7 +23,7 @@ new file mode 100644
 index 0000000..a7cfb05
 --- /dev/null
 +++ b/redfish-core/include/registries/oem_security_event_message_registry.hpp
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,160 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// SPDX-FileCopyrightText: Copyright HTTPS-Guard project.
 +#pragma once
@@ -103,6 +103,78 @@ index 0000000..a7cfb05
 +            },
 +            "None.",
 +        }},
++    MessageEntry{
++        "HttpsCertificateAccessViolation",
++        {
++            "An unrecognized process attempted to access the BMC's HTTPS certificate or private key file.",
++            "%1",
++            "Critical",
++            1,
++            {
++                "string",
++            },
++            "Verify the accessing process is authorized; investigate for key theft or process impersonation.",
++        }},
++    MessageEntry{
++        "HttpsWeakCipherSuiteDetected",
++        {
++            "An incoming HTTPS connection offered a cryptographically weak cipher suite.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Review client TLS configuration; disable support for weak cipher suites if this traffic is expected to continue.",
++        }},
++    MessageEntry{
++        "HttpsSniAnomalyDetected",
++        {
++            "An incoming HTTPS connection's TLS Server Name Indication did not match the expected hostname.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Verify the client is targeting the correct BMC hostname; investigate for domain fronting or misdirected traffic.",
++        }},
++    MessageEntry{
++        "HttpsConnectionRateViolation",
++        {
++            "A source exceeded the configured connection-rate threshold, indicating possible SYN flood, port scan, or volumetric abuse.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Investigate the source IP; the connection has been blocklisted if enforcement is enabled.",
++        }},
++    MessageEntry{
++        "HttpsSlowlorisDetected",
++        {
++            "A source held an unusually high number of slow, incomplete HTTPS connections open, indicative of a Slowloris-style resource-exhaustion attempt.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Investigate the source IP; consider tightening connection-timeout settings.",
++        }},
++    MessageEntry{
++        "HttpsTlsRenegotiationStorm",
++        {
++            "A source initiated an unusually high number of TLS handshakes within a short window, indicative of a renegotiation-based denial-of-service attempt.",
++            "%1",
++            "Warning",
++            1,
++            {
++                "string",
++            },
++            "Investigate the source IP; the connection has been blocklisted if enforcement is enabled.",
++        }},
 +};
 +
 +};
@@ -125,6 +197,6 @@ index 6440ca5..2dac224 100644
  #include "registries/openbmc_message_registry.hpp"
  // NOLINTNEXTLINE(misc-include-cleaner)
  #include "registries/resource_event_message_registry.hpp"
--- 
+--
 2.34.1
 
