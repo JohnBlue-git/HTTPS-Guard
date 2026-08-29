@@ -14,19 +14,19 @@ namespace https_guard {
  * TCP socket without touching the owning process. */
 class BlockTcpAction final : public IAction {
 public:
-    BlockTcpAction(std::uint32_t src_ip_v4,
-                   std::uint32_t dst_ip_v4,
-                   std::uint16_t src_port,
-                   std::uint16_t dst_port,
+    BlockTcpAction(std::uint32_t local_ip_v4,
+                   std::uint32_t remote_ip_v4,
+                   std::uint16_t local_port,
+                   std::uint16_t remote_port,
                    std::string reason) noexcept;
 
     boost::asio::awaitable<void> execute_async() override;
 
 private:
-    std::uint32_t      src_ip_v4_;
-    std::uint32_t      dst_ip_v4_;
-    std::uint16_t      src_port_;
-    std::uint16_t      dst_port_;
+    std::uint32_t      local_ip_v4_;
+    std::uint32_t      remote_ip_v4_;
+    std::uint16_t      local_port_;
+    std::uint16_t      remote_port_;
     std::string        reason_;
 };
 

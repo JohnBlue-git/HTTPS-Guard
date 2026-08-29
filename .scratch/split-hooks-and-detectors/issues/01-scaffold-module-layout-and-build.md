@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Every existing source file has moved to its final location per the agreed layout, with nothing left under the old flat locations
 - [x] The single BPF object still compiles from one aggregator source that includes a header per hook, with the shared event-source discriminator and per-hook raw event structs split into their owning hook's own header

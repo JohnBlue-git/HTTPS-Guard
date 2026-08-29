@@ -98,7 +98,7 @@ uprobe_event ──► SslUprobeProgram::parseEvent() ──► hg_event
                           Verdict{OK, not actionable}      Verdict{actionable=true}
                                         │                            │
                                         │                            ▼
-                                        │            src_ip_v4 resolved?
+                                        │            peer resolved?  
                                         │                 │yes         │no
                                         │                 ▼            ▼
                                         │      BlockTcpAction   log a warning:

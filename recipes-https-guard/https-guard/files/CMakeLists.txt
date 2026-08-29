@@ -41,11 +41,11 @@ else()
 endif()
 
 # Each top-level concern owns its own CMakeLists.txt and produces one
-# library target: actions_lib, detectors_lib, programs_lib (the latter
+# library target: actions_lib, detections_lib, programs_lib (the latter
 # also owns the BPF object build, since that's what it compiles).  Adding
 # a source file to one concern never requires touching this file.
 add_subdirectory(actions)
-add_subdirectory(detectors)
+add_subdirectory(detections)
 add_subdirectory(programs)
 
 # Tests are a host-side development tool (no kernel/BPF/QEMU dependency —
@@ -64,7 +64,7 @@ endif()
 add_executable(https_guardd
     programs/core/main.cpp
 )
-target_link_libraries(https_guardd PRIVATE programs_lib detectors_lib actions_lib)
+target_link_libraries(https_guardd PRIVATE programs_lib detections_lib actions_lib)
 
 if(HTTPS_GUARD_BUILD_BPF)
     add_dependencies(https_guardd https_guard_bpf)

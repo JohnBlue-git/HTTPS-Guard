@@ -68,15 +68,15 @@ void buildDestroyRequest(const struct diag_nl_msg& msg,
 
 }  // anonymous namespace
 
-TcpDestroyer::TcpDestroyer(std::uint32_t src_ip_v4,
-                           std::uint32_t dst_ip_v4,
-                           std::uint16_t src_port,
-                           std::uint16_t dst_port,
+TcpDestroyer::TcpDestroyer(std::uint32_t local_ip_v4,
+                           std::uint32_t remote_ip_v4,
+                           std::uint16_t local_port,
+                           std::uint16_t remote_port,
                            std::string reason) noexcept
-    : src_ip_v4_(src_ip_v4)
-    , dst_ip_v4_(dst_ip_v4)
-    , src_port_(src_port)
-    , dst_port_(dst_port)
+    : local_ip_v4_(local_ip_v4)
+    , remote_ip_v4_(remote_ip_v4)
+    , local_port_(local_port)
+    , remote_port_(remote_port)
     , reason_(std::move(reason))
 {
     /*
@@ -108,7 +108,20 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
     struct diag_nl_msg msg{};
     msg.nlh.nlmsg_len   = sizeof(msg);
     msg.nlh.nlmsg_type  = SOCK_DESTROY;          /* <linux/inet_diag.h> */
-    msg.nlh.nlmsg_flags = NLM_F_REQUEST;
+    /* NLM_F_ACK matters here, and its absence hid a working enforcement path.
+     *
+     * With NLM_F_REQUEST alone, netlink replies only on *error* -- a
+     * successful SOCK_DESTROY sends nothing back. While CONFIG_INET_DIAG was
+     * missing from the kernel every request failed, so a reply always
+     * arrived and the failure was always logged; once the kernel could
+     * actually honour the request, success became completely silent and this
+     * code sat waiting for a reply that was never coming.
+     *
+     * For a security daemon that is the wrong way round: a successful
+     * teardown is precisely the event worth recording. Asking for an ack
+     * makes the kernel answer either way, which also makes the
+     * "destroyed TCP connection" branch below reachable at all. */
+    msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     msg.nlh.nlmsg_seq   = 1;
 
     msg.req.sdiag_family   = AF_INET;
@@ -116,18 +129,40 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
     msg.req.idiag_states   = 0xFFF;               /* all TCP states */
 
     /*
-     * All address/port fields are already in network byte order in the
-     * hg_event, so we copy them verbatim.
+     * Byte order at this boundary -- the reason SOCK_DESTROY never worked
+     * before.
+     *
+     * hg_event's convention (see detections/core/hg_event.hpp) is:
+     *   - addresses: NETWORK byte order
+     *   - ports:     HOST byte order
+     *
+     * inet_diag_sockid wants both in network byte order: idiag_src/idiag_dst
+     * are __be32 and idiag_sport/idiag_dport are __be16. So the addresses
+     * copy verbatim, but the ports must be converted here.
+     *
+     * Orientation: inet_diag_sockid's src/sport is the socket's LOCAL end
+     * and dst/dport the peer, which is why this class takes local_ and
+     * remote_ parameters rather than src/dst. Under the old src/dst names the XDP hook passed
+     * these inverted (an ingress packet's source is the peer, not us), so
+     * even a byte-order-correct request described a socket that does not
+     * exist.
+     *
+     * The previous code asserted in a comment that *all* of these fields
+     * were already network order and copied the ports verbatim too. They
+     * were not, so the kernel was asked for a byte-swapped port -- e.g. 443
+     * (0x01BB) looked up as 47873 (0xBB01) -- matched nothing, and returned
+     * -ENOENT every time. Every "connection blocked" message this daemon
+     * has ever emitted was therefore inaccurate.
      *
      * idiag_cookie must be initialised to all-ones (~0ULL); the kernel
      * interprets this as "don't care / match any socket".  A zero
      * cookie would require an exact cookie match which is almost never
      * what we want.
      */
-    msg.req.id.idiag_sport  = src_port_;
-    msg.req.id.idiag_dport  = dst_port_;
-    msg.req.id.idiag_src[0] = src_ip_v4_;
-    msg.req.id.idiag_dst[0] = dst_ip_v4_;
+    msg.req.id.idiag_sport  = htons(local_port_);
+    msg.req.id.idiag_dport  = htons(remote_port_);
+    msg.req.id.idiag_src[0] = local_ip_v4_;
+    msg.req.id.idiag_dst[0] = remote_ip_v4_;
     msg.req.id.idiag_cookie[0] = ~0ULL;
     msg.req.id.idiag_cookie[1] = ~0ULL;
 
@@ -212,14 +247,14 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
 
         if (nl_err == 0) {
             std::cerr << "BlockTcpAction: destroyed TCP connection "
-                      << formatIp(src_ip_v4_) << ":" << ntohs(src_port_)
-                      << " -> " << formatIp(dst_ip_v4_) << ":" << ntohs(dst_port_)
+                      << formatIp(local_ip_v4_) << ":" << local_port_
+                      << " -> " << formatIp(remote_ip_v4_) << ":" << remote_port_
                       << " reason=" << reason_ << "\n";
             co_return true;
         } else {
             std::cerr << "BlockTcpAction: SOCK_DESTROY failed for "
-                      << formatIp(src_ip_v4_) << ":" << ntohs(src_port_)
-                      << " -> " << formatIp(dst_ip_v4_) << ":" << ntohs(dst_port_)
+                      << formatIp(local_ip_v4_) << ":" << local_port_
+                      << " -> " << formatIp(remote_ip_v4_) << ":" << remote_port_
                       << " reason=" << reason_
                       << " netlink_error=" << nl_err
                       << " (" << std::strerror(-nl_err) << ")\n";

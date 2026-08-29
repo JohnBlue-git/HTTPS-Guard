@@ -20,6 +20,8 @@
 #include "TlsVersionDetector.hpp"
 #include "PayloadAnomalyDetector.hpp"
 #include "CertAccessDetector.hpp"
+#include "CipherSuiteDetector.hpp"
+#include "SniDetector.hpp"
 #include "SslUprobeProgram.hpp"
 #include "XdpTlsProgram.hpp"
 #include "LsmCertGuardProgram.hpp"
@@ -39,25 +41,34 @@ struct runtime_config {
     std::string iface;
     std::string openssl_lib_path;
     std::string output_path;
+    std::string expected_sni;
 };
 
 // Composition root: this is the one place that knows about every concrete
-// detector. Both event sources run the same rules in the same order today
-// (TLS version violation checked ahead of payload anomalies) — a future
-// hook-specific detector (e.g. cipher-suite checks for xdp_tls) would only
-// need to append to that hook's own vector here, not touch HttpGuardProgram.
-https_guard::HttpGuardProgram::DetectorRegistry buildDetectorRegistry()
+// detector. Ordering within each source's vector is the priority order —
+// first match wins — so the more severe/specific rules come first.
+https_guard::HttpGuardProgram::DetectorRegistry buildDetectorRegistry(
+    const std::string& expected_sni)
 {
-    auto defaultRules = []() {
-        std::vector<std::unique_ptr<https_guard::IDetector>> rules;
+    auto sharedRules = [](std::vector<std::unique_ptr<https_guard::IDetector>>& rules) {
         rules.push_back(std::make_unique<https_guard::TlsVersionDetector>());
         rules.push_back(std::make_unique<https_guard::PayloadAnomalyDetector>());
-        return rules;
     };
 
     https_guard::HttpGuardProgram::DetectorRegistry registry;
-    registry[HG_SOURCE_UPROBE] = defaultRules();
-    registry[HG_SOURCE_XDP]    = defaultRules();
+
+    std::vector<std::unique_ptr<https_guard::IDetector>> uprobeRules;
+    sharedRules(uprobeRules);
+    registry[HG_SOURCE_UPROBE] = std::move(uprobeRules);
+
+    // XDP additionally gets the ClientHello-derived rules: only this hook
+    // sees ClientHello bytes at all, so registering them elsewhere would
+    // just evaluate permanently-empty fields.
+    std::vector<std::unique_ptr<https_guard::IDetector>> xdpRules;
+    sharedRules(xdpRules);
+    xdpRules.push_back(std::make_unique<https_guard::CipherSuiteDetector>());
+    xdpRules.push_back(std::make_unique<https_guard::SniDetector>(expected_sni));
+    registry[HG_SOURCE_XDP] = std::move(xdpRules);
 
     std::vector<std::unique_ptr<https_guard::IDetector>> certAccessRules;
     certAccessRules.push_back(std::make_unique<https_guard::CertAccessDetector>());
@@ -103,6 +114,12 @@ int main(int argc, char** argv)
     if (argc > 4) {
         cfg.bpf_object_path = argv[4];
     }
+    // Optional: leaving this empty disables SNI *mismatch* checking (the
+    // safe default — see SniDetector's class comment); malformed-SNI
+    // detection is unconditional either way.
+    if (argc > 5) {
+        cfg.expected_sni = argv[5];
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
@@ -120,7 +137,7 @@ int main(int argc, char** argv)
         buildHookModules(cfg.openssl_lib_path, if_nametoindex(cfg.iface.c_str())),
         std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl),
         cfg.output_path,
-        buildDetectorRegistry());
+        buildDetectorRegistry(cfg.expected_sni));
     if (!program.loadFilter()) {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;
@@ -130,7 +147,11 @@ int main(int argc, char** argv)
               << "  interface: " << cfg.iface << "\n"
               << "  ssl lib:   " << cfg.openssl_lib_path << "\n"
               << "  bpf obj:   " << cfg.bpf_object_path << "\n"
-              << "  output:    " << cfg.output_path << "\n";
+              << "  output:    " << cfg.output_path << "\n"
+              << "  expected SNI: "
+              << (cfg.expected_sni.empty() ? "(unset — mismatch checking disabled)"
+                                           : cfg.expected_sni)
+              << "\n";
 
     while (!g_stop) {
         const int rc = program.pollEvents(200);

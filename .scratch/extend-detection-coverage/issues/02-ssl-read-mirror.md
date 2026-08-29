@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] `SSL_read` is hooked via a uprobe, capturing at minimum: the negotiated TLS version, a plaintext snippet of what was read, and PID/process — the same fields `uprobe_event` already carries for the write side
 - [x] Both directions' events are classified by the same detector registry entries already registered for the uprobe source — no new detector is required for this ticket, and no existing detector's logic changes
@@ -35,5 +35,11 @@ A third test — a path-traversal signature (`/etc/passwd`, no spaces, no encodi
 
 Two pre-existing, out-of-scope observations noted for the record (neither is a regression from this ticket, neither blocks it):
 - `BlockTcpAction: SOCK_DESTROY failed ... netlink_error=-2 (No such file or directory)` — the short-lived curl connection had already closed by the time enforcement ran; `TcpDestroyer` targeting an already-gone socket is a pre-existing edge case, not something `direction` tagging introduced.
+
+  **Update — that explanation was wrong.** While verifying ticket 04 the real cause surfaced: `TcpDestroyer` feeds host-byte-order ports into netlink's `idiag_sport`/`idiag_dport`, which require network order, so the kernel looks up a byte-swapped port and correctly answers `-ENOENT`. It fails the same way against a live, mid-handshake connection, so "the socket had already closed" was not what was happening. Still pre-existing and still not introduced by this ticket, but it means TCP-kill enforcement has never actually worked — tracked as ticket 08.
 - The logged source IP reads as `1.0.0.127` rather than `127.0.0.1` — an artifact of this being a loopback self-test topology (guest curling itself), not seen with real external peers; `ProcPeerResolver` wasn't touched by this ticket.
+
+  **Update — that explanation was also wrong.** It is a byte-order bug in `ProcPeerResolver::parseProcNetEntry`, which applied a byte swap that `/proc/net/tcp`'s format does not call for, reversing every resolved address. Nothing to do with loopback: it would have blocklisted `1.0.0.127` instead of `127.0.0.1` for real external peers too — enforcement aimed at an entirely different address than the one observed. Confirmed by comparing the resolved tuple against `getsockname`/`getpeername` on a socket whose real addresses were known, and fixed under ticket 13.
+
+  Two wrong explanations in this one comment block (this, and the `SOCK_DESTROY` one above) came from reading a plausible story into log output instead of checking it. Both surfaced later only because something else forced a closer look at the same lines.
 

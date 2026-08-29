@@ -74,7 +74,7 @@ TCP payload, first bytes:
 is_violation = (tls_ver < 0x0303) ? 1 : 0;
 ```
 
-This line-rate decision is why `xdp_event` carries an `is_violation` field when `uprobe_event` doesn't — it's surfaced to userspace as `hg_event.tls_violation_hint` (see `detectors/CLAUDE.md` for why that field exists and the bug it prevents). Everything else — message text, severity naming, whether to blocklist — is still decided entirely in userspace by `TlsVersionDetector`, same as the uprobe path.
+This line-rate decision is why `xdp_event` carries an `is_violation` field when `uprobe_event` doesn't — it's surfaced to userspace as `hg_event.tls_violation_hint` (see `detections/CLAUDE.md` for why that field exists and the bug it prevents). Everything else — message text, severity naming, whether to blocklist — is still decided entirely in userspace by `TlsVersionDetector`, same as the uprobe path.
 
 ## How to defend (enforcement)
 
@@ -94,7 +94,7 @@ ClientHello arrives, tls_ver < 0x0303
                           │  (asynchronously, milliseconds later)
                           ▼
        Userspace: XdpTlsProgram::parseEvent() → hg_event
-       (tls_violation_hint = true, src_ip_v4/dst_ip_v4/ports already
+       (tls_violation_hint = true, local/remote addresses and ports already
         known — XDP sees the packet headers directly, unlike the
         uprobe path which needs ProcPeerResolver)
                           │
@@ -129,6 +129,10 @@ For a **plaintext-HTTP-on-443** event, `is_violation` is always 0 — there's no
 
 **Attach success under QEMU SLIRP is unverified as a hard rule.** This hook is documented (in `README.md`) as unable to attach under SLIRP networking (no real netdev, so neither native nor generic XDP should have anything to hook). A live boot on this project's own kernel showed the native attach call succeeding anyway. Whether the actual `XDP_DROP` enforcement path fires correctly in that state was not independently confirmed — treat it as needing verification on whatever kernel you're actually deploying to, not a fixed platform fact either way.
 
-**No cipher-suite or SNI inspection yet.** The ClientHello carries far more than `legacy_version` — the cipher suite list (immediately after the session ID) and the `server_name` extension (SNI) are both sitting right there in the same record this hook already parses partway through. Detecting a downgraded/weak cipher suite or a mismatched/unexpected SNI is planned as a direct extension of this same parsing, not a new hook — see `.scratch/` once that ticket is published.
+**Cipher-suite and SNI detection are alert-only, never enforced.** Both are extracted (see `ebpf/parse_client_hello.h`) and classified by `../../detections/cipher_suite/` and `../../detections/sni/`, but their verdicts are deliberately `actionable = false`. The blocklist this hook enforces is keyed on source IP and drops *every* port, not just 443 — so treating "offered RC4" or "unexpected SNI" as actionable means one scanner packet, or one legacy tool behind a shared NAT address, locks every administrator sharing that address out of SSH and everything else for the blocklist TTL. This was established empirically, not theoretically: the first live test of these detectors blocklisted the test's own SSH source and cut off the session. Offering a weak suite in a handshake bmcweb then refuses does not warrant that; enforcement, if ever wanted, belongs behind an explicit opt-in.
+
+**SNI hostname mismatch is opt-in and off by default.** A BMC legitimately answers to any DNS name resolving to it, so mismatch-against-own-hostname would fire on every connection through a CNAME or site alias. Only a *configured* `HTTPS_GUARD_EXPECTED_SNI` enables mismatch checking; malformed-structure detection always runs. Absent SNI — the normal case for a BMC reached by IP — is never flagged.
+
+**Captured ClientHello detail is capped.** At most `HG_MAX_CIPHER_SUITES` (32) suites and `HG_SNI_LEN - 1` (63) hostname bytes land in the event; `cipher_suites_offered` reports the true count so a detector can tell truncation from a genuinely short list, and a partially-captured hostname sets `sni_malformed` so it can't be compared as if complete (that specific gap was a real bypass — a truncated `bmc.evil.com` reading as `bmc` — caught by test before shipping).
 
 **No rate-based detection.** Connection-rate abuse, SYN floods, and port scanning need per-source-IP state over a time window (an `LRU_HASH` map keyed on source IP, most naturally checked at the same point `blocklist_check()` already runs) — planned as a separate ticket, since it's a different kind of mechanism (stateful counting) from anything this hook does today.

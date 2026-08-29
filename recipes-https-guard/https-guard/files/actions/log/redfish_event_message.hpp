@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <iomanip>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -12,11 +13,17 @@ namespace https_guard {
 
 class RedfishEventMessage {
 public:
+    /* Takes the event by reference and keeps only the two scalars it
+     * formats. It used to store an hg_event by value, which is no longer
+     * possible now that events are polymorphic (the copy would slice off
+     * the hook's half) -- and was never needed, since nothing here read
+     * more than these. */
     RedfishEventMessage(const hg_event& event,
                         std::string message_id,
                         std::string message,
                         std::string severity)
-        : event_(event)
+        : timestamp_ns_(event.timestamp_ns)
+        , pid_(event.pid)
         , message_id_(std::move(message_id))
         , message_(std::move(message))
         , severity_(std::move(severity))
@@ -28,10 +35,10 @@ public:
         json payload;
         payload["@odata.type"] = "#Event.v1_7_0.Event";
         payload["Name"] = "Platform Security Anomaly Event";
-        payload["Id"] = std::to_string(event_.timestamp_ns);
+        payload["Id"] = std::to_string(timestamp_ns_);
 
         json event_entry;
-        event_entry["EventId"] = std::to_string(event_.timestamp_ns) + "-" + std::to_string(event_.pid);
+        event_entry["EventId"] = std::to_string(timestamp_ns_) + "-" + std::to_string(pid_);
         event_entry["Severity"] = severity_;
         event_entry["MessageId"] = message_id_;
         event_entry["Message"] = message_;
@@ -43,7 +50,6 @@ public:
         return payload.dump();
     }
 
-    const hg_event& getEvent() const { return event_; }
     const std::string& getMessageId() const { return message_id_; }
     const std::string& getMessage() const { return message_; }
     const std::string& getSeverity() const { return severity_; }
@@ -64,7 +70,8 @@ private:
 
     using json = nlohmann::json;
 
-    hg_event event_;
+    std::uint64_t timestamp_ns_;
+    std::uint32_t pid_;
     std::string message_id_;
     std::string message_;
     std::string severity_;

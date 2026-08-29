@@ -6,27 +6,34 @@
 add_library(programs_lib OBJECT
     core/BpfProgram.cpp
     core/HttpGuardProgram.cpp
-    ssl_uprobe/SslUprobeProgram.cpp
-    xdp_tls/XdpTlsProgram.cpp
-    lsm_cert_guard/LsmCertGuardProgram.cpp
+    ssl_uprobe/src/SslUprobeProgram.cpp
+    xdp_tls/src/XdpTlsProgram.cpp
+    lsm_cert_guard/src/LsmCertGuardProgram.cpp
 )
 
 target_include_directories(programs_lib
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/core
-    ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe
-    ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls
-    ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard
+    # Each hook splits into ebpf/ (the BPF program and its raw event struct)
+    # and src/ (the IHookModule implementation). Classification rules are not
+    # here at all -- they all live in ../detections/, which keeps this tree
+    # the only one that depends on libbpf.
+    ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/ebpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/src
     ${CMAKE_CURRENT_SOURCE_DIR}/utils
     ${LIBBPF_INCLUDE_DIRS}
     ${nlohmann_json_INCLUDE_DIRS}
     ${BOOST_INCLUDE_DIR}
 )
 
-# HttpGuardProgram.cpp dispatches enforcement actions (LogAction,
-# BlockTcpAction, BlocklistAddAction), so it needs both actions/'s headers
-# and its compiled objects at link time.
-target_link_libraries(programs_lib PUBLIC detectors_lib actions_lib)
+# The hooks implement IHookModule and HttpGuardProgram feeds DetectLoop, both
+# of which live in detections/. actions_lib comes in transitively through
+# detections_lib, but is named explicitly since main.cpp also touches it.
+target_link_libraries(programs_lib PUBLIC detections_lib actions_lib)
 target_compile_definitions(programs_lib PUBLIC BOOST_ERROR_CODE_HEADER_ONLY)
 
 if(HTTPS_GUARD_BUILD_BPF)
@@ -122,6 +129,9 @@ if(HTTPS_GUARD_BUILD_BPF)
         -O2
         -g
         -I${CMAKE_CURRENT_BINARY_DIR}
+        # hg_event_source.h moved to the classification tree; the BPF side
+        # shares that header with userspace, so it needs the path too.
+        -I${CMAKE_SOURCE_DIR}/detections/core
     )
 
     if(LIBBPF_INCLUDE_DIRS)
@@ -155,13 +165,13 @@ if(HTTPS_GUARD_BUILD_BPF)
             ${HTTPS_GUARD_VMLINUX_HEADER}
             ${HTTPS_GUARD_SSL_OFFSET_HEADER}
             ${CMAKE_CURRENT_SOURCE_DIR}/core/https_guard.bpf.c
-            ${CMAKE_CURRENT_SOURCE_DIR}/core/hg_event_source.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ssl_uprobe.bpf.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ssl_uprobe_event.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/xdp_tls.bpf.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/xdp_tls_event.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/lsm_cert_guard.bpf.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/lsm_cert_guard_event.h
+            ${CMAKE_SOURCE_DIR}/detections/core/hg_event_source.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe.bpf.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe_event.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls.bpf.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls_event.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/lsm_cert_guard/ebpf/lsm_cert_guard_event.h
             ${CMAKE_SOURCE_DIR}/actions/blocklist/blocklist.bpf.h
         VERBATIM
         COMMENT "Compiling HTTPS-Guard BPF object"

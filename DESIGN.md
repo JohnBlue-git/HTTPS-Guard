@@ -5,7 +5,7 @@
 This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline, and the source tree is organized around exactly those three stages:
 
 - **`programs/`** (Detect) — attaches BPF hooks (uprobe primary, XDP auxiliary) and parses their raw ring-buffer events into a common representation. Purely observational; makes no security decisions.
-- **`detectors/`** (Classify) — pure, synchronous rules that turn a parsed event into a verdict (severity, message, actionability), or no verdict at all.
+- **`detections/`** (Classify) — pure, synchronous rules that turn a parsed event into a verdict (severity, message, actionability), or no verdict at all.
 - **`actions/`** (Dispatch) — asynchronous countermeasures (log, kill the TCP connection, blocklist the source) triggered by an actionable verdict.
 
 ## Table of Contents
@@ -13,7 +13,7 @@ This document covers the complete source code under `recipes-https-guard/https-g
 - [Source Code Structure](#source-code-structure)
 - [Build System](#build-system)
 - [The Detect Layer: `programs/`](#the-detect-layer-programs)
-- [The Classify Layer: `detectors/`](#the-classify-layer-detectors)
+- [The Classify Layer: `detections/`](#the-classify-layer-detectors)
 - [The Dispatch Layer: `actions/`](#the-dispatch-layer-actions)
 - [Event Processing Pipeline](#event-processing-pipeline)
 - [Security Model](#security-model)
@@ -52,8 +52,8 @@ files/
 │   │   └── xdp_tls_event.h                 # struct xdp_event
 │   └── utils/
 │       └── bounded_string.hpp              # Fixed-size char[] → std::string, shared by both hook modules
-├── detectors/                               # Classify layer
-│   ├── CMakeLists.txt                      # detectors_lib (INTERFACE — header-only)
+├── detections/                               # Classify layer
+│   ├── CMakeLists.txt                      # detections_lib (INTERFACE — header-only)
 │   ├── core/
 │   │   ├── IDetector.hpp                   # evaluate(const hg_event&) -> std::optional<Verdict>
 │   │   ├── hg_event.hpp                    # Common parsed-event representation (no classification fields)
@@ -89,7 +89,7 @@ files/
 
 ### CMakeLists.txt
 
-One `CMakeLists.txt` per top-level concern (`actions`, `detectors`, `programs`, `tests`), each producing one library target (`actions_lib`, `detectors_lib`, `programs_lib`) plus the root file tying them into the final executables. Adding a source file to one concern never requires touching another concern's build file.
+One `CMakeLists.txt` per top-level concern (`actions`, `detections`, `programs`, `tests`), each producing one library target (`actions_lib`, `detections_lib`, `programs_lib`) plus the root file tying them into the final executables. Adding a source file to one concern never requires touching another concern's build file.
 
 **Key features:**
 - Cross-compilation support for ARM 32-bit (ASpeed AST2600)
@@ -152,7 +152,7 @@ public:
 };
 ```
 
-A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into the shared `hg_event` representation. It never classifies (that's `detectors/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
+A hook module does exactly two things: attach its own BPF program(s) to the already-loaded object, and parse its own raw ring-buffer struct into the shared `hg_event` representation. It never classifies (that's `detections/`) and never dispatches an action (that's `actions/`) — the same "BPF is observational, userspace decides" split the kernel side already enforces, pushed one layer up into the C++ classes too.
 
 Two hooks exist today, each documented in depth in its own `DESIGN.md`:
 
@@ -171,7 +171,7 @@ The sole `BpfProgram` subclass. It holds a `vector<unique_ptr<IHookModule>>` and
 
 Because everything is expressed through `IHookModule`/`IDetector`, adding a new hook (e.g. the planned BPF-LSM certificate-access guard) or a new detection rule never requires touching `HttpGuardProgram` — only `main.cpp`'s composition root grows by a line.
 
-## The Classify Layer: `detectors/`
+## The Classify Layer: `detections/`
 
 ### `IDetector` and `Verdict`
 
@@ -202,13 +202,13 @@ The orchestrator runs a source's list in order and stops at the first match; no 
 
 ## The Dispatch Layer: `actions/`
 
-Unchanged in shape by the `programs`/`detectors` split — still three single-responsibility, asynchronously-dispatched countermeasures run through `ActionLoop`:
+Unchanged in shape by the `programs`/`detections` split — still three single-responsibility, asynchronously-dispatched countermeasures run through `ActionLoop`:
 
 - **`LogAction`** — writes the formatted Redfish event JSON to the event log file (always dispatched, regardless of severity).
 - **`BlockTcpAction`** — `SOCK_DESTROY` via `NETLINK_INET_DIAG` for the exact 4-tuple (`TcpDestroyer`).
 - **`BlocklistAddAction`** — writes an expiry into the shared BPF blocklist map, which `xdp_tls`'s synchronous `blocklist_check()` reads on every subsequent packet.
 
-The last two only fire when a `Verdict::actionable` is true and `hg_event::src_ip_v4` is non-zero (uprobe events need `ProcPeerResolver` to have found a socket first; `xdp_tls` events always carry it from the packet headers).
+The last two only fire when a `Verdict::actionable` is true and `hg_event::remote_ip_v4` is non-zero (uprobe events need `ProcPeerResolver` to have found a socket first; `xdp_tls` events always carry it from the packet headers).
 
 ## Event Processing Pipeline
 
@@ -233,8 +233,8 @@ HttpGuardProgram::ringBufferHandler()
     │   └─ PayloadAnomalyDetector::evaluate(evt)  -> optional<Verdict>
     │   └─ (no match → inline "OK / traffic observed" Verdict)
     │
-    ├─ if Verdict::actionable && evt.src_ip_v4 != 0:
-    │   ├─ BlockTcpAction(src_ip, dst_ip, src_port, dst_port)
+    ├─ if Verdict::actionable && evt.remote_ip_v4 != 0:
+    │   ├─ BlockTcpAction(local_ip, remote_ip, local_port, remote_port)
     │   │   └─ TcpDestroyer::execute() → SOCK_DESTROY via NETLINK_INET_DIAG
     │   └─ BlocklistAddAction(src_ip, ttl)
     │       └─ Blocklist::add() → bpf_map_update_elem()
@@ -457,7 +457,7 @@ Process calls SSL_write(ssl, buf, num)
 ```
 $ curl -sk https://<bmc>/redfish/v1 -u root:0penBmc --tlsv1.2
 ```
-still produces a `tls_version=772` (0x0304 = TLS 1.3) uprobe event, classified `OK` / `HttpsTrafficObserved`. Testing the actual TLS < 1.2 violation path requires a legacy TLS client; the unit tests in `detectors/` cover that path directly against synthetic input instead (see `tests/test_detectors.cpp`).
+still produces a `tls_version=772` (0x0304 = TLS 1.3) uprobe event, classified `OK` / `HttpsTrafficObserved`. Testing the actual TLS < 1.2 violation path requires a legacy TLS client; the unit tests in `detections/` cover that path directly against synthetic input instead (see `tests/test_detectors.cpp`).
 
 ## Configuration
 
@@ -529,7 +529,7 @@ HTTPS_GUARD_REDFISH_LOG=/var/log/redfish
    - Installs config to `${sysconfdir}/default/https-guard`
    - Stamps event mode into config from PACKAGECONFIG
 
-**SRC_URI includes:** all shell scripts and systemd units under `service/`, `CMakeLists.txt` (root and per-concern), every C++ source/header under `programs/`, `detectors/`, `actions/`, `tests/`, and `scripts/gen_ssl_offset.c`.
+**SRC_URI includes:** all shell scripts and systemd units under `service/`, `CMakeLists.txt` (root and per-concern), every C++ source/header under `programs/`, `detections/`, `actions/`, `tests/`, and `scripts/gen_ssl_offset.c`.
 
 ## Development
 

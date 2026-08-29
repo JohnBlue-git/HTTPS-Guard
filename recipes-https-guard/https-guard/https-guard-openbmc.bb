@@ -58,37 +58,50 @@ SRC_URI = " \
     file://CMakeLists.txt \
     file://scripts/gen_ssl_offset.c \
     file://programs/CMakeLists.txt \
-    file://programs/core/hg_event_source.h \
     file://programs/core/https_guard.bpf.c \
     file://programs/core/main.cpp \
     file://programs/core/HttpGuardProgram.hpp \
     file://programs/core/HttpGuardProgram.cpp \
-    file://programs/core/IHookModule.hpp \
     file://programs/core/BpfProgram.hpp \
     file://programs/core/BpfProgram.cpp \
-    file://programs/ssl_uprobe/proc_peer_resolver.hpp \
-    file://programs/ssl_uprobe/ssl_uprobe.bpf.h \
-    file://programs/ssl_uprobe/ssl_uprobe_event.h \
-    file://programs/ssl_uprobe/parse_uprobe_event.hpp \
-    file://programs/ssl_uprobe/SslUprobeProgram.hpp \
-    file://programs/ssl_uprobe/SslUprobeProgram.cpp \
-    file://programs/xdp_tls/xdp_tls.bpf.h \
-    file://programs/xdp_tls/xdp_tls_event.h \
-    file://programs/xdp_tls/XdpTlsProgram.hpp \
-    file://programs/xdp_tls/XdpTlsProgram.cpp \
-    file://programs/lsm_cert_guard/lsm_cert_guard.bpf.h \
-    file://programs/lsm_cert_guard/lsm_cert_guard_event.h \
-    file://programs/lsm_cert_guard/LsmCertGuardProgram.hpp \
-    file://programs/lsm_cert_guard/LsmCertGuardProgram.cpp \
+    file://programs/ssl_uprobe/src/proc_peer_resolver.hpp \
+    file://programs/ssl_uprobe/ebpf/ssl_uprobe.bpf.h \
+    file://programs/ssl_uprobe/ebpf/ssl_uprobe_event.h \
+    file://programs/ssl_uprobe/src/parse_uprobe_event.hpp \
+    file://programs/ssl_uprobe/src/SslUprobeProgram.hpp \
+    file://programs/ssl_uprobe/src/uprobe_hg_event.hpp \
+    file://programs/ssl_uprobe/src/SslUprobeProgram.cpp \
+    file://programs/xdp_tls/ebpf/xdp_tls.bpf.h \
+    file://programs/xdp_tls/ebpf/xdp_tls_event.h \
+    file://programs/xdp_tls/ebpf/parse_client_hello.h \
+    file://programs/xdp_tls/src/XdpTlsProgram.hpp \
+    file://programs/xdp_tls/src/xdp_hg_event.hpp \
+    file://programs/xdp_tls/src/XdpTlsProgram.cpp \
+    file://programs/lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h \
+    file://programs/lsm_cert_guard/ebpf/lsm_cert_guard_event.h \
+    file://programs/lsm_cert_guard/src/LsmCertGuardProgram.hpp \
+    file://programs/lsm_cert_guard/src/cert_access_hg_event.hpp \
+    file://programs/lsm_cert_guard/src/LsmCertGuardProgram.cpp \
     file://programs/utils/bounded_string.hpp \
-    file://detectors/CMakeLists.txt \
-    file://detectors/core/hg_event.hpp \
-    file://detectors/core/IDetector.hpp \
-    file://detectors/core/Verdict.hpp \
-    file://detectors/tls_version/TlsVersionDetector.hpp \
-    file://detectors/tls_version/tls_version.hpp \
-    file://detectors/payload_anomaly/PayloadAnomalyDetector.hpp \
-    file://detectors/cert_access/CertAccessDetector.hpp \
+    file://detections/CMakeLists.txt \
+    file://detections/core/hg_event.hpp \
+    file://detections/core/ITlsTrafficInfo.hpp \
+    file://detections/core/IClientHelloInfo.hpp \
+    file://detections/core/ICertAccessInfo.hpp \
+    file://detections/core/hg_event_source.h \
+    file://detections/core/IHookModule.hpp \
+    file://detections/core/DetectLoop.hpp \
+    file://detections/core/DetectLoop.cpp \
+    file://detections/core/IDetector.hpp \
+    file://detections/core/IPeerResolver.hpp \
+    file://detections/core/Verdict.hpp \
+    file://detections/tls_version/TlsVersionDetector.hpp \
+    file://detections/tls_version/tls_version.hpp \
+    file://detections/payload_anomaly/PayloadAnomalyDetector.hpp \
+    file://detections/cert_access/CertAccessDetector.hpp \
+    file://detections/cipher_suite/CipherSuiteDetector.hpp \
+    file://detections/cipher_suite/weak_cipher_suites.hpp \
+    file://detections/sni/SniDetector.hpp \
     file://actions/CMakeLists.txt \
     file://actions/core/main.cpp \
     file://actions/core/ActionLoop.hpp \
@@ -109,6 +122,7 @@ SRC_URI = " \
     file://tests/CMakeLists.txt \
     file://tests/test_detectors.cpp \
     file://tests/test_uprobe_parsing.cpp \
+    file://tests/test_client_hello_parsing.cpp \
 "
 
 S = "${UNPACKDIR}"

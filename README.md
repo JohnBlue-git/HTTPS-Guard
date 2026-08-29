@@ -111,9 +111,9 @@ The source under `files/` is organized around the **Detect → Classify → Disp
 | Component | Path | Role |
 |-----------|------|------|
 | **Detect** | `programs/` | Attaches BPF hooks and parses their raw events. `ssl_uprobe/` (uprobe on `SSL_write()`, PRIMARY) and `xdp_tls/` (XDP ClientHello inspection + blocklist enforcement, AUXILIARY) each implement the `IHookModule` interface; `core/` holds the generic BPF lifecycle wrapper and the orchestrator (`HttpGuardProgram`) that dispatches between them |
-| **Classify** | `detectors/` | Pure classification rules behind `IDetector`: `tls_version/` (TLS-version-violation check) and `payload_anomaly/` (SQLi/path-traversal signatures), run through a registry keyed by which hook produced the event |
+| **Classify** | `detections/` | Pure classification rules behind `IDetector`: `tls_version/` (TLS-version-violation check) and `payload_anomaly/` (SQLi/path-traversal signatures), run through a registry keyed by which hook produced the event |
 | **Dispatch** | `actions/` | Three async countermeasures run through `ActionLoop`: `log/` (file write), `tcp/` (SOCK_DESTROY via Netlink), `blocklist/` (BPF map update) |
-| **Tests** | `tests/` | doctest-based unit tests for the `detectors/` layer — no kernel/BPF/root/QEMU dependency |
+| **Tests** | `tests/` | doctest-based unit tests for the `detections/` layer — no kernel/BPF/root/QEMU dependency |
 | **Event bridge** | `service/https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
 > For per-file documentation, build system internals, event struct layouts, and security strategy deep-dives, see [DESIGN.md](DESIGN.md). Per-hook detection rationale and diagrams live in `programs/ssl_uprobe/DESIGN.md` and `programs/xdp_tls/DESIGN.md`.

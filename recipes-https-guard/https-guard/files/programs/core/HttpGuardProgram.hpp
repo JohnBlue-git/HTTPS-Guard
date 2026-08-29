@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "BpfProgram.hpp"
+#include "DetectLoop.hpp"
 #include "IDetector.hpp"
 #include "IHookModule.hpp"
 #include "hg_event_source.h"
@@ -20,7 +21,9 @@ public:
     // event source's detectors run in order; the first one that matches
     // wins. Built by the composition root (main.cpp) and injected here —
     // this class never constructs a concrete detector itself.
-    using DetectorRegistry = std::unordered_map<hg_event_source, std::vector<std::unique_ptr<IDetector>>>;
+    // Owned by DetectLoop now; aliased here so the composition root's
+    // vocabulary doesn't change.
+    using DetectorRegistry = DetectLoop::DetectorRegistry;
 
     // hooks: one entry per BPF hook family (uprobe, XDP, ...), also built
     // and injected by main.cpp. This class knows nothing about SSL_write,
@@ -38,14 +41,22 @@ protected:
     ring_buffer_sample_fn getRingBufferHandler() noexcept override;
 
 private:
+    /**
+     * Copies the record and hands it to detect_loop_ -- nothing more. All
+     * parsing, /proc access, classification and action construction happen
+     * on the DetectLoop worker, because libbpf needs this callback back
+     * promptly: a slow callback lets the ring buffer fill, and a full ring
+     * buffer drops events silently.
+     */
     int ringBufferHandler(void* data, size_t size) noexcept;
     static int ringBufferCallback(void* ctx, void* data, size_t size) noexcept;
 
+    // Declaration order matters: detect_loop_ holds a reference to hooks_,
+    // so hooks_ must outlive it. Members are destroyed in reverse order, so
+    // detect_loop_ (declared last) is torn down first.
     ActionLoop& action_loop_;
     std::vector<std::unique_ptr<IHookModule>> hooks_;
-    DetectorRegistry detectors_;
-    std::chrono::seconds blocklist_ttl_;
-    std::string output_path_;
+    DetectLoop detect_loop_;
 };
 
 }  // namespace https_guard

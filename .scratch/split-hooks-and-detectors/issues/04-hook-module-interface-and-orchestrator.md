@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Scaffold the new module layout and multi-layer build; 03 — Extract the detector interface and the two existing detection rules, with unit tests
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A common hook-module interface exists: attach (given the shared BPF object and a place to register resulting links), report an event-source identifier, and parse a raw event into the daemon's common event representation
 - [x] The OpenSSL uprobe hook and the XDP hook are each implemented as standalone modules behind that interface

@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A message ID exists for a certificate-access violation (BPF-LSM cert-access guard, ticket 03), severity Critical
 - [x] A message ID exists for a weak/downgraded cipher suite (ticket 04), severity Warning or Critical (implementer's call, consistent with how `HttpsTlsVersionViolation` reasons about severity)

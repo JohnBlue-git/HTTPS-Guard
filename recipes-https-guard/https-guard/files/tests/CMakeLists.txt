@@ -1,4 +1,4 @@
-# Unit-test target: exercises pure C++ logic — currently the detectors/
+# Unit-test target: exercises pure C++ logic — currently the detections/
 # layer (IDetector implementations) — with no kernel/BPF/root/QEMU
 # dependency. Uses doctest (single-header, MIT) fetched the same way
 # Boost is fetched above when not already present on the system, so
@@ -19,15 +19,20 @@ endif()
 add_executable(https_guard_tests
     test_detectors.cpp
     test_uprobe_parsing.cpp
+    test_client_hello_parsing.cpp
 )
-target_link_libraries(https_guard_tests PRIVATE doctest::doctest detectors_lib)
+target_link_libraries(https_guard_tests PRIVATE doctest::doctest detections_lib)
 
-# test_uprobe_parsing.cpp exercises programs/ssl_uprobe/parse_uprobe_event.hpp,
-# which (deliberately) has no libbpf dependency -- add just its header path
-# and utils/, not the full programs_lib (which would pull one in via
-# IHookModule.hpp/BpfProgram.cpp).
+# These tests exercise the parsing headers under programs/ that are
+# deliberately dependency-free (parse_uprobe_event.hpp, parse_client_hello.h)
+# -- add just their header paths, not the full programs_lib, which would pull
+# in libbpf via IHookModule.hpp/BpfProgram.cpp. That dependency-free property
+# is what lets the *real* parsers be tested rather than reimplementations.
 target_include_directories(https_guard_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe
+    ${CMAKE_SOURCE_DIR}/programs/core
+    ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/ebpf
+    ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/src
+    ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
     ${CMAKE_SOURCE_DIR}/programs/utils
 )
 

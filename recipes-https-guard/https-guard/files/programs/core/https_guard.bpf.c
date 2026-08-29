@@ -51,6 +51,6 @@ struct {
     __uint(max_entries, 1 << 24);  /* 16 MiB */
 } events SEC(".maps");
 
-#include "../ssl_uprobe/ssl_uprobe.bpf.h"
-#include "../xdp_tls/xdp_tls.bpf.h"
-#include "../lsm_cert_guard/lsm_cert_guard.bpf.h"
+#include "../ssl_uprobe/ebpf/ssl_uprobe.bpf.h"
+#include "../xdp_tls/ebpf/xdp_tls.bpf.h"
+#include "../lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h"

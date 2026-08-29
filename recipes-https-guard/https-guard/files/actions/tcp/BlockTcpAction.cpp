@@ -9,23 +9,23 @@
 
 namespace https_guard {
 
-BlockTcpAction::BlockTcpAction(std::uint32_t src_ip_v4,
-                               std::uint32_t dst_ip_v4,
-                               std::uint16_t src_port,
-                               std::uint16_t dst_port,
+BlockTcpAction::BlockTcpAction(std::uint32_t local_ip_v4,
+                               std::uint32_t remote_ip_v4,
+                               std::uint16_t local_port,
+                               std::uint16_t remote_port,
                                std::string reason) noexcept
-    : src_ip_v4_(src_ip_v4)
-    , dst_ip_v4_(dst_ip_v4)
-    , src_port_(src_port)
-    , dst_port_(dst_port)
+    : local_ip_v4_(local_ip_v4)
+    , remote_ip_v4_(remote_ip_v4)
+    , local_port_(local_port)
+    , remote_port_(remote_port)
     , reason_(std::move(reason))
 {}
 
 boost::asio::awaitable<void> BlockTcpAction::execute_async()
 {
     TcpDestroyer destroyer(
-        src_ip_v4_, dst_ip_v4_,
-        src_port_, dst_port_, reason_);
+        local_ip_v4_, remote_ip_v4_,
+        local_port_, remote_port_, reason_);
 
     /*
      * Truly async Netlink SOCK_DESTROY – the coroutine suspends

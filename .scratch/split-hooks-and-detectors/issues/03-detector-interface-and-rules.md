@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Scaffold the new module layout and multi-layer build; 02 — Stand up a minimal unit-test framework and build target
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A common detector interface exists: given the daemon's common event representation, a detector may inspect it and, on a match, fill in its classification (severity, message, actionability) and report that it matched
 - [x] The TLS-version-violation check and the payload-pattern/anomaly check are each implemented as standalone classes behind that interface, with no BPF/socket/action-dispatch knowledge inside them

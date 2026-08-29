@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Scaffold the new module layout and multi-layer build
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] A test framework is selected and integrated into the build (e.g. via CMake `FetchContent`, matching the project's existing pattern for fetching dependencies like Boost)
 - [x] A dedicated test build target/binary exists and is runnable independently of the daemon binary and of any BPF/kernel/root dependency

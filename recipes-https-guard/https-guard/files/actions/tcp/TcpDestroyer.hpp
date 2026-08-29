@@ -18,10 +18,10 @@ namespace https_guard {
  */
 class TcpDestroyer {
 public:
-    TcpDestroyer(std::uint32_t src_ip_v4,
-                 std::uint32_t dst_ip_v4,
-                 std::uint16_t src_port,
-                 std::uint16_t dst_port,
+    TcpDestroyer(std::uint32_t local_ip_v4,
+                 std::uint32_t remote_ip_v4,
+                 std::uint16_t local_port,
+                 std::uint16_t remote_port,
                  std::string reason) noexcept;
 
     ~TcpDestroyer() noexcept;
@@ -44,10 +44,10 @@ public:
 
 private:
     int              nl_fd_ = -1;
-    std::uint32_t    src_ip_v4_;
-    std::uint32_t    dst_ip_v4_;
-    std::uint16_t    src_port_;
-    std::uint16_t    dst_port_;
+    std::uint32_t    local_ip_v4_;
+    std::uint32_t    remote_ip_v4_;
+    std::uint16_t    local_port_;
+    std::uint16_t    remote_port_;
     std::string      reason_;
 };
 

@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Extend the OEM security event message registry
 
-**Status:** ready-for-agent
+**Status:** done — except one criterion that is unverifiable on this hardware (see Comments: ARM32 has no BPF trampoline, so the LSM hook cannot attach at all)
 
 - [x] The kernel target actually supports BPF LSM programs attaching to the file-open path in the "bpf" LSM slot (`CONFIG_BPF_LSM=y` is already set in `recipes-kernel/linux/bpf-kernel-config.cfg` — confirm the *active* LSM chain includes `bpf`, e.g. via the `lsm=` kernel cmdline parameter or its Kconfig default, before assuming enforcement mode is even reachable on this platform)
 - [x] A hook exists that filters on the exact certificate/key file path and reports at least: the accessing PID, its real executable path (via `/proc/<pid>/exe`, not just `comm`), and its cgroup

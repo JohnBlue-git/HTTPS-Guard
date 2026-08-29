@@ -14,6 +14,7 @@ DAEMON="/usr/sbin/https-guardd"
 BPF_OBJ="${HTTPS_GUARD_BPF_OBJ:-/usr/share/https-guard/https_guard.bpf.o}"
 IFACE="${HTTPS_GUARD_IFACE:-eth0}"
 OUTPUT="${HTTPS_GUARD_EVENT_FILE:-/var/log/https_guard_events.log}"
+EXPECTED_SNI="${HTTPS_GUARD_EXPECTED_SNI:-}"
 
 # Auto-detect libssl if not explicitly configured
 if [ -n "${HTTPS_GUARD_SSL_LIB:-}" ]; then
@@ -93,6 +94,8 @@ echo "    bpf_obj:   $BPF_OBJ"
 echo "    iface:     $IFACE"
 echo "    ssl_lib:   $SSL_LIB"
 echo "    output:    $OUTPUT"
+echo "    sni:       ${EXPECTED_SNI:-(unset)}"
 
-# Launch the real daemon with all 4 positional arguments
-exec "$DAEMON" "$IFACE" "$SSL_LIB" "$OUTPUT" "$BPF_OBJ"
+# Launch the real daemon. The 5th argument (expected SNI) is optional and
+# may legitimately be empty — see HTTPS_GUARD_EXPECTED_SNI in the config.
+exec "$DAEMON" "$IFACE" "$SSL_LIB" "$OUTPUT" "$BPF_OBJ" "$EXPECTED_SNI"
