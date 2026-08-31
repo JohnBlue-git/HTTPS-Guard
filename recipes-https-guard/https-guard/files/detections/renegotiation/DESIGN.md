@@ -39,6 +39,36 @@ Three things there are deliberate:
 - **SYNs are counted before the port filter.** A port scan targets ports other than 443 by definition, so counting after the filter would make the thing worth detecting invisible.
 - **The BPF side draws no conclusion and drops nothing.** It only counts.
 
+### Where this sits in the handshake
+
+```
+Client                                                          bmcweb (server)
+  │                                                                    │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ──┤
+  ├── ACK ──────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)            │
+  │                                                                    │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)     │
+  │◀── ServerHello, Certificate, ... (0x16) ─────────────────────────────┤
+  ├── Finished (0x16) ───────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ──────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)        │
+  │                                                                    │
+  ├── application data, e.g. an HTTP request ────────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ──────────────────────────┤
+  │                                                                    │
+  ├── TCP FIN or RST ───────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** every `0x16`-marked message in this diagram — the initial
+handshake's own messages, and any handshake-type record sent afterward on a
+connection that already completed one. `hello_count` does not distinguish an
+initial handshake from a repeated one; it counts the message type, not the
+connection's state, which is why the trigger recipe can drive this by resending
+`0x16` records rather than performing genuine renegotiations.
+
 `ConnRateSweeper` reads the map every 2 seconds and synthesises one event per
 detection per offending source. These detections therefore have **no
 `IDetection`** and never reach `submit()` — there is no ring-buffer record for a

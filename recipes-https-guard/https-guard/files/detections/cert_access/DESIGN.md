@@ -22,13 +22,13 @@ retroactively suspect** — no amount of traffic inspection recovers from that.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  bmcweb                       → opens the key at startup.        │
-│                                  Expected.                        │
-│                                                                   │
+│                                  Expected.                       │
+│                                                                  │
 │  phosphor-certificate-manager → writes a new key/cert here on a  │
-│                                  Redfish/D-Bus certificate        │
-│                                  install, then restarts bmcweb.   │
-│                                  Expected.                        │
-│                                                                   │
+│                                  Redfish/D-Bus certificate       │
+│                                  install, then restarts bmcweb.  │
+│                                  Expected.                       │
+│                                                                  │
 │  anything else                → the key is now assumed leaked.   │
 │    ...even if it called prctl(PR_SET_NAME, "bmcweb") first,      │
 │       which is exactly why comm is not the check.                │

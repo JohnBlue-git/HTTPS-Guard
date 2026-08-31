@@ -18,6 +18,37 @@ connection, credentials included, is exposed to anyone on the path.
 
 ## How to detect
 
+### Where this sits in the handshake
+
+```
+Client                                                             bmcweb (server)
+  │                                                                      │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ───┤
+  ├── ACK ─────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)              │
+  │                                                                      │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)       │
+  │◀── ServerHello, Certificate, ... (0x16) ────────────────────────────┤
+  ├── Finished (0x16) ─────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ─────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)          │
+  │                                                                      │
+  ├── application data, e.g. an HTTP request ──────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ─────────────────────────┤
+  │                                                                      │
+  ├── TCP FIN or RST ──────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** the XDP check reads `legacy_version` out of the
+ClientHello, before the TCP handshake above has even finished reaching bmcweb's
+TLS stack — the earliest point anything in this diagram can be judged. The
+uprobe check reads `ssl->version` only after both `Finished` messages, once
+negotiation is done — the only point at which what was *actually agreed* exists
+anywhere. That gap between the two markers is exactly why they can disagree, and
+why only the earlier one is reachable on this project's target — see below.
+
 Two sources see this, and they see genuinely different things.
 
 ### On the wire, before the handshake completes (XDP)

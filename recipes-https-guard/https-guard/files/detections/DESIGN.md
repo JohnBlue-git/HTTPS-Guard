@@ -55,12 +55,23 @@ cheapest thing in the path (a few hundred integer compares worst case); the cost
 is the `/proc` walk in peer resolution. A queue placed after parsing would have
 added a thread hop and left the bottleneck untouched.
 
-### `post()`, not `co_spawn()`
+### `co_spawn()`, ready for a detection that awaits
 
-`ActionLoop` spawns coroutines because `IAction`'s entry point is one. Nothing on
-the classify path awaits anything — `inspect()` is straight-line code — so
-`post()` is the honest primitive and a coroutine frame per event would be pure
-overhead.
+`inspect()` is still straight-line code today — nothing on the classify path
+awaits anything — so this buys nothing in the way `ActionLoop`'s coroutines do,
+where two of three actions genuinely suspend on I/O. `submit()` schedules
+`handleRecord()`/`process()` via `co_spawn()` anyway, and `process()` evaluates a
+record's detections concurrently with `asio::experimental::make_parallel_group`
+rather than stopping at the first verdict, so the shape is already in place for
+the day a detection's `inspect()` needs to suspend — see `IDetection.hpp`'s "WHEN
+THAT WOULD CHANGE" for what that would look like. Until then it costs one
+coroutine frame per record for no behavioural difference: every submitted
+detection is evaluated regardless, and results are gathered back in list order,
+so the lowest-index verdict still wins exactly as the sequential loop produced.
+
+The one place this remains `post()`, deliberately, is `enableRateSweeps()`
+arming the sweep timer: that call never has anything to await, and turning it
+into a coroutine would be pure overhead with no future case to prepare for.
 
 ### Admission is bounded explicitly
 

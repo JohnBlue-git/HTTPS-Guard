@@ -36,6 +36,35 @@ Three things there are deliberate:
 - **SYNs are counted before the port filter.** A port scan targets ports other than 443 by definition, so counting after the filter would make the thing worth detecting invisible.
 - **The BPF side draws no conclusion and drops nothing.** It only counts.
 
+### Where this sits in the handshake
+
+```
+Client                                                             bmcweb (server)
+  │                                                                      │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ───┤
+  ├── ACK ─────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)              │
+  │                                                                      │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)       │
+  │◀── ServerHello, Certificate, ... (0x16) ────────────────────────────┤
+  ├── Finished (0x16) ─────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ─────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)          │
+  │                                                                      │
+  ├── application data, e.g. an HTTP request ──────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ─────────────────────────┤
+  │                                                                      │
+  ├── TCP FIN or RST ──────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** the very first line — the inbound SYN (`syn_count` and
+`open_conns` both increment here) — before the
+port-443 filter and before anything TLS-shaped exists on the connection at
+all. That is deliberate: a port scan targets ports other than 443, so counting
+any later point in this diagram would make the thing worth detecting invisible.
+
 `ConnRateSweeper` reads the map every 2 seconds and synthesises one event per
 detection per offending source. These detections therefore have **no
 `IDetection`** and never reach `submit()` — there is no ring-buffer record for a

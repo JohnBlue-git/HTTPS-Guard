@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -45,13 +46,19 @@ namespace https_guard {
  * queue placed after parsing would have added a thread hop and left the
  * bottleneck untouched.
  *
- * WHY post() AND NOT co_spawn()
- * -----------------------------
- * `ActionLoop` uses `co_spawn` because `IAction`'s entry point is a
- * coroutine. Nothing on the classify path awaits anything -- process() and
- * classifyAndDispatch() are straight-line synchronous code -- so `post()` is
- * the honest primitive here, and a coroutine frame per event would be pure
- * overhead. Same loop, different handler shape.
+ * co_spawn(), READY FOR A DETECTION THAT AWAITS
+ * -----------------------------------------------
+ * Nothing on the classify path awaits anything today -- `IDetection::inspect()`
+ * is still straight-line synchronous code, exactly as `IDetection.hpp` argues it
+ * should stay unless a detection genuinely needs to consult something remote or
+ * slow. `handleRecord()`/`process()` are coroutines anyway, and `process()`
+ * evaluates a record's detections concurrently via
+ * `asio::experimental::make_parallel_group` rather than stopping at the first
+ * verdict, so that the day a detection's `inspect()` does become awaitable, it
+ * suspends alongside its siblings instead of requiring the loop's dispatch
+ * shape to change again. Until then this costs one coroutine frame per record
+ * for no behavioural difference -- every submitted detection is evaluated
+ * either way, and list order still decides the winner. See detections/DESIGN.md.
  *
  * TWO THREADS, AND WHY THE SWEEP IS NOT ON THE STRAND
  * --------------------------------------------------
@@ -210,8 +217,8 @@ private:
     };
 
     /** Executor handler for one record: releases its slot, then classifies. */
-    void handleRecord(const RawRecord& rec) noexcept;
-    void process(const RawRecord& rec);
+    boost::asio::awaitable<void> handleRecord(RawRecord rec) noexcept;
+    boost::asio::awaitable<void> process(const RawRecord& rec);
 
 
     /** Reads the rate counters and classifies anything over the threshold. */

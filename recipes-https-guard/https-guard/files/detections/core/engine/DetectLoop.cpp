@@ -4,7 +4,13 @@
 #include <optional>
 #include <utility>
 
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/deferred.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/experimental/parallel_group.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/this_coro.hpp>
+#include <boost/asio/use_awaitable.hpp>
 
 #include "DetectLoop.hpp"
 
@@ -205,8 +211,7 @@ void DetectLoop::submit(const void* data, std::size_t size,
         /* Through the strand, so records are classified one at a time and in
          * arrival order -- which is what makes "drop the newest" leave a
          * coherent prefix of history. */
-        asio::post(record_strand_,
-                   [this, rec = std::move(rec)]() noexcept { handleRecord(rec); });
+        asio::co_spawn(record_strand_, handleRecord(std::move(rec)), asio::detached);
     } catch (...) {
         /* post() allocates the handler, so it can throw on a memory-starved
          * BMC. This function is noexcept and is called from libbpf's
@@ -216,7 +221,7 @@ void DetectLoop::submit(const void* data, std::size_t size,
     }
 }
 
-void DetectLoop::handleRecord(const RawRecord& rec) noexcept
+asio::awaitable<void> DetectLoop::handleRecord(RawRecord rec) noexcept
 {
     in_flight_.fetch_sub(1, std::memory_order_relaxed);
 
@@ -226,13 +231,161 @@ void DetectLoop::handleRecord(const RawRecord& rec) noexcept
     // memory-constrained BMC a bad_alloc here is plausible -- and without
     // this it would be std::terminate, since this handler is noexcept.
     try {
-        process(rec);
+        co_await process(rec);
     } catch (const std::exception& e) {
         std::cerr << "https_guard: dropped one event; classification threw: "
                   << e.what() << "\n";
     } catch (...) {
         std::cerr << "https_guard: dropped one event; classification threw"
                      " an unknown exception\n";
+    }
+}
+
+asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
+{
+    if (rec.size < sizeof(std::uint32_t)) {
+        std::cerr << "https_guard: undersized event (" << rec.size << " bytes)\n";
+        co_return;
+    }
+
+    std::uint32_t event_source = 0;
+    std::memcpy(&event_source, rec.bytes, sizeof(event_source));
+
+    const DispatchContext ctx{action_loop_, blocklist_ttl_, output_path_};
+
+    /* Every submitted detection is evaluated concurrently now, rather than
+     * stopping at the first verdict, so that a future I/O-bound detection can
+     * suspend inside inspect() without holding up its siblings. List order
+     * still decides the winner: results come back indexed by the hook's
+     * original order, and the lowest-index non-nullopt verdict is the one
+     * dispatched below -- the same outcome as walking the list one entry at a
+     * time. See detections/DESIGN.md. */
+    const auto executor = co_await asio::this_coro::executor;
+
+    using Op = decltype(asio::co_spawn(
+        executor, std::declval<asio::awaitable<void>>(), asio::deferred));
+
+    std::vector<Op> ops;
+    ops.reserve(rec.detection_count);
+
+    std::vector<std::optional<Verdict>> verdicts(rec.detection_count);
+    std::vector<EventMeta> metas(rec.detection_count);
+
+    /* A plain function, called once per detection to produce the awaitable<void>
+     * value co_spawn needs -- as opposed to handing co_spawn the lambda itself,
+     * whose closure type would differ per capture and break the homogeneous
+     * `Op` vector above. Mirrors ActionLoop::pushActions, which spawns
+     * `action->execute_async()` (already a value) rather than a lambda. */
+    auto inspectOne = [](const IDetection* detection, const RawRecord& r,
+                        std::optional<Verdict>& verdict,
+                        EventMeta& meta) -> asio::awaitable<void> {
+        if (detection != nullptr) {
+            verdict = detection->inspect(r.bytes, r.size, meta);
+        }
+        co_return;
+    };
+
+    for (std::size_t i = 0; i < rec.detection_count; ++i) {
+        ops.push_back(asio::co_spawn(
+            executor,
+            inspectOne(rec.detections[i], rec, verdicts[i], metas[i]),
+            asio::deferred));
+    }
+
+    auto [completion_order, exceptions] =
+        co_await asio::experimental::make_parallel_group(std::move(ops))
+            .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
+    (void)completion_order;
+
+    /* Report every detection that threw, not just the first -- mirroring
+     * ActionLoop::pushActions, which exists specifically so a failure is seen
+     * "alongside its siblings rather than in isolation" (see its class
+     * comment). Concurrent evaluation makes more than one throwing detection
+     * for the same record possible, where the old sequential loop stopped at
+     * the first. Same outcome as before either way: the record is dropped,
+     * not the daemon. */
+    std::size_t failed = 0;
+    for (std::size_t i = 0; i < exceptions.size(); ++i) {
+        if (!exceptions[i]) {
+            continue;
+        }
+        ++failed;
+        const IDetection* detection = rec.detections[i];
+        try {
+            std::rethrow_exception(exceptions[i]);
+        } catch (const std::exception& e) {
+            std::cerr << "https_guard: detection " << (i + 1) << " of "
+                      << exceptions.size() << " ('"
+                      << (detection ? detection->name() : "?") << "') threw: "
+                      << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "https_guard: detection " << (i + 1) << " of "
+                      << exceptions.size() << " ('"
+                      << (detection ? detection->name() : "?")
+                      << "') threw an unknown exception\n";
+        }
+    }
+    if (failed != 0) {
+        if (failed > 1) {
+            std::cerr << "https_guard: " << failed << " of " << exceptions.size()
+                      << " detection(s) threw for this record; dropping it\n";
+        }
+        co_return;
+    }
+
+    for (std::size_t i = 0; i < rec.detection_count; ++i) {
+        if (verdicts[i]) {
+            const IDetection* detection = rec.detections[i];
+            /* One trace line per record, from the envelope every source shares.
+             * The per-source handlers this replaced each logged their own
+             * detail line ("xdp event received: cipher_suites=3/3, sni=..."),
+             * which no longer has a home now that no single class sees a whole
+             * record. Source-specific detail still reaches the journal through
+             * the verdict message; what is kept here is which detection claimed
+             * the record, because that is what makes list order observable. */
+            std::cout << "https_guard: event source=" << event_source
+                      << " pid=" << metas[i].pid << " (" << metas[i].process
+                      << ") claimed by '" << detection->name() << "' ("
+                      << (i + 1) << " of " << rec.detection_count << "): "
+                      << verdicts[i]->message_id << "\n";
+            dispatchVerdict(metas[i], *verdicts[i], ctx);
+            co_return;
+        }
+    }
+
+    /* Nothing matched and nothing reported. A hook is expected to put an
+     * always-matching TrafficObservedDetection last, so reaching here means
+     * either a record too short for any of this hook's layouts, or a list built
+     * without that terminal entry. */
+    const auto n = undetected_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n % 1000 == 0) {
+        std::cerr << "https_guard: no detection claimed a " << rec.size
+                  << "-byte record; tried";
+        for (std::size_t i = 0; i < rec.detection_count; ++i) {
+            if (rec.detections[i] != nullptr) {
+                std::cerr << " " << rec.detections[i]->name();
+            }
+        }
+        std::cerr << " (" << n << " such record(s) so far). A hook's list should"
+                     " end with an always-matching traffic-observed entry.\n";
+    }
+}
+
+
+void DetectLoop::sweepRates() noexcept
+{
+    if (!rate_sweeper_) {
+        return;
+    }
+
+    /* Same per-item boundary as event processing: a throw here must cost the
+     * sweep, not the daemon. */
+    try {
+        rate_sweeper_->sweep(DispatchContext{action_loop_, blocklist_ttl_, output_path_});
+    } catch (const std::exception& e) {
+        std::cerr << "https_guard: connection-rate sweep threw: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "https_guard: connection-rate sweep threw an unknown exception\n";
     }
 }
 
@@ -256,82 +409,6 @@ void DetectLoop::armSweepTimer() noexcept
          * failure mode this feature is supposed to report on. */
         std::cerr << "https_guard: could not arm the connection-rate sweep "
                      "timer; rate detection is now inactive\n";
-    }
-}
-
-void DetectLoop::process(const RawRecord& rec)
-{
-    if (rec.size < sizeof(std::uint32_t)) {
-        std::cerr << "https_guard: undersized event (" << rec.size << " bytes)\n";
-        return;
-    }
-
-    std::uint32_t event_source = 0;
-    std::memcpy(&event_source, rec.bytes, sizeof(event_source));
-
-    const DispatchContext ctx{action_loop_, blocklist_ttl_, output_path_};
-
-    /* In order, first match wins. That ordering is the hook's, expressed as its
-     * list order -- see BpfProgram::ringBufferHandler. Stopping at the first
-     * verdict is what keeps one record to one Redfish event; running them all
-     * would emit up to four for a single ClientHello. */
-    for (std::size_t i = 0; i < rec.detection_count; ++i) {
-        const IDetection* detection = rec.detections[i];
-        if (detection == nullptr) {
-            continue;
-        }
-
-        EventMeta meta;
-        if (auto verdict = detection->inspect(rec.bytes, rec.size, meta)) {
-            /* One trace line per record, from the envelope every source shares.
-             * The per-source handlers this replaced each logged their own
-             * detail line ("xdp event received: cipher_suites=3/3, sni=..."),
-             * which no longer has a home now that no single class sees a whole
-             * record. Source-specific detail still reaches the journal through
-             * the verdict message; what is kept here is which detection claimed
-             * the record, because that is what makes list order observable. */
-            std::cout << "https_guard: event source=" << event_source
-                      << " pid=" << meta.pid << " (" << meta.process
-                      << ") claimed by '" << detection->name() << "' ("
-                      << (i + 1) << " of " << rec.detection_count << "): "
-                      << verdict->message_id << "\n";
-            dispatchVerdict(meta, *verdict, ctx);
-            return;
-        }
-    }
-
-    /* Nothing matched and nothing reported. A hook is expected to put an
-     * always-matching TrafficObservedDetection last, so reaching here means
-     * either a record too short for any of this hook's layouts, or a list built
-     * without that terminal entry. */
-    const auto n = undetected_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n == 1 || n % 1000 == 0) {
-        std::cerr << "https_guard: no detection claimed a " << rec.size
-                  << "-byte record; tried";
-        for (std::size_t i = 0; i < rec.detection_count; ++i) {
-            if (rec.detections[i] != nullptr) {
-                std::cerr << " " << rec.detections[i]->name();
-            }
-        }
-        std::cerr << " (" << n << " such record(s) so far). A hook's list should"
-                     " end with an always-matching traffic-observed entry.\n";
-    }
-}
-
-void DetectLoop::sweepRates() noexcept
-{
-    if (!rate_sweeper_) {
-        return;
-    }
-
-    /* Same per-item boundary as event processing: a throw here must cost the
-     * sweep, not the daemon. */
-    try {
-        rate_sweeper_->sweep(DispatchContext{action_loop_, blocklist_ttl_, output_path_});
-    } catch (const std::exception& e) {
-        std::cerr << "https_guard: connection-rate sweep threw: " << e.what() << "\n";
-    } catch (...) {
-        std::cerr << "https_guard: connection-rate sweep threw an unknown exception\n";
     }
 }
 

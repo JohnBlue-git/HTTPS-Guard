@@ -57,9 +57,13 @@ boost::asio::awaitable<void> BlockTcpAction::execute_async() { co_return; }
  * property below is observed. */
 namespace https_guard {
 std::atomic<int> g_dispatched{0};
-void dispatchVerdict(const EventMeta&, const Verdict&, const DispatchContext&)
+static std::mutex      g_last_verdict_mu;
+static std::string     g_last_verdict_message_id;
+void dispatchVerdict(const EventMeta&, const Verdict& v, const DispatchContext&)
 {
     g_dispatched.fetch_add(1);
+    const std::lock_guard<std::mutex> lk(g_last_verdict_mu);
+    g_last_verdict_message_id = v.message_id;
 }
 }  // namespace https_guard
 
@@ -105,6 +109,7 @@ public:
     mutable std::mutex                 mu;
     mutable std::vector<std::uint32_t> order;
     bool                               throw_always = false;
+    std::string                        message_id = "harness";
 
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
@@ -129,7 +134,7 @@ public:
         meta.pid = seq;
         Verdict v;
         v.severity   = "OK";
-        v.message_id = "harness";
+        v.message_id = message_id;
         return v;
     }
 };
@@ -258,6 +263,37 @@ int main()
         for (int spin = 0; spin < 200 && raw->handled.load() < 20; ++spin)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         check(raw->handled.load() == 20, "every event still processed despite throws");
+        loop.stop();
+    }
+
+    /* ---- 4a. every submitted detection is evaluated; lowest index still wins,
+     * despite the concurrent fan-out that replaced the sequential early-exit
+     * loop -- see detections/DESIGN.md */
+    {
+        SlowDetection a, b;
+        a.message_id = "A";
+        b.message_id = "B";
+        const std::array<const IDetection*, 2> detections{&a, &b};
+
+        auto loop_owner = DetectLoop::createForTesting();
+        DetectLoop& loop = *loop_owner;
+        loop.configure(al, std::chrono::seconds(60), "/dev/null");
+
+        const int before_dispatched = g_dispatched.load();
+        submitSeq(loop, detections, 0);
+
+        for (int spin = 0; spin < 200 && (a.handled.load() < 1 || b.handled.load() < 1); ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        check(a.handled.load() == 1, "fan-out: index-0 detection was evaluated");
+        check(b.handled.load() == 1, "fan-out: index-1 detection was evaluated too (no early-exit)");
+        check(g_dispatched.load() == before_dispatched + 1,
+              "exactly one verdict dispatched per record");
+        {
+            const std::lock_guard<std::mutex> lk(g_last_verdict_mu);
+            check(g_last_verdict_message_id == "A",
+                  "lowest-index verdict still wins despite concurrent evaluation");
+        }
         loop.stop();
     }
 

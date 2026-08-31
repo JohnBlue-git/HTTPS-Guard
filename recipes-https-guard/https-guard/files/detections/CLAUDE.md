@@ -157,7 +157,8 @@ roll, or a Slowloris that goes quiet would look idle.
 A singleton (`getInstance()`), configured once with the action loop, the
 blocklist TTL and the output path. It owns a queue, some threads and a timer,
 and knows **nothing** about events: a record arrives together with the list of
-detections to try against it, and the loop walks that list in order.
+detections to try against it, and the loop evaluates that list concurrently and
+picks a winner by its order.
 
 ```cpp
 // in the hook, on the poll thread
@@ -166,9 +167,9 @@ DetectLoop::getInstance().submit(data, size, detections_);
 
 Three consequences:
 
-- **First match wins**, which is what keeps one record to one Redfish event. Running every entry would emit up to four for a single ClientHello.
+- **Lowest-index match wins**, which is what keeps one record to one Redfish event. Every entry is evaluated regardless — the loop no longer stops at the first verdict, so a future I/O-bound detection can suspend without holding up its siblings (see `detections/DESIGN.md`) — but only the lowest-index verdict is ever dispatched.
 - **Rule priority is the hook's list order.** That is the one real cost of this shape: which rule wins is a classification decision, and it is now expressed in `programs/`. Accepted deliberately — each list is 2–5 entries, readable at the point where the hook says what it can observe — and visible at runtime, because the loop logs which index claimed each record.
-- **There is no "nothing matched" branch.** A hook puts an always-matching `TrafficObservedDetection` last, so first-match-wins covers it.
+- **There is no "nothing matched" branch.** A hook puts an always-matching `TrafficObservedDetection` last, so an always-matching entry at the end covers it.
 
 ### Why the record's arrays are fixed-size, with the numbers
 
@@ -224,8 +225,10 @@ under ASan to pin that.
 Classification runs on the loop's threads, not in the ring-buffer callback: a
 callback that runs long lets the ring buffer fill, and a full ring buffer **drops
 events** — a missed detection nothing reports. Three properties of its shape are
-deliberate, each because the obvious version was wrong: `post()` rather than
-`co_spawn()` (nothing awaits); explicitly bounded admission (`post()` is an
+deliberate, each because the obvious version was wrong: `co_spawn()`, ready for a
+detection that awaits, even though nothing does yet (see "`co_spawn()`, ready for
+a detection that awaits" in `DESIGN.md`); explicitly bounded admission (`post()`
+— still used to arm the sweep timer, which never has anything to await — is an
 unbounded queue, and on a ~1GB BMC an OOM takes *all* detection with it); and two
 threads with the sweep timer off the record strand (a single-threaded loop
 starves the timer by FIFO fairness — measured, one thread gave **zero** sweeps in
@@ -241,9 +244,18 @@ Short version, because it comes up: a suspension point pays only when something
 else can make progress while you wait on an **external party**, and nothing here
 waits. `inspect()` is memcpy and integer compares; the nearby syscalls
 (`readlink("/proc/<pid>/exe")`, the `/proc/<pid>/net/tcp` parse) are CPU work in
-kernel context with no device to wait for. Awaiting them adds a frame per
-detection per record and buys no concurrency — and `wait_for_all` over a hook's
-list would additionally discard first-match-wins.
+kernel context with no device to wait for. Awaiting *inside* `inspect()` would
+add a frame per detection per record and buy no concurrency, which is why its
+signature is still synchronous.
+
+`DetectLoop` does now run a hook's list with `make_parallel_group` /
+`wait_for_all` rather than a sequential loop — every submitted detection is
+evaluated, not just the ones up to the first match — but that is the loop
+fanning out *calls to* today's synchronous `inspect()`, in preparation for one
+that eventually isn't. List order still decides the winner: results are
+gathered back in order, and the lowest-index verdict wins exactly as the
+sequential loop produced. See `core/engine/DetectLoop.hpp` and
+`detections/DESIGN.md`.
 
 The actions are the opposite case, which is why the coroutines live there. Full
 reasoning, what would make it worth revisiting, and the one optimisation that *is*

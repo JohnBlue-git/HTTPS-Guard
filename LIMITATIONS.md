@@ -135,6 +135,15 @@ the image does not carry. Treat those as host-side or bridged-debugging steps.
   admission, arrival order, and the sweep surviving a backlog — *are* covered,
   by `tests/detectloop/`; that is a separate binary with a documented build
   command rather than part of `https_guard_tests`, and its README says why.
+- **The concurrent fan-out's per-record cost is reasoned, not measured.**
+  `DetectLoop::process()` now evaluates every submitted detection for every
+  record (up to `kMaxDetectionsPerRecord`, currently 8) rather than stopping at
+  the first verdict, in exchange for being ready to host a detection whose
+  `inspect()` eventually needs to suspend. `tests/detectloop/` proves the
+  scheduling and ordering guarantees still hold, and clean ThreadSanitizer and
+  AddressSanitizer/UndefinedBehaviorSanitizer runs; none of that measures the
+  actual added CPU per record on target hardware, which matters most for the
+  hooks with the longest lists (`xdp_tls`'s four).
 
 ## Observability
 

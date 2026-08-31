@@ -310,11 +310,13 @@ void XdpTlsProgram::ringBufferHandler(const void* data, std::size_t size) noexce
 }
 ```
 
-`DetectLoop` walks the list in order and stops at the first verdict. Three things
-follow:
+`DetectLoop` evaluates the list concurrently and picks a winner by its order.
+Three things follow:
 
-**First match wins**, which is what keeps one record to one Redfish event —
-running every entry would emit up to four for a single ClientHello.
+**Lowest-index match wins**, which is what keeps one record to one Redfish
+event — every entry is evaluated regardless (so a future I/O-bound detection
+can suspend without holding up its siblings; see `detections/DESIGN.md`), but
+only the lowest-index verdict is ever dispatched.
 
 **List order is priority order, and it lives in the hook.** That is the one real
 cost of this shape: which rule wins is a classification decision now expressed in
@@ -326,7 +328,8 @@ the TLS violation, which enforces. The loop logs which index claimed each
 record, so the ordering is observable at runtime rather than only in source.
 
 **There is no "nothing matched" branch anywhere.** A hook puts an
-always-matching `TrafficObservedDetection` last and first-match-wins covers it.
+always-matching `TrafficObservedDetection` last, so there is always a
+lowest-index entry to dispatch.
 
 The pointer list is copied into the queued record: `submit()` returns
 immediately and the record is inspected later, so a view of a temporary at the
@@ -379,7 +382,7 @@ HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──
     │                                                     │
     ├─ find the owning hook by event_source at offset 0    │
     └─ hook->ringBufferHandler(): submit(data, size,       │
-       detections_) → asio::post(record_strand_)          │
+       detections_) → asio::co_spawn(record_strand_)       │
            (returns immediately; nothing else happens here)│
                      │                                    │
 ════════════ thread boundary ═════════════════════════════ │ ════════════
@@ -391,14 +394,14 @@ HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──
                      │                           NOT on the strand, so a record
                      │                           backlog cannot delay it.
                      ▼                                    │
-        walk rec.detections in order, first verdict wins ◄──┘
+        fan out rec.detections concurrently, gather in order ◄──┘
                      │
                      ├─ detections[0]->inspect(bytes, size, meta)
-                     ├─ detections[1]->inspect(...)      each one parses only
-                     ├─ ...                              what its own rule reads
+                     ├─ detections[1]->inspect(...)      concurrent; each parses
+                     ├─ ...                              only its own rule's fields
                      └─ detections[n-1] is TrafficObservedDetection,
-                        which always matches — so there is no
-                        "nothing matched" branch anywhere
+                        which always matches — lowest-index verdict wins,
+                        so there is no "nothing matched" branch anywhere
                      │
                      ▼
         dispatchVerdict(meta, verdict, ctx)
@@ -528,9 +531,9 @@ The eBPF hook defers the decision: it submits an observation to a ring buffer an
                             │  Userspace daemon (HttpGuardProgram)  │
                             │                                      │
                             │  ring_buffer__poll() loop            │
-                            │    → walk the detection list        │
+                            │    → fan out the detection list      │
                             │      → each inspect()s the record    │
-                            │        → first verdict wins          │
+                            │        → lowest-index verdict wins   │
                             │          (complex rules, regex,      │
                             │           cross-field logic)         │
                             │          → Verdict                   │
@@ -575,8 +578,9 @@ Packet arrives on port 443
              ▼
   ┌────────────────────────────────┐
   │ Userspace daemon               │
-  │  → detections in list order    │
-  │  → first verdict wins          │
+  │  → detections evaluated        │
+  │    concurrently; lowest-index  │
+  │    verdict wins                │
   │  → if Verdict.actionable:      │
   │    → BlockTcpAction(src,dst)   │
   │    → SOCK_DESTROY connection   │

@@ -64,6 +64,35 @@ That asymmetry is why the read side was added second, and why it matters:
 only the write side meant this detection fired only when bmcweb happened to
 reflect bad input back in a response.
 
+### Where this sits in the handshake
+
+```
+Client                                                          bmcweb (server)
+  │                                                                    │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ──┤
+  ├── ACK ──────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)            │
+  │                                                                    │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)     │
+  │◀── ServerHello, Certificate, ... (0x16) ─────────────────────────────┤
+  ├── Finished (0x16) ───────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ──────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)        │
+  │                                                                    │
+  ├── application data, e.g. an HTTP request ────────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ──────────────────────────┤
+  │                                                                    │
+  ├── TCP FIN or RST ───────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** the application-data lines near the bottom, at the exact
+moment `SSL_write`/`SSL_read` crosses the OpenSSL boundary — plaintext on both
+sides of that call, ciphertext everywhere else in this diagram. The XDP path
+instead watches for traffic that never gets this far at all: plaintext HTTP
+arriving on port 443, which fails before any `0x16` message above is ever sent.
+
 ### The rule
 
 Eight case-insensitive substrings against the captured plaintext:

@@ -19,6 +19,34 @@ addresses with a fixed hostname and not caring which answers.
 
 ## How to detect
 
+### Where this sits in the handshake
+
+```
+Client                                                             bmcweb (server)
+  │                                                                      │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ───┤
+  ├── ACK ─────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)              │
+  │                                                                      │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)       │
+  │◀── ServerHello, Certificate, ... (0x16) ────────────────────────────┤
+  ├── Finished (0x16) ─────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ─────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)          │
+  │                                                                      │
+  ├── application data, e.g. an HTTP request ──────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ─────────────────────────┤
+  │                                                                      │
+  ├── TCP FIN or RST ──────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** inside the ClientHello, same message as `legacy_version`
+and the offered cipher list — before the handshake has gone any further. By the
+time `SSL_write`/`SSL_read` ever runs, this message is long gone, which is why
+only the wire-side hook can see it at all.
+
 Only a hook on the wire can see the SNI extension: it is inside the ClientHello,
 before the handshake completes.
 

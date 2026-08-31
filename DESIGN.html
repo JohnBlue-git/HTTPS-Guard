@@ -418,10 +418,12 @@
       <p class="prose">Classification runs on <code>DetectLoop</code>'s Boost.Asio loop, not in the ring-buffer callback &mdash; that callback only copies the record and posts it, because a slow callback lets the ring buffer fill and a full ring buffer silently drops events. Each rule is a pure function of one event:</p>
       <div class="panel">
         <span class="panel-label">detections/core/DetectLoop.cpp &mdash; simplified</span>
-        <pre>// Rules for this event source, in order; first match wins.
+        <pre>// Rules for this event source, evaluated concurrently -- no early exit,
+// so a future rule whose evaluate() suspends doesn't hold up the rest.
 for (const auto&amp; rule : detectors_[source]) {
-    if (auto v = rule-&gt;evaluate(evt)) { verdict = *v; break; }
+    if (auto v = rule-&gt;evaluate(evt)) { verdicts[i] = *v; }
 }
+verdict = lowestIndexNonEmpty(verdicts);  // list order still decides the winner
 // No match: an inline "OK / traffic observed" verdict.
 
 if (verdict.actionable) {
@@ -464,7 +466,7 @@ push(LogAction{...});                  // always</pre>
       <h2><span class="num">&sect;4</span> Class Relationships</h2>
       <div class="prose">
         <p>Three things extend this codebase: a <strong>hook</strong> derives from <code>BpfProgram</code>, a <strong>detection</strong> implements <code>IDetection</code>, and a <strong>response</strong> implements <code>IAction</code>. A new hook is one class plus one line in <code>programs/core/main.cpp</code>. A new detection is one directory under <code>detections/</code> plus one entry in the list of whichever hook can feed it &mdash; nothing else changes, including the composition root.</p>
-        <p>The property worth protecting when reading the diagram: <code>HttpGuardProgram</code>, <code>DetectLoop</code> and <code>ActionLoop</code> name no concrete hook, detection, event or action. A record arrives carrying the list of detections to try against it, the loop walks that list in order, and the first verdict wins &mdash; so inside a detection the concrete type is known to the compiler from the raw bytes through to the verdict, and outside one nothing knows what an event is at all.</p>
+        <p>The property worth protecting when reading the diagram: <code>HttpGuardProgram</code>, <code>DetectLoop</code> and <code>ActionLoop</code> name no concrete hook, detection, event or action. A record arrives carrying the list of detections to try against it, the loop evaluates that list concurrently, and the lowest-index verdict wins &mdash; so inside a detection the concrete type is known to the compiler from the raw bytes through to the verdict, and outside one nothing knows what an event is at all.</p>
       </div>
 
       <figure class="diagram">
@@ -515,8 +517,8 @@ push(LogAction{...});                  // always</pre>
             <text class="dg-edge-label" x="157" y="256">owns, attach()</text>
 
             <path class="dg-edge dg-edge-user" d="M450,338 V260" marker-end="url(#arrowUser)"/>
-            <text class="dg-edge-label" x="458" y="292">walks the list</text>
-            <text class="dg-edge-label" x="458" y="306">first match wins</text>
+            <text class="dg-edge-label" x="458" y="292">fans out the list</text>
+            <text class="dg-edge-label" x="458" y="306">lowest index wins</text>
 
             <path class="dg-edge dg-edge-neutral" d="M751,338 V170" marker-end="url(#arrowNeutral)"/>
             <text class="dg-edge-label" x="759" y="256">co_spawn</text>
@@ -565,7 +567,7 @@ push(LogAction{...});                  // always</pre>
               <td class="mono">IDetection</td>
               <td><code>inspect(data, size, meta) const &rarr; optional&lt;Verdict&gt;</code> &mdash; parse and evaluate together</td>
               <td>8 detections, one directory each</td>
-              <td>the loop, walking the submitting hook's list in order &mdash; first verdict wins</td>
+              <td>the loop, evaluating the submitting hook's list concurrently &mdash; lowest-index verdict wins</td>
             </tr>
             <tr>
               <td class="mono">IAction</td>

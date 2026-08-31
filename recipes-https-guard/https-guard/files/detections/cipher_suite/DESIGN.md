@@ -16,6 +16,34 @@ that actually was negotiated.
 
 ## How to detect
 
+### Where this sits in the handshake
+
+```
+Client                                                             bmcweb (server)
+  │                                                                      │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ───┤
+  ├── ACK ─────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)              │
+  │                                                                      │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)       │
+  │◀── ServerHello, Certificate, ... (0x16) ────────────────────────────┤
+  ├── Finished (0x16) ─────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ─────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)          │
+  │                                                                      │
+  ├── application data, e.g. an HTTP request ──────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ─────────────────────────┤
+  │                                                                      │
+  ├── TCP FIN or RST ──────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** inside the ClientHello, same message as `legacy_version`
+and the SNI extension — an offer, not yet a negotiated outcome. Same reason as
+[`sni`](../sni/DESIGN.md): nothing later in this diagram ever exposes the
+offered list again, so a wire-side hook is the only place this is visible.
+
 Only a hook on the wire can see a ClientHello at all: it is the client's first
 message, and by the time `SSL_write` runs in bmcweb the handshake is long over.
 So this is XDP-only, and the `requires` clause on the detection says so — naming

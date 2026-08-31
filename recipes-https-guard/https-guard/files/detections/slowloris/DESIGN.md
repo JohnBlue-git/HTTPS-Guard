@@ -38,6 +38,35 @@ Three things there are deliberate:
 - **SYNs are counted before the port filter.** A port scan targets ports other than 443 by definition, so counting after the filter would make the thing worth detecting invisible.
 - **The BPF side draws no conclusion and drops nothing.** It only counts.
 
+### Where this sits in the handshake
+
+```
+Client                                                          bmcweb (server)
+  │                                                                    │
+  ├── TCP SYN ─────────────────────────────────────────────────────────▶│
+  │◀──────────────────────────────────────────────────────── SYN-ACK ──┤
+  ├── ACK ──────────────────────────────────────────────────────────────▶│
+  │                    (TCP handshake complete; no TLS yet)            │
+  │                                                                    │
+  ├── ClientHello (0x16, unencrypted) ─────────────────────────────────▶│
+  │      legacy_version · cipher_suites[] · extensions (incl. SNI)     │
+  │◀── ServerHello, Certificate, ... (0x16) ─────────────────────────────┤
+  ├── Finished (0x16) ───────────────────────────────────────────────────▶│
+  │◀── Finished (0x16) ──────────────────────────────────────────────────┤
+  │              (TLS handshake complete; ssl->version now set)        │
+  │                                                                    │
+  ├── application data, e.g. an HTTP request ────────────────────────────▶│
+  │◀── application data, e.g. an HTTP response ──────────────────────────┤
+  │                                                                    │
+  ├── TCP FIN or RST ───────────────────────────────────────────────────▶│
+```
+
+**Where this sits:** not one point but the span between the SYN and the FIN/RST
+at the top and bottom of this diagram — `open_conns` increments at the first
+line and decrements at the last, regardless of how much or how little happens
+in between. A Slowloris connection is exactly the case where nothing in the
+middle of this diagram ever happens at all.
+
 `ConnRateSweeper` reads the map every 2 seconds and synthesises one event per
 detection per offending source. These detections therefore have **no
 `IDetection`** and never reach `submit()` — there is no ring-buffer record for a
