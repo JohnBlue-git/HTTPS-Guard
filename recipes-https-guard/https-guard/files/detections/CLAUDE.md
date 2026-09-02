@@ -105,10 +105,19 @@ never fires.
 
 ## Why some rules enforce and others only alert
 
-Understand this before adding a rule, because getting it wrong has caused an
-outage. The blocklist applies to a source address on **every port**, so an
-actionable verdict against a false positive removes all access to the BMC for
-the TTL.
+**"Enforces" (in every `DESIGN.md` and in `README.md`) and `Verdict::actionable`
+(in code, and in the table's `Actionable?` column above) name the same switch** —
+prose says "enforces", the field is called `actionable`. Setting it `true` does
+two concrete things, both in `dispatchVerdict()`: it blocklists the verdict's
+source address, and it kills the exact TCP connection via `SOCK_DESTROY` if a
+full 4-tuple is known. `Verdict::actionable` defaults to `false` — a rule opts
+into enforcement, rather than opting out of it, so a new rule alerts until
+someone deliberately decides it should do more.
+
+Understand the blast radius before adding a rule, because getting it wrong has
+caused an outage. The blocklist applies to a source address on **every port**,
+so an actionable verdict against a false positive removes all access to the BMC
+for the TTL — not just to whatever port or protocol tripped the rule.
 
 - `cipher_suite` and `sni` fire on a handshake bmcweb refuses anyway. The offer itself does no damage, so alerting is proportionate. Making them actionable locked an operator out of SSH during testing — that incident is why they are not.
 - `conn_rate`, `slowloris` and `renegotiation` describe *ongoing harm*. An alert that does not stop it is close to useless, so these enforce — which makes their thresholds safety-critical rather than tuning details.

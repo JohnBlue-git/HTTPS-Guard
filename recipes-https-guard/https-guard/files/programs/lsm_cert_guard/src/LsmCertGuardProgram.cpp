@@ -51,14 +51,16 @@ constexpr const char* kExpectedBmcwebExe = "/usr/bin/bmcweb";
 bool LsmCertGuardProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept
 {
     bpf_program* prog = bpf_object__find_program_by_name(obj, "https_guard_cert_open");
-    if (!prog) {
+    if (!prog)
+    {
         std::cerr << "https_guard: LSM cert-access-guard program not found; "
                      "certificate access will not be observed\n";
         return false;
     }
 
     bpf_link* link = bpf_program__attach_lsm(prog);
-    if (!link) {
+    if (!link)
+    {
         std::cerr << "https_guard: failed to attach LSM cert-access-guard (non-fatal): "
                   << strerror(errno) << "\n";
         return false;

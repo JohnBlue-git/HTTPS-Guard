@@ -94,11 +94,16 @@ https_guard_path_matches(struct path *path, const char *expected, int expected_l
     long len = bpf_d_path(path, buf, sizeof(buf));
 
     if (len != expected_len + 1)
+    {
         return false;
+    }
 
-    for (int i = 0; i < expected_len; i++) {
+    for (int i = 0; i < expected_len; i++)
+    {
         if (buf[i] != expected[i])
+        {
             return false;
+        }
     }
     return true;
 }
@@ -110,21 +115,26 @@ int BPF_PROG(https_guard_cert_open, struct file *file)
     static const char bmcweb_comm[]  = HTTPS_GUARD_BMCWEB_COMM;
 
     if (!https_guard_path_matches(&file->f_path, cert_path, sizeof(cert_path) - 1))
-        return 0;  /* not the certificate file: nothing to say or decide */
+    {
+        return 0; /* not the certificate file: nothing to say or decide */
+    }
 
     char comm[HG_COMM_LEN];
     bpf_get_current_comm(&comm, sizeof(comm));
 
     bool comm_ok = true;
-    for (int i = 0; i < (int)sizeof(bmcweb_comm) - 1; i++) {
-        if (comm[i] != bmcweb_comm[i]) {
+    for (int i = 0; i < (int)sizeof(bmcweb_comm) - 1; i++)
+    {
+        if (comm[i] != bmcweb_comm[i])
+        {
             comm_ok = false;
             break;
         }
     }
 
     struct lsm_cert_guard_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-    if (evt) {
+    if (evt)
+    {
         __builtin_memset(evt, 0, sizeof(*evt));
         evt->hdr.event_source = HG_SOURCE_LSM_CERT_GUARD;
         evt->hdr.reserved     = 0;
@@ -143,7 +153,9 @@ int BPF_PROG(https_guard_cert_open, struct file *file)
     }
 
     if (shadow_mode)
-        return 0;  /* observe-and-log only: never deny, regardless of comm_ok */
+    {
+        return 0; /* observe-and-log only: never deny, regardless of comm_ok */
+    }
 
     return comm_ok ? 0 : -HG_EACCES;
 }

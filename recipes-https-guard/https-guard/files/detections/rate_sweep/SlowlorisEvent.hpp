@@ -18,6 +18,16 @@ struct SlowlorisEvent {
 
     std::uint32_t open_connections = 0;
     std::uint32_t threshold        = 0;
+
+    SlowlorisEvent() = default;
+
+    SlowlorisEvent(const EventMeta& meta_in, std::uint32_t open_connections_in,
+                   std::uint32_t threshold_in)
+        : meta(meta_in)
+        , open_connections(open_connections_in)
+        , threshold(threshold_in)
+    {
+    }
 };
 
 }  // namespace https_guard

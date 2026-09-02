@@ -27,7 +27,8 @@ void dispatchVerdict(const EventMeta& meta,
                      const Verdict& verdict,
                      const DispatchContext& ctx)
 {
-    if (ctx.action_loop == nullptr) {
+    if (ctx.action_loop == nullptr)
+    {
         std::cerr << "https_guard: BUG: dispatchVerdict with no ActionLoop\n";
         return;
     }
@@ -51,7 +52,8 @@ void dispatchVerdict(const EventMeta& meta,
     std::vector<std::unique_ptr<IAction>> response;
     response.reserve(3);
 
-    if (verdict.actionable) {
+    if (verdict.actionable)
+    {
         /* Only now is the connection tuple worth resolving -- this is the first
          * point that actually needs it, and most events never get here. For XDP
          * the addresses came from the packet and this is already satisfied.
@@ -78,7 +80,8 @@ void dispatchVerdict(const EventMeta& meta,
          * SOCK_DESTROY needs the connection to still exist. The synchronous call
          * here maximises the chance the socket is still there to destroy. */
         meta.ensurePeerResolved();
-        if (meta.remote_ip_v4 != 0) {
+        if (meta.remote_ip_v4 != 0)
+        {
             /* Tearing down a connection only makes sense when we know which
              * connection. A rate violation is attributed to an address, not a
              * socket -- no local endpoint, no ports -- so asking netlink to
@@ -88,7 +91,8 @@ void dispatchVerdict(const EventMeta& meta,
             const bool have_full_tuple = meta.local_ip_v4 != 0 &&
                                           meta.local_port != 0 &&
                                           meta.remote_port != 0;
-            if (have_full_tuple) {
+            if (have_full_tuple)
+            {
                 response.push_back(std::make_unique<BlockTcpAction>(
                     meta.local_ip_v4, meta.remote_ip_v4,
                     meta.local_port, meta.remote_port, verdict.message));
@@ -97,7 +101,9 @@ void dispatchVerdict(const EventMeta& meta,
             response.push_back(std::make_unique<BlocklistAddAction>(
                 meta.remote_ip_v4,   /* block the peer, never our own address */
                 ctx.blocklist_ttl, verdict.message));
-        } else {
+        }
+        else
+        {
             std::cerr << "https_guard: PID " << meta.pid << " (" << meta.process
                       << ") — no connection could be attributed, declining to enforce\n";
         }

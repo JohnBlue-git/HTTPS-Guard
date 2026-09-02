@@ -25,22 +25,26 @@ HttpGuardProgram::~HttpGuardProgram() noexcept
 
 bool HttpGuardProgram::loadFilter() noexcept
 {
-    if (!openObject()) {
+    if (!openObject())
+    {
         return false;
     }
 
-    if (bpf_object__load(object_) != 0) {
+    if (bpf_object__load(object_) != 0)
+    {
         closeObject();
         return false;
     }
 
-    if (!attachHooks()) {
+    if (!attachHooks())
+    {
         detachFilter();
         closeObject();
         return false;
     }
 
-    if (!registerEventHandler()) {
+    if (!registerEventHandler())
+    {
         detachFilter();
         closeObject();
         return false;
@@ -59,12 +63,14 @@ void HttpGuardProgram::detachFilter() noexcept
 
 bool HttpGuardProgram::openObject() noexcept
 {
-    if (object_) {
+    if (object_)
+    {
         return true;
     }
 
     object_ = bpf_object__open_file(object_path_.c_str(), nullptr);
-    if (!object_ || libbpf_get_error(object_)) {
+    if (!object_ || libbpf_get_error(object_))
+    {
         object_ = nullptr;
         return false;
     }
@@ -73,7 +79,8 @@ bool HttpGuardProgram::openObject() noexcept
 
 void HttpGuardProgram::closeObject() noexcept
 {
-    if (object_) {
+    if (object_)
+    {
         bpf_object__close(object_);
         object_ = nullptr;
     }
@@ -82,8 +89,10 @@ void HttpGuardProgram::closeObject() noexcept
 bool HttpGuardProgram::attachHooks() noexcept
 {
     int attached_count = 0;
-    for (const auto& hook : hooks_) {
-        if (hook->attach(object_, links_)) {
+    for (const auto& hook : hooks_)
+    {
+        if (hook->attach(object_, links_))
+        {
             ++attached_count;
         }
     }
@@ -91,7 +100,8 @@ bool HttpGuardProgram::attachHooks() noexcept
     // Require at least one enforcement path. Which hooks are actually
     // required vs. auxiliary is each hook's own attach() diagnostics to
     // log -- this class only needs to know whether *anything* attached.
-    if (attached_count == 0) {
+    if (attached_count == 0)
+    {
         std::cerr << "https_guard: no hook could be attached\n";
         return false;
     }
@@ -102,7 +112,8 @@ bool HttpGuardProgram::attachHooks() noexcept
     /* Adopt the blocklist map so enforcement can populate it after
      * classification. The only countermeasure touch point in the attach path;
      * everything else here stays observational. */
-    if (!Blocklist::instance().adopt(getMapFd(kBlocklistMapName))) {
+    if (!Blocklist::instance().adopt(getMapFd(kBlocklistMapName)))
+    {
         std::cerr << "https_guard: failed to adopt blocklist map '"
                   << kBlocklistMapName << "' (countermeasure disabled)\n";
         /* Non-fatal: the daemon still works in pure observational mode. */
@@ -112,12 +123,14 @@ bool HttpGuardProgram::attachHooks() noexcept
 
 int HttpGuardProgram::pollEvents(int timeout_ms) noexcept
 {
-    if (!ring_buffer_) {
+    if (!ring_buffer_)
+    {
         std::cerr << "https_guard: pollEvents called but ring_buffer_ is null\n";
         return -1;
     }
     const int rc = ring_buffer__poll(ring_buffer_, timeout_ms);
-    if (rc < 0 && rc != -EINTR) {
+    if (rc < 0 && rc != -EINTR)
+    {
         std::cerr << "https_guard: ring_buffer__poll returned " << rc
                   << " (" << strerror(-rc) << ")\n";
     }
@@ -126,7 +139,8 @@ int HttpGuardProgram::pollEvents(int timeout_ms) noexcept
 
 int HttpGuardProgram::getProgramFd(const std::string& prog_name) const noexcept
 {
-    if (!object_) {
+    if (!object_)
+    {
         return -1;
     }
 
@@ -136,7 +150,8 @@ int HttpGuardProgram::getProgramFd(const std::string& prog_name) const noexcept
 
 int HttpGuardProgram::getMapFd(const std::string& map_name) const noexcept
 {
-    if (!object_) {
+    if (!object_)
+    {
         return -1;
     }
 
@@ -146,7 +161,8 @@ int HttpGuardProgram::getMapFd(const std::string& map_name) const noexcept
 bool HttpGuardProgram::registerEventHandler() noexcept
 {
     const int map_fd = getMapFd("events");
-    if (map_fd < 0) {
+    if (map_fd < 0)
+    {
         std::cerr << "https_guard: failed to find 'events' ring buffer map\n";
         return false;
     }
@@ -154,7 +170,8 @@ bool HttpGuardProgram::registerEventHandler() noexcept
     std::cerr << "https_guard: creating ring buffer (map_fd=" << map_fd << ")\n";
     ring_buffer_ = ring_buffer__new(map_fd, &HttpGuardProgram::ringBufferCallback,
                                     this, nullptr);
-    if (!ring_buffer_) {
+    if (!ring_buffer_)
+    {
         std::cerr << "https_guard: ring_buffer__new failed: " << strerror(errno) << "\n";
         return false;
     }
@@ -164,7 +181,8 @@ bool HttpGuardProgram::registerEventHandler() noexcept
 
 void HttpGuardProgram::releaseRingBuffer() noexcept
 {
-    if (ring_buffer_) {
+    if (ring_buffer_)
+    {
         ring_buffer__free(ring_buffer_);
         ring_buffer_ = nullptr;
     }
@@ -172,8 +190,10 @@ void HttpGuardProgram::releaseRingBuffer() noexcept
 
 void HttpGuardProgram::destroyLinks() noexcept
 {
-    for (bpf_link* link : links_) {
-        if (link) {
+    for (bpf_link* link : links_)
+    {
+        if (link)
+        {
             bpf_link__destroy(link);
         }
     }
@@ -191,8 +211,10 @@ void HttpGuardProgram::enableRateSweeps(ConnRateSweeper::Thresholds thresholds) 
 
 const IPeerResolver* HttpGuardProgram::peerResolver() const noexcept
 {
-    for (const auto& hook : hooks_) {
-        if (const auto* resolver = dynamic_cast<const IPeerResolver*>(hook.get())) {
+    for (const auto& hook : hooks_)
+    {
+        if (const auto* resolver = dynamic_cast<const IPeerResolver*>(hook.get()))
+        {
             return resolver;
         }
     }
@@ -201,8 +223,10 @@ const IPeerResolver* HttpGuardProgram::peerResolver() const noexcept
 
 BpfProgram* HttpGuardProgram::hookFor(std::uint32_t event_source) const noexcept
 {
-    for (const auto& hook : hooks_) {
-        if (static_cast<std::uint32_t>(hook->eventSource()) == event_source) {
+    for (const auto& hook : hooks_)
+    {
+        if (static_cast<std::uint32_t>(hook->eventSource()) == event_source)
+        {
             return hook.get();
         }
     }
@@ -212,7 +236,8 @@ BpfProgram* HttpGuardProgram::hookFor(std::uint32_t event_source) const noexcept
 
 int HttpGuardProgram::dispatchRecord(const void* data, std::size_t size) noexcept
 {
-    if (data == nullptr || size < sizeof(std::uint32_t)) {
+    if (data == nullptr || size < sizeof(std::uint32_t))
+    {
         std::cerr << "https_guard: undersized ring-buffer record (" << size << " bytes)\n";
         return 0;
     }
@@ -221,10 +246,12 @@ int HttpGuardProgram::dispatchRecord(const void* data, std::size_t size) noexcep
     std::memcpy(&event_source, data, sizeof(event_source));
 
     BpfProgram* hook = hookFor(event_source);
-    if (hook == nullptr) {
+    if (hook == nullptr)
+    {
         /* Rate-limited: a mislabelled producer would otherwise flood the
          * journal at line rate, which is its own denial of service. */
-        if (++unknown_source_count_ == 1 || unknown_source_count_ % 1000 == 0) {
+        if (++unknown_source_count_ == 1 || unknown_source_count_ % 1000 == 0)
+        {
             std::cerr << "https_guard: no hook owns event_source=" << event_source
                       << " (size=" << size << "); " << unknown_source_count_
                       << " such record(s) skipped\n";

@@ -7,7 +7,6 @@
 #include "IPeerResolver.hpp"
 #include "PayloadAnomalyDetector.hpp"
 #include "PayloadEvent.hpp"
-#include "bounded_string.hpp"
 #include "detection_traits.hpp"
 #include "event_meta_from.hpp"
 
@@ -33,21 +32,23 @@ public:
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
     {
-        if (data == nullptr || size < sizeof(RawT)) {
+        if (data == nullptr || size < sizeof(RawT))
+        {
             return std::nullopt;
         }
         const auto* raw = static_cast<const RawT*>(data);
 
         fillEnvelope(*raw, meta);
-        if constexpr (HasConnectionTuple<RawT>) {
+        if constexpr (HasConnectionTuple<RawT>)
+        {
             fillConnection(raw->conn, meta);
-        } else {
+        }
+        else
+        {
             meta.peer_resolver = resolver_;
         }
 
-        PayloadEvent evt;
-        evt.meta            = meta;
-        evt.payload_snippet = boundedString(raw->tls.payload_snippet);
+        const PayloadEvent evt(meta, *raw);
 
         return rule_.evaluate(evt);
     }

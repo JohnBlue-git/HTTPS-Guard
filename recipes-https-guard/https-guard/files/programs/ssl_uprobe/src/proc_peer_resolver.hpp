@@ -85,19 +85,22 @@ public:
         const std::string fd_dir = "/proc/" + std::to_string(pid) + "/fd";
 
         DIR* dir = ::opendir(fd_dir.c_str());
-        if (dir == nullptr) {
+        if (dir == nullptr)
+        {
             return inodes;  // process gone, or no permission
         }
 
         while (const dirent* ent = ::readdir(dir)) {
-            if (ent->d_name[0] == '.') {
+            if (ent->d_name[0] == '.')
+            {
                 continue;
             }
 
             std::array<char, 64> link{};
             const std::string fd_path = fd_dir + "/" + ent->d_name;
             const ssize_t len = ::readlink(fd_path.c_str(), link.data(), link.size() - 1);
-            if (len <= 0) {
+            if (len <= 0)
+            {
                 continue;  // fd closed under us; normal, just skip it
             }
             link[static_cast<std::size_t>(len)] = '\0';
@@ -105,7 +108,8 @@ public:
             // Only socket fds matter: "socket:[12345]"
             static constexpr char kPrefix[] = "socket:[";
             constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1;
-            if (std::strncmp(link.data(), kPrefix, kPrefixLen) != 0) {
+            if (std::strncmp(link.data(), kPrefix, kPrefixLen) != 0)
+            {
                 continue;
             }
 
@@ -113,7 +117,8 @@ public:
             // non-throwing parse is simpler than guarding every call.
             const std::uint64_t inode =
                 std::strtoull(link.data() + kPrefixLen, nullptr, 10);
-            if (inode != 0) {
+            if (inode != 0)
+            {
                 inodes.insert(inode);
             }
         }
@@ -150,7 +155,8 @@ public:
         {
             const std::lock_guard<std::mutex> lock(mu);
             const auto it = cache.find(pid);
-            if (it != cache.end() && (now - it->second.at) < kTtl) {
+            if (it != cache.end() && (now - it->second.at) < kTtl)
+            {
                 return it->second.result;
             }
         }
@@ -161,7 +167,8 @@ public:
             const std::lock_guard<std::mutex> lock(mu);
             // Bound the map so a churn of short-lived pids can't grow it
             // without limit; entries are cheap to rebuild.
-            if (cache.size() > 256) {
+            if (cache.size() > 256)
+            {
                 cache.clear();
             }
             cache[pid] = Entry{fresh, now};
@@ -183,7 +190,8 @@ public:
         PeerResolution result;
 
         const auto owned = getOwnedSocketInodes(pid);
-        if (owned.empty()) {
+        if (owned.empty())
+        {
             result.reason = "no socket fds owned by pid (process gone, or not permitted)";
             return result;
         }
@@ -192,21 +200,26 @@ public:
         const TcpSocketEntry* match = nullptr;
         std::size_t match_count = 0;
 
-        for (const auto& sock : all) {
-            if (sock.inode == 0 || owned.count(sock.inode) == 0) {
+        for (const auto& sock : all)
+        {
+            if (sock.inode == 0 || owned.count(sock.inode) == 0)
+            {
                 continue;  // belongs to some other process in this namespace
             }
             ++match_count;
-            if (match == nullptr) {
+            if (match == nullptr)
+            {
                 match = &sock;
             }
         }
 
-        if (match_count == 0) {
+        if (match_count == 0)
+        {
             result.reason = "pid owns no established TCP connection";
             return result;
         }
-        if (match_count > 1) {
+        if (match_count > 1)
+        {
             // Cannot tell which of them this SSL_write/SSL_read used; a
             // uprobe event carries no socket identity. Resolving this
             // properly needs the fd read out of the SSL object's BIO in
@@ -247,7 +260,8 @@ public:
         std::string path = "/proc/" + std::to_string(pid) + "/net/tcp";
         std::ifstream f(path);
 
-        if (!f.is_open()) {
+        if (!f.is_open())
+        {
             return entries;
         }
 
@@ -279,14 +293,16 @@ public:
 
             // col[9] is the socket inode, which resolveEstablishedPeer()
             // needs in order to match against /proc/<pid>/fd entries.
-            if (cols.size() < 10) {
+            if (cols.size() < 10)
+            {
                 continue;
             }
 
             // col[3] is the TCP state. Only ESTABLISHED sockets describe a
             // real peer; skipping the rest is what stops a LISTEN entry
             // (rem_address 00000000:0000) reaching enforcement.
-            if (cols[3] != kTcpStateEstablished) {
+            if (cols[3] != kTcpStateEstablished)
+            {
                 continue;
             }
 
@@ -312,10 +328,14 @@ public:
             // noexcept, so an unparseable column escaping as an exception
             // would be std::terminate() -- killing the daemon over one odd
             // line of /proc, rather than skipping the field.
-            if (cols.size() > 7) {
-                try {
+            if (cols.size() > 7)
+            {
+                try
+                {
                     entry.uid = std::stoi(cols[7], nullptr, 10);
-                } catch (...) {
+                }
+                catch (...)
+                {
                     entry.uid = 0;
                 }
             }
@@ -343,7 +363,8 @@ public:
                                    std::uint16_t& port) noexcept
     {
         auto colon_pos = field.find(':');
-        if (colon_pos == std::string::npos) {
+        if (colon_pos == std::string::npos)
+        {
             ip_v4 = 0;
             port = 0;
             return;
@@ -375,20 +396,28 @@ public:
         // That meant BlocklistAddAction was blocking an entirely different
         // address than the one observed. It was previously mistaken for an
         // artifact of loopback testing; it was not.
-        if (ip_hex.length() == 8) {
-            try {
+        if (ip_hex.length() == 8)
+        {
+            try
+            {
                 ip_v4 = static_cast<std::uint32_t>(std::stoul(ip_hex, nullptr, 16));
-            } catch (...) {
+            }
+            catch (...)
+            {
                 ip_v4 = 0;
             }
         }
 
         // Parse port
-        if (port_hex.length() <= 4) {
-            try {
+        if (port_hex.length() <= 4)
+        {
+            try
+            {
                 port = static_cast<std::uint16_t>(
                     std::stoul(port_hex, nullptr, 16));
-            } catch (...) {
+            }
+            catch (...)
+            {
                 port = 0;
             }
         }
@@ -401,13 +430,17 @@ public:
                             int& tx_queue, int& rx_queue) noexcept
     {
         auto colon_pos = field.find(':');
-        if (colon_pos == std::string::npos) {
+        if (colon_pos == std::string::npos)
+        {
             return;
         }
-        try {
+        try
+        {
             tx_queue = std::stoi(field.substr(0, colon_pos), nullptr, 16);
             rx_queue = std::stoi(field.substr(colon_pos + 1), nullptr, 16);
-        } catch (...) {
+        }
+        catch (...)
+        {
             // ignore
         }
     }

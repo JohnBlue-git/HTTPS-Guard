@@ -5,7 +5,9 @@
 - `OemSecurityEvent.1.0.HttpsSlowlorisDetected` (Warning) — Slowloris
 - `OemSecurityEvent.1.0.HttpsTlsRenegotiationStorm` (Warning) — renegotiation storm
 
-**Enforces:** yes, all three.
+**Enforces:** yes, all three — blocklist the source address (every port, for
+the TTL); no TCP teardown, since each verdict is attributed to an address, not
+a socket.
 
 ## Why one DESIGN.md for three rules
 
@@ -36,6 +38,19 @@ this is three rules and not one:
 - **Connection rate** catches a flood or a port scan: many SYNs, fast. This also catches port scanning, which is why SYNs are counted before the port-443 filter — a scan targets other ports by definition.
 - **Slowloris** catches the opposite shape: open many connections, then go quiet. A Slowloris attacker stays comfortably under any connection-rate threshold, and the traffic rate looks like nothing at all — every individual connection looks legitimate.
 - **Renegotiation storm** exploits the asymmetry of the TLS handshake: the server does key-exchange and signature work far exceeding what the client spends asking for it, so a source can stay well under any connection-rate threshold while renegotiating continuously on connections it already holds.
+
+That asymmetry is also why *repetition* is the actual signal, not renegotiation
+itself. A Redfish client has no legitimate reason to renegotiate at all — it
+authenticates once and reuses the connection — so even one renegotiation on a
+`bmcweb` connection is already unusual. (Renegotiation was rare even on the
+wider web before it was mostly retired: client-initiated renegotiation was
+disabled after a real vulnerability, CVE-2009-3555, and TLS 1.3 removed the
+mechanism entirely in favor of a cheaper key update.) What turns "unusual" into
+"attack" is doing it *many times on one connection, inside one window*: each
+repetition costs the attacker almost nothing to request and costs bmcweb a full
+asymmetric handshake to perform, so a source crossing
+`HTTPS_GUARD_RENEG_THRESHOLD` within the 10s window is spending the BMC's CPU
+on the attacker's behalf far faster than the attacker is spending their own.
 
 ### Where the numbers come from
 
@@ -83,9 +98,47 @@ Client                                                             bmcweb (serve
   ├── TCP FIN or RST ──────────────────────────────────────────────────▶│
 ```
 
-- **Connection rate** — the very first line: the inbound SYN, before the port-443 filter and before anything TLS-shaped exists on the connection at all. Counting any later point in this diagram would make a port scan invisible.
-- **Slowloris** — not one point but the span between the SYN and the FIN/RST at the top and bottom of this diagram: `open_conns` increments at the first line and decrements at the last, regardless of how much or how little happens in between. A Slowloris connection is exactly the case where nothing in the middle ever happens at all.
-- **Renegotiation storm** — every `0x16`-marked message in this diagram: the initial handshake's own messages, and any handshake-type record sent afterward on a connection that already completed one. `hello_count` does not distinguish an initial handshake from a repeated one; it counts the message type, not the connection's state, which is why the trigger recipe can drive this by resending `0x16` records rather than performing genuine renegotiations.
+### Connection rate: one point, once
+
+```
+SYN ──▶ SYN-ACK ──▶ ACK ──▶ ... rest of the connection, irrelevant to this counter ... ──▶ FIN/RST
+│
+└── syn_count += 1 — the ONLY point this rule reads, once per attempt, windowed
+```
+
+The very first line: the inbound SYN, before the port-443 filter and before
+anything TLS-shaped exists on the connection at all. Counting any later point
+would make a port scan invisible.
+
+### Slowloris: a level, held across the whole span
+
+```
+SYN ──▶ SYN-ACK ──▶ ACK ──▶ ... connection stays open, however long ... ──▶ FIN/RST
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+open_conns += 1                                                             open_conns -= 1
+held at this LEVEL for the whole span in between — survives any window roll
+```
+
+Not one point but the entire span between SYN and FIN/RST: `open_conns`
+increments at the first and decrements at the last, regardless of how much or
+how little happens in between. A Slowloris connection is exactly the case
+where nothing in the middle ever happens at all.
+
+### Renegotiation storm: every `0x16`, wherever it occurs
+
+```
+SYN ──▶ ClientHello ──▶ ServerHello ──▶ Finished ──▶ Finished ──▶ app data ──▶ another 0x16 ──▶ FIN/RST
+        │               │               │            │                         │
+        └───────────────┴───────────────┴────────────┴─────────────────────────┘
+hello_count += 1 on EVERY 0x16-marked record — including ones sent long after the
+handshake finished, which is why this can fire without a real renegotiation
+```
+
+`hello_count` does not distinguish an initial handshake from a repeated one; it
+counts the message type, not the connection's state, which is why the trigger
+recipe can drive this by resending `0x16` records rather than performing
+genuine renegotiations.
 
 `ConnRateSweeper` reads the map every 2 seconds and evaluates all three rules
 against each offending source. These detections therefore have **no
@@ -137,12 +190,14 @@ All three are actionable: the source is blocklisted, and Tier 1 drops its
 subsequent packets at line rate — the same two-tier flow a TLS-version
 violation uses.
 
-**No TCP teardown for any of the three**, and that is not an omission: each
-verdict is attributed to an *address*, not a socket — there is no local
-endpoint and no ports, so asking netlink to destroy a zero tuple produced a
-guaranteed `-ENOENT` and a misleading "SOCK_DESTROY failed" line.
-`dispatchVerdict()` checks for a full 4-tuple first, and none of these three
-ever have one.
+**No TCP teardown for any of the three.** `SOCK_DESTROY` needs a full 4-tuple —
+local *and* remote IP and port — to pick out one exact socket. These verdicts
+only carry a source address, aggregated from a counter keyed by IP alone, with
+no port and no specific connection behind it — so there is nothing valid to
+identify a socket with. `dispatchVerdict()` checks for a full 4-tuple before
+attempting teardown and skips it when one isn't there — deliberately, after an
+earlier attempt produced a guaranteed `-ENOENT` and a misleading "SOCK_DESTROY
+failed" line for a socket that was never identifiable to begin with.
 
 The cost of keeping the decision in userspace is that enforcement waits for
 the next sweep rather than acting on the offending packet. For *sustained*

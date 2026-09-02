@@ -35,7 +35,8 @@ void DetectLoop::configure(ActionLoop& action_loop,
                            std::chrono::seconds blocklist_ttl,
                            std::string output_path) noexcept
 {
-    if (configured_.load(std::memory_order_acquire)) {
+    if (configured_.load(std::memory_order_acquire))
+    {
         /* Not a reconfiguration: the worker threads are already reading these
          * fields, so a second write would be a data race. Refuse loudly
          * rather than half-applying it. */
@@ -43,7 +44,8 @@ void DetectLoop::configure(ActionLoop& action_loop,
                      "ignoring the second call\n";
         return;
     }
-    if (stop_.load(std::memory_order_relaxed)) {
+    if (stop_.load(std::memory_order_relaxed))
+    {
         std::cerr << "https_guard: DetectLoop::configure() after stop(); ignored\n";
         return;
     }
@@ -63,19 +65,27 @@ DetectLoop::DetectLoop() noexcept
     , record_strand_(asio::make_strand(io_context_))
     , sweep_timer_(io_context_)
 {
-    try {
-        for (auto& t : threads_) {
+    try
+    {
+        for (auto& t : threads_)
+        {
             t = std::thread([this] { io_context_.run(); });
         }
-    } catch (...) {
+    }
+    catch (...)
+    {
         // Without a worker nothing would ever be classified, so make the
         // failure loud rather than silently accepting events onto an
         // executor that is never run.
         stop_.store(true, std::memory_order_relaxed);
         work_guard_.reset();
         io_context_.stop();
-        for (auto& t : threads_) {
-            if (t.joinable()) t.join();
+        for (auto& t : threads_)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
         }
         std::cerr << "https_guard: FATAL: could not start DetectLoop workers; "
                      "no events will be classified\n";
@@ -89,9 +99,14 @@ DetectLoop::~DetectLoop() noexcept
 
 void DetectLoop::stop() noexcept
 {
-    if (stop_.exchange(true, std::memory_order_relaxed)) {
-        for (auto& t : threads_) {
-            if (t.joinable()) t.join();
+    if (stop_.exchange(true, std::memory_order_relaxed))
+    {
+        for (auto& t : threads_)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
         }
         return;
     }
@@ -109,15 +124,20 @@ void DetectLoop::stop() noexcept
     work_guard_.reset();
     io_context_.stop();
 
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
+    for (auto& t : threads_)
+    {
+        if (t.joinable())
+        {
+            t.join();
+        }
     }
 
     /* Read after the joins, so nothing is still decrementing it. */
     const auto abandoned    = in_flight_.load(std::memory_order_relaxed);
     const auto dropped      = dropped_.load(std::memory_order_relaxed);
     const auto unconfigured = unconfigured_.load(std::memory_order_relaxed);
-    if (abandoned != 0 || dropped != 0 || unconfigured != 0) {
+    if (abandoned != 0 || dropped != 0 || unconfigured != 0)
+    {
         std::cerr << "https_guard: DetectLoop stopped; " << abandoned
                   << " event(s) abandoned at shutdown, " << dropped
                   << " dropped earlier (full queue, oversized, or no detections), "
@@ -129,7 +149,8 @@ void DetectLoop::stop() noexcept
 void DetectLoop::countDrop(const char* why) noexcept
 {
     const auto n = dropped_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n == 1 || n % 1000 == 0) {
+    if (n == 1 || n % 1000 == 0)
+    {
         std::cerr << "https_guard: DetectLoop dropped an event (" << why
                   << "); " << n << " dropped so far\n";
     }
@@ -138,32 +159,37 @@ void DetectLoop::countDrop(const char* why) noexcept
 void DetectLoop::submit(const void* data, std::size_t size,
                         DetectionList detections) noexcept
 {
-    if (data == nullptr || size == 0 || stop_.load(std::memory_order_relaxed)) {
+    if (data == nullptr || size == 0 || stop_.load(std::memory_order_relaxed))
+    {
         return;
     }
 
-    if (!configured_.load(std::memory_order_acquire)) {
+    if (!configured_.load(std::memory_order_acquire))
+    {
         /* Nothing to dispatch to yet. Cannot happen in the daemon -- polling
          * only starts after the composition root configures the loop -- but
          * count and say so rather than discarding a security event in
          * silence, which is the failure mode this project keeps rediscovering.
          */
         const auto n = unconfigured_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n == 1) {
+        if (n == 1)
+        {
             std::cerr << "https_guard: DetectLoop received an event before "
                          "configure(); dropping until configured\n";
         }
         return;
     }
 
-    if (detections.empty()) {
+    if (detections.empty())
+    {
         /* A hook that submits with no detections would be silently discarding
          * its own events. Report it rather than dropping them quietly. */
         countDrop("no detections submitted with the record");
         return;
     }
 
-    if (detections.size() > kMaxDetectionsPerRecord) {
+    if (detections.size() > kMaxDetectionsPerRecord)
+    {
         std::cerr << "https_guard: BUG: " << detections.size()
                   << " detections submitted, cap is " << kMaxDetectionsPerRecord
                   << "; raise kMaxDetectionsPerRecord\n";
@@ -171,7 +197,8 @@ void DetectLoop::submit(const void* data, std::size_t size,
         return;
     }
 
-    if (size > HG_MAX_RAW_EVENT_SIZE) {
+    if (size > HG_MAX_RAW_EVENT_SIZE)
+    {
         // A record larger than any known event struct: either a new hook
         // outgrew the cap without updating it, or the data is malformed.
         // Either way, don't truncate it into something that parses as
@@ -188,14 +215,16 @@ void DetectLoop::submit(const void* data, std::size_t size,
      * overflow, which is the problem this class exists to avoid. */
     std::size_t depth = in_flight_.load(std::memory_order_relaxed);
     do {
-        if (depth >= kMaxQueueDepth) {
+        if (depth >= kMaxQueueDepth)
+        {
             countDrop("queue full");
             return;
         }
     } while (!in_flight_.compare_exchange_weak(depth, depth + 1,
                                                std::memory_order_relaxed));
 
-    try {
+    try
+    {
         RawRecord rec;
         rec.size = size;
         std::memcpy(rec.bytes, data, size);
@@ -204,7 +233,8 @@ void DetectLoop::submit(const void* data, std::size_t size,
          * the call site, and this record is inspected long after submit() has
          * returned. The pointees are owned by the hook, which outlives the loop. */
         rec.detection_count = detections.size();
-        for (std::size_t i = 0; i < detections.size(); ++i) {
+        for (std::size_t i = 0; i < detections.size(); ++i)
+        {
             rec.detections[i] = detections[i];
         }
 
@@ -212,7 +242,9 @@ void DetectLoop::submit(const void* data, std::size_t size,
          * arrival order -- which is what makes "drop the newest" leave a
          * coherent prefix of history. */
         asio::co_spawn(record_strand_, handleRecord(std::move(rec)), asio::detached);
-    } catch (...) {
+    }
+    catch (...)
+    {
         /* post() allocates the handler, so it can throw on a memory-starved
          * BMC. This function is noexcept and is called from libbpf's
          * callback, so the only options are drop-and-count or terminate. */
@@ -230,12 +262,17 @@ asio::awaitable<void> DetectLoop::handleRecord(RawRecord rec) noexcept
     // below allocates (strings, vectors, json, make_unique), so on a
     // memory-constrained BMC a bad_alloc here is plausible -- and without
     // this it would be std::terminate, since this handler is noexcept.
-    try {
+    try
+    {
         co_await process(rec);
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e)
+    {
         std::cerr << "https_guard: dropped one event; classification threw: "
                   << e.what() << "\n";
-    } catch (...) {
+    }
+    catch (...)
+    {
         std::cerr << "https_guard: dropped one event; classification threw"
                      " an unknown exception\n";
     }
@@ -243,7 +280,8 @@ asio::awaitable<void> DetectLoop::handleRecord(RawRecord rec) noexcept
 
 asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
 {
-    if (rec.size < sizeof(std::uint32_t)) {
+    if (rec.size < sizeof(std::uint32_t))
+    {
         std::cerr << "https_guard: undersized event (" << rec.size << " bytes)\n";
         co_return;
     }
@@ -277,15 +315,17 @@ asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
      * `Op` vector above. Mirrors ActionLoop::pushActions, which spawns
      * `action->execute_async()` (already a value) rather than a lambda. */
     auto inspectOne = [](const IDetection* detection, const RawRecord& r,
-                        std::optional<Verdict>& verdict,
-                        EventMeta& meta) -> asio::awaitable<void> {
-        if (detection != nullptr) {
+                         std::optional<Verdict>& verdict,
+                         EventMeta&              meta) -> asio::awaitable<void> {
+        if (detection != nullptr)
+        {
             verdict = detection->inspect(r.bytes, r.size, meta);
         }
         co_return;
     };
 
-    for (std::size_t i = 0; i < rec.detection_count; ++i) {
+    for (std::size_t i = 0; i < rec.detection_count; ++i)
+    {
         ops.push_back(asio::co_spawn(
             executor,
             inspectOne(rec.detections[i], rec, verdicts[i], metas[i]),
@@ -305,36 +345,47 @@ asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
      * the first. Same outcome as before either way: the record is dropped,
      * not the daemon. */
     std::size_t failed = 0;
-    for (std::size_t i = 0; i < exceptions.size(); ++i) {
-        if (!exceptions[i]) {
+    for (std::size_t i = 0; i < exceptions.size(); ++i)
+    {
+        if (!exceptions[i])
+        {
             continue;
         }
         ++failed;
         const IDetection* detection = rec.detections[i];
-        try {
+        try
+        {
             std::rethrow_exception(exceptions[i]);
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e)
+        {
             std::cerr << "https_guard: detection " << (i + 1) << " of "
                       << exceptions.size() << " ('"
                       << (detection ? detection->name() : "?") << "') threw: "
                       << e.what() << "\n";
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cerr << "https_guard: detection " << (i + 1) << " of "
                       << exceptions.size() << " ('"
                       << (detection ? detection->name() : "?")
                       << "') threw an unknown exception\n";
         }
     }
-    if (failed != 0) {
-        if (failed > 1) {
+    if (failed != 0)
+    {
+        if (failed > 1)
+        {
             std::cerr << "https_guard: " << failed << " of " << exceptions.size()
                       << " detection(s) threw for this record; dropping it\n";
         }
         co_return;
     }
 
-    for (std::size_t i = 0; i < rec.detection_count; ++i) {
-        if (verdicts[i]) {
+    for (std::size_t i = 0; i < rec.detection_count; ++i)
+    {
+        if (verdicts[i])
+        {
             const IDetection* detection = rec.detections[i];
             /* One trace line per record, from the envelope every source shares.
              * The per-source handlers this replaced each logged their own
@@ -358,11 +409,14 @@ asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
      * either a record too short for any of this hook's layouts, or a list built
      * without that terminal entry. */
     const auto n = undetected_.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n == 1 || n % 1000 == 0) {
+    if (n == 1 || n % 1000 == 0)
+    {
         std::cerr << "https_guard: no detection claimed a " << rec.size
                   << "-byte record; tried";
-        for (std::size_t i = 0; i < rec.detection_count; ++i) {
-            if (rec.detections[i] != nullptr) {
+        for (std::size_t i = 0; i < rec.detection_count; ++i)
+        {
+            if (rec.detections[i] != nullptr)
+            {
                 std::cerr << " " << rec.detections[i]->name();
             }
         }
@@ -379,18 +433,24 @@ asio::awaitable<void> DetectLoop::sweepRates() noexcept
     // co_await process(rec) -- ConnRateSweeper::sweep() is not itself
     // noexcept, for the same reason process() is not: this is the layer that
     // catches.
-    if (rate_sweeper_) {
+    if (rate_sweeper_)
+    {
         /* Named, not a temporary bound to sweep()'s const& parameter: sweep()
          * is a coroutine, so an argument temporary here would be destroyed
          * once this call expression finishes evaluating -- which happens
          * before sweep()'s body actually runs, not after. process() below
          * binds its own DispatchContext the same way for the same reason. */
         const DispatchContext ctx{action_loop_, blocklist_ttl_, output_path_};
-        try {
+        try
+        {
             co_await rate_sweeper_->sweep(ctx);
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e)
+        {
             std::cerr << "https_guard: connection-rate sweep threw: " << e.what() << "\n";
-        } catch (...) {
+        }
+        catch (...)
+        {
             std::cerr << "https_guard: connection-rate sweep threw an unknown exception\n";
         }
     }
@@ -404,21 +464,27 @@ asio::awaitable<void> DetectLoop::sweepRates() noexcept
 
 void DetectLoop::armSweepTimer() noexcept
 {
-    if (stop_.load(std::memory_order_relaxed)) {
+    if (stop_.load(std::memory_order_relaxed))
+    {
         return;
     }
 
-    try {
+    try
+    {
         sweep_timer_.expires_after(kSweepInterval);
         sweep_timer_.async_wait([this](const boost::system::error_code& ec) noexcept {
-            if (ec || stop_.load(std::memory_order_relaxed)) {
+            if (ec || stop_.load(std::memory_order_relaxed))
+            {
                 return;
             }
-            try {
+            try
+            {
                 /* Detached: sweepRates() re-arms the timer itself once it
                  * completes, which is what keeps sweeps serial. */
                 asio::co_spawn(io_context_, sweepRates(), asio::detached);
-            } catch (...) {
+            }
+            catch (...)
+            {
                 /* co_spawn() allocates the coroutine frame and can throw on a
                  * memory-starved BMC. This handler is noexcept, and nothing
                  * ran to re-arm the timer on this path, so do it here --
@@ -428,7 +494,9 @@ void DetectLoop::armSweepTimer() noexcept
                 armSweepTimer();
             }
         });
-    } catch (...) {
+    }
+    catch (...)
+    {
         /* Losing the timer loses rate detection silently, which is the exact
          * failure mode this feature is supposed to report on. */
         std::cerr << "https_guard: could not arm the connection-rate sweep "
@@ -440,7 +508,8 @@ void DetectLoop::enableRateSweeps(int conn_rate_map_fd,
                                   ConnRateSweeper::Thresholds thresholds) noexcept
 {
     rate_sweeper_ = std::make_unique<ConnRateSweeper>(conn_rate_map_fd, thresholds);
-    if (!rate_sweeper_->enabled()) {
+    if (!rate_sweeper_->enabled())
+    {
         rate_sweeper_.reset();   // keep the hot path free of a disabled sweeper
         return;
     }
@@ -449,9 +518,12 @@ void DetectLoop::enableRateSweeps(int conn_rate_map_fd,
      * already running, and posting is also what publishes rate_sweeper_ to
      * them. Not on the record strand -- the whole point is that the sweep
      * does not queue behind records. */
-    try {
+    try
+    {
         asio::post(io_context_, [this] { armSweepTimer(); });
-    } catch (...) {
+    }
+    catch (...)
+    {
         std::cerr << "https_guard: could not start the connection-rate sweep; "
                      "rate detection is inactive\n";
         rate_sweeper_.reset();

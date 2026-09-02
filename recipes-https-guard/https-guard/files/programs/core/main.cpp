@@ -77,34 +77,42 @@ int main(int argc, char** argv)
         .output_path = "/var/log/redfish/https_guard_events.log",
     };
 
-    if (argc > 1) {
+    if (argc > 1)
+    {
         cfg.iface = argv[1];
     }
-    if (argc > 2) {
+    if (argc > 2)
+    {
         cfg.openssl_lib_path = argv[2];
     }
-    if (argc > 3) {
+    if (argc > 3)
+    {
         cfg.output_path = argv[3];
     }
-    if (argc > 4) {
+    if (argc > 4)
+    {
         cfg.bpf_object_path = argv[4];
     }
     // Optional: leaving this empty disables SNI *mismatch* checking (the
     // safe default — see SniDetector's class comment); malformed-SNI
     // detection is unconditional either way.
-    if (argc > 5) {
+    if (argc > 5)
+    {
         cfg.expected_sni = argv[5];
     }
     // Optional: connection-rate threshold. 0 (and anything unparseable)
     // leaves rate detection off, which is the safe default given a crossing
     // is actionable and blocklists the source on every port.
-    if (argc > 6) {
+    if (argc > 6)
+    {
         cfg.rate_threshold = static_cast<std::uint32_t>(std::strtoul(argv[6], nullptr, 10));
     }
-    if (argc > 7) {
+    if (argc > 7)
+    {
         cfg.slowloris_threshold = static_cast<std::uint32_t>(std::strtoul(argv[7], nullptr, 10));
     }
-    if (argc > 8) {
+    if (argc > 8)
+    {
         cfg.reneg_threshold = static_cast<std::uint32_t>(std::strtoul(argv[8], nullptr, 10));
     }
 
@@ -136,7 +144,8 @@ int main(int argc, char** argv)
         std::chrono::duration_cast<std::chrono::seconds>(kDefaultBlocklistTtl),
         cfg.output_path);
 
-    if (!program.loadFilter()) {
+    if (!program.loadFilter())
+    {
         std::cerr << "failed to initialize HTTPS Guard program\n";
         return 1;
     }
@@ -163,10 +172,12 @@ int main(int argc, char** argv)
 
     while (!g_stop) {
         const int rc = program.pollEvents(200);
-        if (rc == -EINTR) {
+        if (rc == -EINTR)
+        {
             break;
         }
-        if (rc < 0) {
+        if (rc < 0)
+        {
             std::cerr << "https_guard: pollEvents error: " << rc << " (" << strerror(-rc) << ")\n";
         }
     }

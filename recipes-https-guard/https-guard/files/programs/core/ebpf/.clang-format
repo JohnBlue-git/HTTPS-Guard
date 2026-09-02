@@ -1,0 +1,61 @@
+---
+# Same style as the parent .clang-format, except pointer/reference alignment:
+# this directory is kernel-side C using the Linux/GNU convention (`type *var`),
+# not the C++ detection code's `type* var`. clang-format has no config
+# inheritance in this build, so this file is a full copy with that one diff —
+# keep it in sync with ../../../.clang-format if that one changes.
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Right
+ReferenceAlignment: Right
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: true
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+FixNamespaceComments: true
+SpacesBeforeTrailingComments: 2
+SortIncludes: Never
+IncludeBlocks: Preserve
+SpaceBeforeParens: ControlStatements
+NamespaceIndentation: None
+IndentCaseLabels: true
+BreakConstructorInitializers: BeforeComma
+PackConstructorInitializers: Never
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Always
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeWhile: true
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+InsertBraces: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: All
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+AccessModifierOffset: -4

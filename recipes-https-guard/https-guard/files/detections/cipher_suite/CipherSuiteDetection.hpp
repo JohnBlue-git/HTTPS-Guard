@@ -25,7 +25,8 @@ public:
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
     {
-        if (data == nullptr || size < sizeof(RawT)) {
+        if (data == nullptr || size < sizeof(RawT))
+        {
             return std::nullopt;
         }
         const auto* raw = static_cast<const RawT*>(data);
@@ -33,15 +34,7 @@ public:
         fillEnvelope(*raw, meta);
         fillConnection(raw->conn, meta);
 
-        const auto& ch = raw->client_hello;
-        const std::uint16_t captured =
-            ch.cipher_suite_count < HG_MAX_CIPHER_SUITES ? ch.cipher_suite_count
-                                                         : HG_MAX_CIPHER_SUITES;
-
-        CipherSuiteEvent evt;
-        evt.meta = meta;
-        evt.cipher_suites.assign(ch.cipher_suites, ch.cipher_suites + captured);
-        evt.cipher_suites_offered = ch.cipher_suites_offered;
+        const CipherSuiteEvent evt(meta, *raw);
 
         return rule_.evaluate(evt);
     }

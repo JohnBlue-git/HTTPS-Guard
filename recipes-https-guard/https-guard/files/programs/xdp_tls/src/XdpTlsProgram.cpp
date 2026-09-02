@@ -46,18 +46,22 @@ void XdpTlsProgram::ringBufferHandler(const void* data, std::size_t size) noexce
 
 XdpTlsProgram::~XdpTlsProgram() noexcept
 {
-    if (!owns_legacy_attachment_) {
+    if (!owns_legacy_attachment_)
+    {
         return;  // link-based: the kernel detaches when the link fd closes
     }
 
     // Legacy path only. Without this the attachment outlives the process and
     // the next start cannot attach at all.
     const int err = bpf_xdp_detach(ifindex_, 0, nullptr);
-    if (err) {
+    if (err)
+    {
         std::cerr << "https_guard: failed to detach XDP program from ifindex "
                   << ifindex_ << " (" << strerror(-err)
                   << "); a restart may report 'XDP program already attached'\n";
-    } else {
+    }
+    else
+    {
         std::cout << "https_guard: XDP program detached from ifindex " << ifindex_ << "\n";
     }
 }
@@ -67,12 +71,14 @@ void XdpTlsProgram::clearStaleAttachment() noexcept
     bpf_xdp_query_opts query = {};
     query.sz = sizeof(query);
 
-    if (bpf_xdp_query(static_cast<int>(ifindex_), 0, &query) != 0) {
+    if (bpf_xdp_query(static_cast<int>(ifindex_), 0, &query) != 0)
+    {
         return;  // nothing attached, or the interface can't be queried
     }
 
     const __u32 prog_id = query.prog_id != 0 ? query.prog_id : query.skb_prog_id;
-    if (prog_id == 0) {
+    if (prog_id == 0)
+    {
         return;  // interface is free
     }
 
@@ -80,7 +86,8 @@ void XdpTlsProgram::clearStaleAttachment() noexcept
     // another tool on this interface, and taking it down would swap our
     // outage for theirs.
     const int prog_fd = bpf_prog_get_fd_by_id(prog_id);
-    if (prog_fd < 0) {
+    if (prog_fd < 0)
+    {
         std::cerr << "https_guard: an XDP program (id " << prog_id
                   << ") is attached to ifindex " << ifindex_
                   << " but could not be identified; leaving it alone\n";
@@ -94,7 +101,8 @@ void XdpTlsProgram::clearStaleAttachment() noexcept
                                                     sizeof(info.name)) == 0;
     close(prog_fd);
 
-    if (!is_ours) {
+    if (!is_ours)
+    {
         std::cerr << "https_guard: ifindex " << ifindex_
                   << " already has an XDP program attached ('"
                   << (identified ? info.name : "unknown")
@@ -106,10 +114,13 @@ void XdpTlsProgram::clearStaleAttachment() noexcept
     // before link-based attach was used, or a legacy-path instance that was
     // killed before its destructor ran.
     const int err = bpf_xdp_detach(static_cast<int>(ifindex_), 0, nullptr);
-    if (err) {
+    if (err)
+    {
         std::cerr << "https_guard: found a leaked https_guard XDP program on ifindex "
                   << ifindex_ << " but could not detach it (" << strerror(-err) << ")\n";
-    } else {
+    }
+    else
+    {
         std::cout << "https_guard: cleared a leaked https_guard XDP program from ifindex "
                   << ifindex_ << " (left by a previous run)\n";
     }
@@ -118,7 +129,8 @@ void XdpTlsProgram::clearStaleAttachment() noexcept
 bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept
 {
     bpf_program* xdp_prog = bpf_object__find_program_by_name(obj, "https_guard_xdp");
-    if (!xdp_prog) {
+    if (!xdp_prog)
+    {
         std::cerr << "https_guard: XDP program not found; running uprobe only\n";
         return false;
     }
@@ -129,7 +141,8 @@ bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexc
     // process goes away for any reason. See the class comment.
     bpf_link* link = bpf_program__attach_xdp(xdp_prog, static_cast<int>(ifindex_));
     const long link_err = libbpf_get_error(link);
-    if (link && !link_err) {
+    if (link && !link_err)
+    {
         links.push_back(link);
         std::cout << "https_guard: XDP attached via BPF link (auto-detaches on exit)\n";
         return true;
@@ -140,7 +153,8 @@ bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexc
                  " this process must clean up itself\n";
 
     int xdp_fd = bpf_program__fd(xdp_prog);
-    if (xdp_fd < 0) {
+    if (xdp_fd < 0)
+    {
         std::cerr << "https_guard: failed to get XDP program fd (non-fatal): "
                   << strerror(errno) << "\n";
         return false;
@@ -167,7 +181,8 @@ bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexc
     // mode actually took.
     int native_err = bpf_xdp_attach(
         ifindex_, xdp_fd, XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST, &opts);
-    if (!native_err) {
+    if (!native_err)
+    {
         owns_legacy_attachment_ = true;
         std::cout << "https_guard: XDP attached in native mode (legacy path)\n";
         return true;
@@ -175,7 +190,8 @@ bool XdpTlsProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexc
 
     int generic_err = bpf_xdp_attach(
         ifindex_, xdp_fd, XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST, &opts);
-    if (generic_err) {
+    if (generic_err)
+    {
         std::cerr << "https_guard: failed to attach XDP program to ifindex "
                   << ifindex_ << " (non-fatal, continuing with uprobe only):\n"
                   << "  native XDP: " << strerror(-native_err) << "\n"

@@ -95,10 +95,12 @@ static __always_inline void conn_rate_record(uint32_t src_ip, enum hg_conn_event
         (uint64_t)HTTPS_GUARD_CONN_RATE_WINDOW_SEC * 1000000000ULL;
 
     struct hg_conn_rate *entry = bpf_map_lookup_elem(&conn_rate, &src_ip);
-    if (!entry) {
+    if (!entry)
+    {
         /* A close for a source we have never seen is not worth an entry --
          * it is the tail of a connection that predates us. */
-        if (what == HG_CONN_CLOSED) {
+        if (what == HG_CONN_CLOSED)
+        {
             return;
         }
         struct hg_conn_rate fresh = {};
@@ -117,7 +119,8 @@ static __always_inline void conn_rate_record(uint32_t src_ip, enum hg_conn_event
      * Only the windowed counters reset. open_conns deliberately carries over:
      * it describes how many connections are held open right now, and a
      * Slowloris that stops sending would otherwise appear to release them. */
-    if (now - entry->window_start_ns > window_ns) {
+    if (now - entry->window_start_ns > window_ns)
+    {
         entry->window_start_ns = now;
         entry->syn_count   = 0;
         entry->hello_count = 0;
@@ -127,15 +130,18 @@ static __always_inline void conn_rate_record(uint32_t src_ip, enum hg_conn_event
      * plausible threshold, and a wrapped counter would read as innocent. */
     switch (what) {
     case HG_CONN_ATTEMPT:
-        if (entry->syn_count < 0xFFFFFFFFU) {
+        if (entry->syn_count < 0xFFFFFFFFU)
+        {
             entry->syn_count += 1;
         }
-        if (entry->open_conns < 0x7FFFFFFF) {
+        if (entry->open_conns < 0x7FFFFFFF)
+        {
             entry->open_conns += 1;
         }
         break;
     case HG_CONN_HELLO:
-        if (entry->hello_count < 0xFFFFFFFFU) {
+        if (entry->hello_count < 0xFFFFFFFFU)
+        {
             entry->hello_count += 1;
         }
         break;
@@ -144,7 +150,8 @@ static __always_inline void conn_rate_record(uint32_t src_ip, enum hg_conn_event
          * (connections predating this entry, or a FIN and an RST for the
          * same connection), and a negative level would read as innocent
          * forever afterwards. */
-        if (entry->open_conns > 0) {
+        if (entry->open_conns > 0)
+        {
             entry->open_conns -= 1;
         }
         break;

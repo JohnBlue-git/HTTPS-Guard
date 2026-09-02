@@ -27,7 +27,8 @@ public:
          * see TlsVersionEvent.hpp. */
         const bool violation = evt.violation_hint ||
                                (evt.tls_version > 0 && evt.tls_version < 0x0303);
-        if (!violation) {
+        if (!violation)
+        {
             return std::nullopt;
         }
 

@@ -26,7 +26,8 @@ class CertAccessDetector {
 public:
     std::optional<Verdict> evaluate(const CertAccessEvent& evt) const
     {
-        if (!evt.identity_mismatch) {
+        if (!evt.identity_mismatch)
+        {
             return std::nullopt;
         }
 

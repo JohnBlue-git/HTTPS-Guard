@@ -8,7 +8,6 @@
 #include "IDetection.hpp"
 #include "SniDetector.hpp"
 #include "SniEvent.hpp"
-#include "bounded_string.hpp"
 #include "detection_traits.hpp"
 #include "event_meta_from.hpp"
 
@@ -34,7 +33,8 @@ public:
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
     {
-        if (data == nullptr || size < sizeof(RawT)) {
+        if (data == nullptr || size < sizeof(RawT))
+        {
             return std::nullopt;
         }
         const auto* raw = static_cast<const RawT*>(data);
@@ -42,13 +42,7 @@ public:
         fillEnvelope(*raw, meta);
         fillConnection(raw->conn, meta);
 
-        const auto& ch = raw->client_hello;
-
-        SniEvent evt;
-        evt.meta          = meta;
-        evt.sni_present   = (ch.sni_present != 0);
-        evt.sni_malformed = (ch.sni_malformed != 0);
-        evt.sni_hostname  = boundedString(ch.sni_hostname);
+        const SniEvent evt(meta, *raw);
 
         return rule_.evaluate(evt);
     }

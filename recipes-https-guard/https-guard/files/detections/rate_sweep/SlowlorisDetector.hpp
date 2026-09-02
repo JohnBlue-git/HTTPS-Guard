@@ -26,7 +26,8 @@ class SlowlorisDetector {
 public:
     std::optional<Verdict> evaluate(const SlowlorisEvent& evt) const
     {
-        if (evt.threshold == 0 || evt.open_connections < evt.threshold) {
+        if (evt.threshold == 0 || evt.open_connections < evt.threshold)
+        {
             return std::nullopt;
         }
 

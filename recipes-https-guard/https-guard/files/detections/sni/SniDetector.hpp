@@ -49,17 +49,20 @@ public:
 
     std::optional<Verdict> evaluate(const SniEvent& evt) const
     {
-        if (evt.sni_malformed) {
+        if (evt.sni_malformed)
+        {
             return makeVerdict(evt.meta,
                 "malformed or over-long SNI/ClientHello structure"
                 " — no standard client produces this");
         }
 
-        if (!evt.sni_present || expected_hostname_.empty()) {
+        if (!evt.sni_present || expected_hostname_.empty())
+        {
             return std::nullopt;
         }
 
-        if (toLower(evt.sni_hostname) == expected_hostname_) {
+        if (toLower(evt.sni_hostname) == expected_hostname_)
+        {
             return std::nullopt;
         }
 

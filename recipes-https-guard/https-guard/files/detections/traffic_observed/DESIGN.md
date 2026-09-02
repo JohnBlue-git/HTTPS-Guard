@@ -2,7 +2,8 @@
 
 **Detects:** nothing. That is the point.
 **Emits:** `OemSecurityEvent.1.0.HttpsTrafficObserved` (OK).
-**Enforces:** no.
+**Enforces:** no — there is nothing to enforce against; this fires only when
+every other rule in the list found no violation.
 
 ## Why a detection that always matches
 

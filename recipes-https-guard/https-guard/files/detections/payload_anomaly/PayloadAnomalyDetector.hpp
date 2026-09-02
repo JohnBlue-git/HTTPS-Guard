@@ -22,7 +22,8 @@ class PayloadAnomalyDetector {
 public:
     std::optional<Verdict> evaluate(const PayloadEvent& evt) const
     {
-        if (evt.payload_snippet.empty()) {
+        if (evt.payload_snippet.empty())
+        {
             return std::nullopt;
         }
 
@@ -30,8 +31,10 @@ public:
         std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-        for (const auto* rule : kRules) {
-            if (lowered.find(rule) != std::string::npos) {
+        for (const auto* rule : kRules)
+        {
+            if (lowered.find(rule) != std::string::npos)
+            {
                 Verdict verdict;
                 verdict.severity   = "Warning";
                 verdict.message_id = "OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected";

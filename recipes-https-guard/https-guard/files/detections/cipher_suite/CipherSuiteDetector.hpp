@@ -41,9 +41,11 @@ class CipherSuiteDetector {
 public:
     std::optional<Verdict> evaluate(const CipherSuiteEvent& evt) const
     {
-        for (const std::uint16_t code : evt.cipher_suites) {
+        for (const std::uint16_t code : evt.cipher_suites)
+        {
             const WeakCipherSuite* weak = findWeakCipherSuite(code);
-            if (weak == nullptr) {
+            if (weak == nullptr)
+            {
                 continue;
             }
 
@@ -73,7 +75,8 @@ private:
     {
         static constexpr char kDigits[] = "0123456789abcdef";
         std::string out(4, '0');
-        for (int i = 3; i >= 0; --i) {
+        for (int i = 3; i >= 0; --i)
+        {
             out[static_cast<std::size_t>(i)] = kDigits[value & 0xF];
             value = static_cast<std::uint16_t>(value >> 4);
         }

@@ -32,7 +32,8 @@ namespace {
 std::uint64_t monotonic_now_ns() noexcept
 {
     struct timespec ts = {};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
         return 0;
     }
     return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL +
@@ -45,12 +46,14 @@ ConnRateSweeper::ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept
     : map_fd_(map_fd)
     , thresholds_(thresholds)
 {
-    if (map_fd_ < 0) {
+    if (map_fd_ < 0)
+    {
         std::cerr << "https_guard: per-source counter map unavailable;"
                      " rate, Slowloris and renegotiation detection disabled\n";
         return;
     }
-    if (!enabled()) {
+    if (!enabled())
+    {
         std::cout << "https_guard: rate, Slowloris and renegotiation detection"
                      " disabled (no thresholds configured)\n";
         return;
@@ -65,7 +68,8 @@ ConnRateSweeper::ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept
 
 boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
 {
-    if (!enabled()) {
+    if (!enabled())
+    {
         co_return;
     }
 
@@ -110,45 +114,59 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
         key = next_key;
 
         struct hg_conn_rate entry = {};
-        if (bpf_map_lookup_elem(map_fd_, &key, &entry) == 0) {
+        if (bpf_map_lookup_elem(map_fd_, &key, &entry) == 0)
+        {
             ++entries_seen;
-            if (entry.syn_count   > max_syn)   max_syn   = entry.syn_count;
-            if (entry.hello_count > max_hello) max_hello = entry.hello_count;
-            if (entry.open_conns  > max_open)  max_open  = entry.open_conns;
+            if (entry.syn_count > max_syn)
+            {
+                max_syn = entry.syn_count;
+            }
+            if (entry.hello_count > max_hello)
+            {
+                max_hello = entry.hello_count;
+            }
+            if (entry.open_conns > max_open)
+            {
+                max_open = entry.open_conns;
+            }
 
             /* --- connection rate (windowed) --- */
-            if (thresholds_.connection_rate > 0 &&
-                entry.syn_count >= thresholds_.connection_rate) {
+            if (thresholds_.connection_rate > 0 && entry.syn_count >= thresholds_.connection_rate)
+            {
                 seen_rate[key] = entry.window_start_ns;
                 const auto prev = reported_rate_.find(key);
-                if (prev == reported_rate_.end() || prev->second != entry.window_start_ns) {
-                    ConnRateEvent evt;
-                    evt.meta.remote_ip_v4 = key;
-                    evt.meta.source_ip    = describe(key);
-                    evt.meta.timestamp_ns = now_ns;
-                    evt.attempts_in_window = entry.syn_count;
-                    evt.window_seconds     = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
-                    evt.threshold          = thresholds_.connection_rate;
-                    if (auto v = kConnRateRule.evaluate(evt)) {
+                if (prev == reported_rate_.end() || prev->second != entry.window_start_ns)
+                {
+                    EventMeta meta;
+                    meta.remote_ip_v4 = key;
+                    meta.source_ip    = describe(key);
+                    meta.timestamp_ns = now_ns;
+                    const ConnRateEvent evt(meta, entry.syn_count,
+                                             HTTPS_GUARD_CONN_RATE_WINDOW_SEC,
+                                             thresholds_.connection_rate);
+                    if (auto v = kConnRateRule.evaluate(evt))
+                    {
                         dispatchVerdict(evt.meta, *v, ctx);
                     }
                 }
             }
 
             /* --- renegotiation storm (windowed) --- */
-            if (thresholds_.handshakes > 0 &&
-                entry.hello_count >= thresholds_.handshakes) {
+            if (thresholds_.handshakes > 0 && entry.hello_count >= thresholds_.handshakes)
+            {
                 seen_reneg[key] = entry.window_start_ns;
                 const auto prev = reported_reneg_.find(key);
-                if (prev == reported_reneg_.end() || prev->second != entry.window_start_ns) {
-                    RenegotiationEvent evt;
-                    evt.meta.remote_ip_v4 = key;
-                    evt.meta.source_ip    = describe(key);
-                    evt.meta.timestamp_ns = now_ns;
-                    evt.handshakes_in_window = entry.hello_count;
-                    evt.window_seconds       = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
-                    evt.threshold            = thresholds_.handshakes;
-                    if (auto v = kRenegotiationRule.evaluate(evt)) {
+                if (prev == reported_reneg_.end() || prev->second != entry.window_start_ns)
+                {
+                    EventMeta meta;
+                    meta.remote_ip_v4 = key;
+                    meta.source_ip    = describe(key);
+                    meta.timestamp_ns = now_ns;
+                    const RenegotiationEvent evt(meta, entry.hello_count,
+                                                  HTTPS_GUARD_CONN_RATE_WINDOW_SEC,
+                                                  thresholds_.handshakes);
+                    if (auto v = kRenegotiationRule.evaluate(evt))
+                    {
                         dispatchVerdict(evt.meta, *v, ctx);
                     }
                 }
@@ -159,18 +177,20 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
              * connections is still a problem, but logging it every sweep
              * would bury everything else. */
             if (thresholds_.open_conns > 0 && entry.open_conns > 0 &&
-                static_cast<std::uint32_t>(entry.open_conns) >= thresholds_.open_conns) {
+                static_cast<std::uint32_t>(entry.open_conns) >= thresholds_.open_conns)
+            {
                 const auto level = static_cast<std::uint32_t>(entry.open_conns);
                 seen_open[key] = level;
                 const auto prev = reported_open_.find(key);
-                if (prev == reported_open_.end() || level > prev->second) {
-                    SlowlorisEvent evt;
-                    evt.meta.remote_ip_v4 = key;
-                    evt.meta.source_ip    = describe(key);
-                    evt.meta.timestamp_ns = now_ns;
-                    evt.open_connections  = level;
-                    evt.threshold         = thresholds_.open_conns;
-                    if (auto v = kSlowlorisRule.evaluate(evt)) {
+                if (prev == reported_open_.end() || level > prev->second)
+                {
+                    EventMeta meta;
+                    meta.remote_ip_v4 = key;
+                    meta.source_ip    = describe(key);
+                    meta.timestamp_ns = now_ns;
+                    const SlowlorisEvent evt(meta, level, thresholds_.open_conns);
+                    if (auto v = kSlowlorisRule.evaluate(evt))
+                    {
                         dispatchVerdict(evt.meta, *v, ctx);
                     }
                 }
@@ -180,9 +200,11 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
         have_key = bpf_map_get_next_key(map_fd_, &key, &next_key) == 0;
     }
 
-    if (entries_seen > 0) {
+    if (entries_seen > 0)
+    {
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_report_ >= std::chrono::seconds(10)) {
+        if (now - last_report_ >= std::chrono::seconds(10))
+        {
             last_report_ = now;
             std::cout << "https_guard: per-source counters: " << entries_seen
                       << " source(s); busiest " << max_syn << " attempts, "

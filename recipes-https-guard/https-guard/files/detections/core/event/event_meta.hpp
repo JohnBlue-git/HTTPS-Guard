@@ -82,11 +82,13 @@ struct EventMeta {
      */
     bool ensurePeerResolved() const noexcept
     {
-        if (peer_attempted_) {
+        if (peer_attempted_)
+        {
             return peer_ok_;
         }
         peer_attempted_ = true;
-        if (peer_resolver != nullptr) {
+        if (peer_resolver != nullptr)
+        {
             peer_ok_ = peer_resolver->resolvePeer(const_cast<EventMeta&>(*this));
         }
         return peer_ok_;

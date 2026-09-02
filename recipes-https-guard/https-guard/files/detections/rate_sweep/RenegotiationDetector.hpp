@@ -21,7 +21,8 @@ class RenegotiationDetector {
 public:
     std::optional<Verdict> evaluate(const RenegotiationEvent& evt) const
     {
-        if (evt.threshold == 0 || evt.handshakes_in_window < evt.threshold) {
+        if (evt.threshold == 0 || evt.handshakes_in_window < evt.threshold)
+        {
             return std::nullopt;
         }
 

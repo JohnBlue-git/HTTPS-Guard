@@ -27,7 +27,8 @@ inline std::string resolveRealExePath(std::uint32_t pid)
     std::array<char, 256> buf{};
     const std::string proc_exe = "/proc/" + std::to_string(pid) + "/exe";
     const ssize_t len = readlink(proc_exe.c_str(), buf.data(), buf.size() - 1);
-    if (len <= 0) {
+    if (len <= 0)
+    {
         return {};  // process likely exited already; nothing to resolve
     }
     return std::string(buf.data(), static_cast<std::size_t>(len));
@@ -63,7 +64,8 @@ public:
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
     {
-        if (data == nullptr || size < sizeof(RawT)) {
+        if (data == nullptr || size < sizeof(RawT))
+        {
             return std::nullopt;
         }
         const auto* raw = static_cast<const RawT*>(data);
@@ -72,20 +74,17 @@ public:
         /* No connection tuple and no resolver: a file open has neither, which
          * is also why this detection's verdict is not actionable. */
 
-        CertAccessEvent evt;
-        evt.meta          = meta;
-        evt.cgroup_id     = raw->cert.cgroup_id;
-        evt.shadow_mode   = (raw->cert.shadow_mode != 0);
-        evt.real_exe_path = detail::resolveRealExePath(raw->hdr.pid);
-
         // The real check: the kernel-backed /proc/<pid>/exe resolution, not the
         // BPF hook's own comm-based pre-check (raw->cert.comm_mismatch), which
         // exists only to give the (never-enabled) shadow-mode enforcement branch
         // something real to gate on. The two can disagree, and only this one is
         // worth acting on.
-        evt.identity_mismatch =
+        std::string real_exe_path = detail::resolveRealExePath(raw->hdr.pid);
+        const bool  identity_mismatch =
             std::find(allowed_exes_.begin(), allowed_exes_.end(),
-                      evt.real_exe_path) == allowed_exes_.end();
+                      real_exe_path) == allowed_exes_.end();
+
+        const CertAccessEvent evt(meta, *raw, std::move(real_exe_path), identity_mismatch);
 
         return rule_.evaluate(evt);
     }

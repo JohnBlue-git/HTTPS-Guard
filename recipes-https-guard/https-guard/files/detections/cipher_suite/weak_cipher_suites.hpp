@@ -70,8 +70,10 @@ inline constexpr WeakCipherSuite kWeakCipherSuites[] = {
 /** Returns the matching table entry, or nullptr if `code` isn't known-weak. */
 inline const WeakCipherSuite* findWeakCipherSuite(uint16_t code)
 {
-    for (const auto& entry : kWeakCipherSuites) {
-        if (entry.code == code) {
+    for (const auto& entry : kWeakCipherSuites)
+    {
+        if (entry.code == code)
+        {
             return &entry;
         }
     }

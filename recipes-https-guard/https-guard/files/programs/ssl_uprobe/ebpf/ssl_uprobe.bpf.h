@@ -95,7 +95,8 @@ read_tls_version(const void *ssl)
     __u32 version_raw = 0;
 
     if (bpf_probe_read_user(&version_raw, sizeof(version_raw),
-                            (const void *)((uintptr_t)ssl + SSL_VERSION_OFFSET)) == 0) {
+                            (const void *)((uintptr_t)ssl + SSL_VERSION_OFFSET)) == 0)
+    {
         return (__u16)(version_raw & 0xFFFF);
     }
     return 0;
@@ -115,7 +116,9 @@ int https_guard_ssl_write(struct pt_regs *ctx)
     int num = (int)PT_REGS_PARM3(ctx);
 
     if (num <= 0 || !buf || !ssl)
+    {
         return 0;
+    }
 
     // Would output to /sys/kernel/debug/tracing/trace_pipe
     bpf_printk("https_guard: SSL_write hit pid=%d num=%d\n",
@@ -125,7 +128,9 @@ int https_guard_ssl_write(struct pt_regs *ctx)
 
     evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
     if (!evt)
+    {
         return 0;
+    }
 
     __builtin_memset(evt, 0, sizeof(*evt));
     fill_uprobe_event_fields(evt, HG_UPROBE_DIR_WRITE);
@@ -186,7 +191,9 @@ int https_guard_ssl_read_entry(struct pt_regs *ctx)
     };
 
     if (!args.ssl || !args.buf)
+    {
         return 0;
+    }
 
     bpf_map_update_elem(&https_guard_ssl_read_args_map, &pid_tgid, &args, BPF_ANY);
     return 0;
@@ -200,7 +207,9 @@ int https_guard_ssl_read_exit(struct pt_regs *ctx)
         bpf_map_lookup_elem(&https_guard_ssl_read_args_map, &pid_tgid);
 
     if (!args)
+    {
         return 0;
+    }
 
     /* SSL_read's return value is the number of bytes actually read, or
      * <= 0 on error/no data — nothing genuinely arrived in that case. */
@@ -211,7 +220,9 @@ int https_guard_ssl_read_exit(struct pt_regs *ctx)
     bpf_map_delete_elem(&https_guard_ssl_read_args_map, &pid_tgid);
 
     if (num_read <= 0)
+    {
         return 0;
+    }
 
     bpf_printk("https_guard: SSL_read hit pid=%d num_read=%d\n",
                pid_tgid >> 32, num_read);
@@ -220,7 +231,9 @@ int https_guard_ssl_read_exit(struct pt_regs *ctx)
 
     evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
     if (!evt)
+    {
         return 0;
+    }
 
     __builtin_memset(evt, 0, sizeof(*evt));
     fill_uprobe_event_fields(evt, HG_UPROBE_DIR_READ);

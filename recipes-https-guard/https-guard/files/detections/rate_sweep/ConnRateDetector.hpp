@@ -32,7 +32,8 @@ public:
         // The sweeper only synthesises an event once a window is already over
         // the threshold, but re-check rather than trust the caller: this class
         // is what the tests exercise, and it should be correct alone.
-        if (evt.threshold == 0 || evt.attempts_in_window < evt.threshold) {
+        if (evt.threshold == 0 || evt.attempts_in_window < evt.threshold)
+        {
             return std::nullopt;
         }
 

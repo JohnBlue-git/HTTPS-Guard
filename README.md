@@ -5,6 +5,7 @@ HTTPS-Guard is an eBPF-based network security observability and enforcement tool
 ## Table of Contents
 
 - [What is HTTPS-Guard?](#what-is-https-guard)
+  - [How this compares to Falco and Tetragon](#how-this-compares-to-falco-and-tetragon)
 - [Architecture Overview](#architecture-overview)
 - [Source Code Structure](#source-code-structure)
 - [Building HTTPS-Guard](#building-https-guard)
@@ -38,6 +39,39 @@ HTTPS-Guard provides real-time network security monitoring for OpenBMC systems b
 - **Pattern detection** - SQL injection, path traversal, and other attack signatures
 - **Zero-configuration fallback** - Gracefully degrades on platforms without XDP support
 - **Redfish EventService** - Native integration with OpenBMC event infrastructure
+
+### How this compares to Falco and Tetragon
+
+HTTPS-Guard sits in the same eBPF-based-security family as [Falco](https://falco.org/)
+(CNCF) and [Tetragon](https://tetragon.io/) (Cilium/Isovalent), but it isn't a
+smaller version of either — it solves a narrower problem, on purpose:
+
+| | Falco | Tetragon | HTTPS-Guard |
+|---|---|---|---|
+| **What it watches** | Linux syscalls (kernel module or eBPF driver), extensible to other event sources (cloud audit logs, Kubernetes audit, etc.) via plugins | Kernel *and* userspace events via kprobes, uprobes, tracepoints, LSM hooks, USDTs | One userspace library's plaintext I/O (`SSL_write`/`SSL_read`, via uprobe) plus the wire itself (XDP) — nothing else on the host |
+| **Protocol awareness** | None — rules match generic syscall/event fields | None — generic kernel-event fields, not a specific application protocol | Parses TLS `ClientHello` fields itself (`legacy_version`, cipher suites, SNI) and matches attack signatures against decrypted HTTP payload |
+| **Rule definition** | YAML rules engine | `TracingPolicy` custom resources (Kubernetes-native) | Fixed, compiled C++ classes — one per rule, no rule language, no runtime reconfiguration |
+| **Enforcement** | None built in — alerting/output only; a separate project (Falcosidekick, or a response engine like Falco Talon) turns an alert into an action | Synchronous, in-kernel block/kill — closes the gap between detection and action, avoiding TOCTOU races | Two-tier and asynchronous by design: classification runs in userspace off the hot path, then updates a BPF blocklist map that is checked synchronously on every later packet, and optionally tears down the one offending TCP connection via `SOCK_DESTROY` |
+| **Target environment** | General Linux hosts, containers, cloud, Kubernetes clusters | Kubernetes-aware container/host security | One fixed embedded daemon (`bmcweb`) on a resource-constrained BMC (~1GB RAM, ARM32), no Kubernetes |
+| **What's being protected** | Any workload on the host or cluster | Any workload on the host or cluster | One network surface: the Redfish API on port 443 |
+
+The trade-off is deliberate: **the one thing HTTPS-Guard does — understand TLS
+and HTTP well enough to catch a weak cipher offer or a SQL-injection payload —
+neither Falco nor Tetragon does out of the box**, because neither parses
+application protocols; they see "a `write()` syscall happened" or "a process
+executed," not "this `ClientHello`'s cipher list is weak." The cost is the
+flip side: HTTPS-Guard cannot express "alert if a shell spawns in this
+container" the way Falco can, has no dynamic rule language, and enforces
+asynchronously rather than in-kernel-synchronously like Tetragon — a choice
+made because a mistuned *synchronous* threshold on a resource-constrained BMC
+risks dropping legitimate traffic at line rate with nothing in the loop to
+catch it (see `detections/DESIGN.md` and `detections/CLAUDE.md`'s "Why some
+rules enforce and others only alert").
+
+*(Falco and Tetragon are both under active development — verify current
+capabilities against [falco.org](https://falco.org/) and
+[tetragon.io](https://tetragon.io/) rather than treating this table as a
+complete or permanent feature list.)*
 
 ## Architecture Overview
 
@@ -409,9 +443,15 @@ Note: `MessageId` uses exactly 4 dot-separated fields (`RegistryName.Major.Minor
 
 ### Event Message IDs
 
-All nine, and which detection rule emits each. "Enforces" means the verdict is
-`actionable`, which triggers the blocklist and — where a full 4-tuple is known —
-a TCP teardown. See [Which rules enforce, and why that matters](#which-rules-enforce-and-why-that-matters).
+All nine, and which detection rule emits each. **"Enforces" means the
+verdict's `actionable` field is true** — the same switch `detections/CLAUDE.md`
+calls `actionable` in code. Setting it blocklists the source address (every
+port, not just 443, for the configured TTL — see the warning below) and, where
+a full 4-tuple is known, additionally tears down that exact TCP connection.
+See [Which rules enforce, and why that matters](#which-rules-enforce-and-why-that-matters)
+for which rules do this and why, and
+[Enforcing a rule against yourself will lock you out](#enforcing-a-rule-against-yourself-will-lock-you-out)
+for what it costs if you trigger one from your own admin host.
 
 | Message ID (`OemSecurityEvent.1.0.` +) | Severity | Emitted by | Fed by | Enforces |
 |---|---|---|---|---|

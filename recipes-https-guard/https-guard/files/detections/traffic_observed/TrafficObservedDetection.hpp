@@ -42,20 +42,25 @@ public:
     std::optional<Verdict> inspect(const void* data, std::size_t size,
                                    EventMeta& meta) const override
     {
-        if (data == nullptr || size < sizeof(RawT)) {
+        if (data == nullptr || size < sizeof(RawT))
+        {
             return std::nullopt;
         }
         const auto* raw = static_cast<const RawT*>(data);
 
         fillEnvelope(*raw, meta);
-        if constexpr (HasConnectionTuple<RawT>) {
+        if constexpr (HasConnectionTuple<RawT>)
+        {
             fillConnection(raw->conn, meta);
-        } else {
+        }
+        else
+        {
             meta.peer_resolver = resolver_;
         }
 
         std::string tls_desc = "n/a";
-        if constexpr (HasTlsFields<RawT>) {
+        if constexpr (HasTlsFields<RawT>)
+        {
             tls_desc = TlsVersion(raw->tls.version).toString();
         }
 

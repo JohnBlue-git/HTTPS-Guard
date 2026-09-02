@@ -52,7 +52,8 @@ bool attachOneUprobe(bpf_object* obj, std::vector<bpf_link*>& links,
                       const std::string& lib_path, bool retprobe) noexcept
 {
     bpf_program* prog = bpf_object__find_program_by_name(obj, bpf_prog_name);
-    if (!prog) {
+    if (!prog)
+    {
         std::cerr << "https_guard: uprobe program '" << bpf_prog_name
                   << "' not found in BPF object\n";
         return false;
@@ -64,7 +65,8 @@ bool attachOneUprobe(bpf_object* obj, std::vector<bpf_link*>& links,
     opts.func_name = target_func;
 
     bpf_link* link = bpf_program__attach_uprobe_opts(prog, -1, lib_path.c_str(), 0, &opts);
-    if (!link || libbpf_get_error(link)) {
+    if (!link || libbpf_get_error(link))
+    {
         int err = libbpf_get_error(link);
         std::cerr << "https_guard: failed to attach " << target_func
                   << (retprobe ? " (return)" : "") << " uprobe at '"
@@ -96,7 +98,8 @@ bool SslUprobeProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) no
         obj, links, "https_guard_ssl_read_entry", "SSL_read", openssl_lib_path_, false);
     const bool have_read_exit = attachOneUprobe(
         obj, links, "https_guard_ssl_read_exit", "SSL_read", openssl_lib_path_, true);
-    if (!have_read_entry || !have_read_exit) {
+    if (!have_read_entry || !have_read_exit)
+    {
         std::cerr << "https_guard: SSL_read mirror did not fully attach"
                      " (non-fatal, SSL_write detection is unaffected)\n";
     }
@@ -122,7 +125,8 @@ bool SslUprobeProgram::resolvePeer(EventMeta& meta) const noexcept
      * uprobe events for the same pid, and the underlying /proc content is
      * namespace-wide and byte-identical between them. */
     const auto peer = ProcPeerResolver::resolveEstablishedPeerCached(static_cast<pid_t>(meta.pid));
-    if (!peer.resolved) {
+    if (!peer.resolved)
+    {
         std::cerr << "https_guard: PID " << meta.pid << " (" << meta.process
                   << "): peer unresolved (" << peer.reason
                   << "); enforcement will be skipped for this event\n";
