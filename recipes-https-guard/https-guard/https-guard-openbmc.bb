@@ -134,26 +134,22 @@ SRC_URI = " \
     file://detections/cipher_suite/DESIGN.md \
     file://detections/sni/DESIGN.md \
     file://detections/cert_access/DESIGN.md \
-    file://detections/conn_rate/DESIGN.md \
-    file://detections/slowloris/DESIGN.md \
-    file://detections/renegotiation/DESIGN.md \
+    file://detections/rate_sweep/DESIGN.md \
     file://detections/core/event/event_meta.hpp \
     file://detections/core/engine/dispatch.hpp \
     file://detections/core/engine/dispatch.cpp \
-    file://detections/conn_rate/rate_sources.hpp \
-    file://detections/conn_rate/rate_sources.cpp \
     file://detections/tls_version/TlsVersionDetector.hpp \
     file://detections/core/event/tls_version.hpp \
     file://detections/payload_anomaly/PayloadAnomalyDetector.hpp \
     file://detections/cert_access/CertAccessDetector.hpp \
-    file://detections/conn_rate/ConnRateEvent.hpp \
-    file://detections/conn_rate/ConnRateDetector.hpp \
-    file://detections/conn_rate/ConnRateSweeper.hpp \
-    file://detections/conn_rate/ConnRateSweeper.cpp \
-    file://detections/slowloris/SlowlorisEvent.hpp \
-    file://detections/slowloris/SlowlorisDetector.hpp \
-    file://detections/renegotiation/RenegotiationEvent.hpp \
-    file://detections/renegotiation/RenegotiationDetector.hpp \
+    file://detections/rate_sweep/ConnRateEvent.hpp \
+    file://detections/rate_sweep/ConnRateDetector.hpp \
+    file://detections/core/sweep/ConnRateSweeper.hpp \
+    file://detections/core/sweep/ConnRateSweeper.cpp \
+    file://detections/rate_sweep/SlowlorisEvent.hpp \
+    file://detections/rate_sweep/SlowlorisDetector.hpp \
+    file://detections/rate_sweep/RenegotiationEvent.hpp \
+    file://detections/rate_sweep/RenegotiationDetector.hpp \
     file://detections/cipher_suite/CipherSuiteDetector.hpp \
     file://detections/cipher_suite/weak_cipher_suites.hpp \
     file://detections/sni/SniDetector.hpp \

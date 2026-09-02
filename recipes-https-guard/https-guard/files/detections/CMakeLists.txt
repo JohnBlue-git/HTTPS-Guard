@@ -25,33 +25,38 @@
 add_library(detections_lib OBJECT
     core/engine/DetectLoop.cpp
     core/engine/dispatch.cpp
-    conn_rate/ConnRateSweeper.cpp
-    conn_rate/rate_sources.cpp
+    core/sweep/ConnRateSweeper.cpp
 )
 
 target_include_directories(detections_lib
     PUBLIC
-    # core/ is grouped by duty. Three directories, and the split is the point:
+    # core/ is grouped by duty. Four directories, and the split is the point:
     #   contract/  what a detection must provide  (IDetection, Verdict, traits)
     #   event/     the vocabulary they all speak  (EventMeta, the envelope parse)
-    #   engine/    what drives the pipeline       (DetectLoop, dispatch)
+    #   engine/    what drives the pipeline        (DetectLoop, dispatch)
+    #   sweep/     ConnRateSweeper -- timer-driven, evaluates + dispatches the
+    #              rate_sweep/ rules directly, the way engine/ drives IDetection
     # Includes stay unqualified, matching the rest of the tree, so moving a file
     # between them does not touch a single #include.
     ${CMAKE_CURRENT_SOURCE_DIR}/core/contract
     ${CMAKE_CURRENT_SOURCE_DIR}/core/event
     ${CMAKE_CURRENT_SOURCE_DIR}/core/engine
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/sweep
     ${CMAKE_CURRENT_SOURCE_DIR}/traffic_observed
     # Every classification rule lives here, one directory per rule family,
     # whether or not a given rule happens to apply to only one hook today.
     # Placement does not depend on which hook feeds it -- see CLAUDE.md.
+    # rate_sweep/ is the one family directory that holds three rules
+    # (connection-rate, Slowloris, renegotiation storm) rather than one: all
+    # three are read from a single BPF counter map by the one ConnRateSweeper
+    # in core/sweep/, so they share a family directory the way the map
+    # shares one sweeper.
     ${CMAKE_CURRENT_SOURCE_DIR}/tls_version
     ${CMAKE_CURRENT_SOURCE_DIR}/payload_anomaly
     ${CMAKE_CURRENT_SOURCE_DIR}/cipher_suite
     ${CMAKE_CURRENT_SOURCE_DIR}/sni
     ${CMAKE_CURRENT_SOURCE_DIR}/cert_access
-    ${CMAKE_CURRENT_SOURCE_DIR}/conn_rate
-    ${CMAKE_CURRENT_SOURCE_DIR}/slowloris
-    ${CMAKE_CURRENT_SOURCE_DIR}/renegotiation
+    ${CMAKE_CURRENT_SOURCE_DIR}/rate_sweep
     # The raw <hook>_event.h structs are the BPF<->userspace WIRE FORMAT, not
     # code: plain C, no libbpf, compiled by both sides. Parsing them is part of
     # deciding what an event means, so it lives here -- which means these paths

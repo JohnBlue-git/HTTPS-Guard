@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <optional>
 #include <string>
 #include <iostream>
 
@@ -9,6 +10,9 @@
 
 #include "ConnRateSweeper.hpp"
 #include "conn_rate.bpf.h"
+#include "ConnRateDetector.hpp"
+#include "SlowlorisDetector.hpp"
+#include "RenegotiationDetector.hpp"
 
 namespace https_guard {
 
@@ -59,11 +63,19 @@ ConnRateSweeper::ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept
               << "/" << HTTPS_GUARD_CONN_RATE_WINDOW_SEC << "s; 0 = rule off)\n";
 }
 
-void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
+boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
 {
     if (!enabled()) {
-        return;
+        co_return;
     }
+
+    /* One rule instance per family, reused across sweeps and sources -- same
+     * as the per-source handlers this replaced (`static const XDetector rule`
+     * in each), just inlined: each rule's `evaluate()` is stateless, so there
+     * is nothing to gain from a fresh instance per event. */
+    static const ConnRateDetector      kConnRateRule;
+    static const SlowlorisDetector     kSlowlorisRule;
+    static const RenegotiationDetector kRenegotiationRule;
 
     /* Iterate with get_next_key rather than holding any lock: entries may be
      * inserted or LRU-evicted underneath this walk, which is fine -- a missed
@@ -117,7 +129,9 @@ void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
                     evt.attempts_in_window = entry.syn_count;
                     evt.window_seconds     = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
                     evt.threshold          = thresholds_.connection_rate;
-                    handleConnRateEvent(evt, ctx);
+                    if (auto v = kConnRateRule.evaluate(evt)) {
+                        dispatchVerdict(evt.meta, *v, ctx);
+                    }
                 }
             }
 
@@ -134,7 +148,9 @@ void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
                     evt.handshakes_in_window = entry.hello_count;
                     evt.window_seconds       = HTTPS_GUARD_CONN_RATE_WINDOW_SEC;
                     evt.threshold            = thresholds_.handshakes;
-                    handleRenegotiationEvent(evt, ctx);
+                    if (auto v = kRenegotiationRule.evaluate(evt)) {
+                        dispatchVerdict(evt.meta, *v, ctx);
+                    }
                 }
             }
 
@@ -154,7 +170,9 @@ void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
                     evt.meta.timestamp_ns = now_ns;
                     evt.open_connections  = level;
                     evt.threshold         = thresholds_.open_conns;
-                    handleSlowlorisEvent(evt, ctx);
+                    if (auto v = kSlowlorisRule.evaluate(evt)) {
+                        dispatchVerdict(evt.meta, *v, ctx);
+                    }
                 }
             }
         }
@@ -178,6 +196,8 @@ void ConnRateSweeper::sweep(const DispatchContext& ctx) noexcept
     reported_rate_  = std::move(seen_rate);
     reported_reneg_ = std::move(seen_reneg);
     reported_open_  = std::move(seen_open);
+
+    co_return;
 }
 
 }  // namespace https_guard

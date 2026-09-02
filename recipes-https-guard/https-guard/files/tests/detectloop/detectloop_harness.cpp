@@ -20,7 +20,6 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include "DetectLoop.hpp"
-#include "rate_sources.hpp"
 #include "dispatch.hpp"
 #include "log/LogAction.hpp"
 #include "blocklist/BlocklistAction.hpp"
@@ -67,17 +66,14 @@ void dispatchVerdict(const EventMeta&, const Verdict& v, const DispatchContext&)
 }
 }  // namespace https_guard
 
-/* ConnRateSweeper's three classification collaborators. Stubbed for the same
- * reason ActionLoop is: this harness is about the loop's scheduling, and the
- * rules are covered by tests/test_detectors.cpp. Counting the calls also lets
- * the sweep-cadence check below observe sweeps that found nothing. */
-namespace https_guard {
-void handleConnRateEvent(const ConnRateEvent&, const DispatchContext&) {}
-void handleSlowlorisEvent(const SlowlorisEvent&, const DispatchContext&) {}
-void handleRenegotiationEvent(const RenegotiationEvent&, const DispatchContext&) {}
-}  // namespace https_guard
-
-/* ConnRateSweeper's only two libbpf calls. Recording the timestamp of each
+/* ConnRateSweeper's rate/Slowloris/renegotiation rules are no longer behind a
+ * per-source handler to stub here: sweep() evaluates each one and calls
+ * dispatchVerdict() directly (stubbed above), so the real, header-only rule
+ * classes compile and run for real against whatever bpf_map_lookup_elem()
+ * below returns -- covered in depth by tests/test_detectors.cpp, exercised
+ * here only incidentally by the sweep-cadence check.
+ *
+ * ConnRateSweeper's only two libbpf calls. Recording the timestamp of each
  * sweep's first call is how sweep cadence is observed. */
 static std::mutex              g_sweep_mu;
 static std::vector<clk::time_point> g_sweeps;

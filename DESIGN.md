@@ -49,7 +49,7 @@ files/
 ├── detections/                             # Classify — event types, parsing, rules, engine. No libbpf.
 │   ├── CMakeLists.txt                      # detections_lib (OBJECT) + the detect_runner binary
 │   ├── DESIGN.md                           # The pipeline: DetectLoop, admission, threading
-│   ├── core/                               # Grouped by duty: contract / event / engine
+│   ├── core/                               # Grouped by duty: contract / event / engine / sweep
 │   │   ├── contract/                       #   what a detection must provide
 │   │   │   ├── IDetection.hpp              #     inspect(data, size, meta) -> optional<Verdict>
 │   │   │   ├── Verdict.hpp                 #     {severity, message_id, message, actionable}
@@ -60,18 +60,18 @@ files/
 │   │   │   ├── event_meta_from.hpp         #     the shared envelope parse, in exactly one place
 │   │   │   ├── IPeerResolver.hpp           #     lazy /proc resolution; only the enforcing path pays
 │   │   │   └── tls_version.hpp             #     a wire version code -> a display string
-│   │   ├── engine/                         #   what drives the pipeline
+│   │   ├── engine/                         #   what drives the record path
 │   │   │   ├── DetectLoop.{hpp,cpp}        #     singleton, asio, walks a submitted detection list
 │   │   │   └── dispatch.{hpp,cpp}          #     the shared tail: enforce if actionable, then log
+│   │   ├── sweep/                          #   what drives the counter path
+│   │   │   └── ConnRateSweeper.{hpp,cpp}   #     timer-driven: sweeps BPF counters, evaluates + dispatches the 3 rate_sweep/ rules
 │   │   └── main.cpp                        #   detect_runner — standalone runner for the loop
 │   ├── tls_version/                        # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
 │   ├── payload_anomaly/                    # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
 │   ├── cipher_suite/                       # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
 │   ├── sni/                                # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
 │   ├── cert_access/                        # event + rule + IDetection + DESIGN.md  (LSM)
-│   ├── conn_rate/                          # rule + event + ConnRateSweeper + rate_sources + DESIGN.md
-│   ├── slowloris/                          # rule + event + DESIGN.md
-│   ├── renegotiation/                      # rule + event + DESIGN.md
+│   ├── rate_sweep/                         # 3 rules + events + DESIGN.md: conn rate, Slowloris, renegotiation storm
 │   └── traffic_observed/                   # the always-matching terminal entry + DESIGN.md
 ├── actions/                                # Dispatch
 │   ├── CMakeLists.txt                      # actions_lib (OBJECT) + the action_runner binary
@@ -387,11 +387,13 @@ HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──
                      │                                    │
 ════════════ thread boundary ═════════════════════════════ │ ════════════
                      ▼                                    ▼
-   DetectLoop::handleRecord() ── io_context ──  steady_timer, every 2s:
-     (on record_strand_: serialized,             ConnRateSweeper reads the
-      arrival order preserved)                   counters and calls the three
-                     │                           typed rate handlers directly.
-                     │                           NOT on the strand, so a record
+   DetectLoop::handleRecord() ── io_context ──  steady_timer, every 2s,
+     (on record_strand_: serialized,             co_spawn()s sweepRates():
+      arrival order preserved)                   ConnRateSweeper reads the
+                     │                           counters, evaluates each of
+                     │                           the 3 rate_sweep/ rules and
+                     │                           dispatches directly. NOT on
+                     │                           the strand, so a record
                      │                           backlog cannot delay it.
                      ▼                                    │
         fan out rec.detections concurrently, gather in order ◄──┘

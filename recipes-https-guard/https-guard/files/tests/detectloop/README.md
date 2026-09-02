@@ -22,8 +22,10 @@ and `nlohmann/json`, and `ConnRateSweeper.cpp` calls libbpf.
 So this harness replaces the collaborators at **link time** — `ActionLoop`,
 the three actions and libbpf's two map calls are defined in the harness itself
 — and only `DetectLoop.cpp` and `ConnRateSweeper.cpp` are compiled from real
-source. Recording the timestamp of each `bpf_map_get_next_key(fd, nullptr, …)`
-is how sweep cadence is observed.
+source (as is `rate_sweep/`'s three rule headers, which `ConnRateSweeper.cpp`
+now calls directly — they're header-only and pull in no kernel dependency, so
+nothing about them needs stubbing). Recording the timestamp of each
+`bpf_map_get_next_key(fd, nullptr, …)` is how sweep cadence is observed.
 
 ## Building it
 
@@ -38,11 +40,11 @@ mkdir -p /tmp/hginc && cp -r "$SR/nlohmann" "$SR/bpf" /tmp/hginc/
 cd recipes-https-guard/https-guard/files
 g++ -std=c++20 -g -O1 -fsanitize=address,undefined -DBOOST_ERROR_CODE_HEADER_ONLY \
     -I/tmp/hginc \
-    -Idetections/core -Idetections/tls_version -Idetections/conn_rate \
-    -Idetections/slowloris -Idetections/renegotiation \
+    -Idetections/core/contract -Idetections/core/event -Idetections/core/engine \
+    -Idetections/core/sweep -Idetections/tls_version -Idetections/rate_sweep \
     -Iactions -Iactions/core -Iactions/log -Iprograms/xdp_tls/ebpf \
     tests/detectloop/detectloop_harness.cpp \
-    detections/core/DetectLoop.cpp detections/conn_rate/ConnRateSweeper.cpp \
+    detections/core/engine/DetectLoop.cpp detections/core/sweep/ConnRateSweeper.cpp \
     -o /tmp/dl -lpthread
 /tmp/dl
 ```

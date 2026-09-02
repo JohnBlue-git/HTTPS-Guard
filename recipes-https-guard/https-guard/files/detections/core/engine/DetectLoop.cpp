@@ -372,21 +372,34 @@ asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
 }
 
 
-void DetectLoop::sweepRates() noexcept
+asio::awaitable<void> DetectLoop::sweepRates() noexcept
 {
-    if (!rate_sweeper_) {
-        return;
+    // Same per-item boundary as event processing: a throw here must cost the
+    // sweep, not the daemon. Mirrors handleRecord() catching around
+    // co_await process(rec) -- ConnRateSweeper::sweep() is not itself
+    // noexcept, for the same reason process() is not: this is the layer that
+    // catches.
+    if (rate_sweeper_) {
+        /* Named, not a temporary bound to sweep()'s const& parameter: sweep()
+         * is a coroutine, so an argument temporary here would be destroyed
+         * once this call expression finishes evaluating -- which happens
+         * before sweep()'s body actually runs, not after. process() below
+         * binds its own DispatchContext the same way for the same reason. */
+        const DispatchContext ctx{action_loop_, blocklist_ttl_, output_path_};
+        try {
+            co_await rate_sweeper_->sweep(ctx);
+        } catch (const std::exception& e) {
+            std::cerr << "https_guard: connection-rate sweep threw: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "https_guard: connection-rate sweep threw an unknown exception\n";
+        }
     }
 
-    /* Same per-item boundary as event processing: a throw here must cost the
-     * sweep, not the daemon. */
-    try {
-        rate_sweeper_->sweep(DispatchContext{action_loop_, blocklist_ttl_, output_path_});
-    } catch (const std::exception& e) {
-        std::cerr << "https_guard: connection-rate sweep threw: " << e.what() << "\n";
-    } catch (...) {
-        std::cerr << "https_guard: connection-rate sweep threw an unknown exception\n";
-    }
+    /* Re-arm only now that this sweep has actually finished -- the same
+     * "serial: the next wait starts only now" guarantee the old synchronous
+     * sweepRates(); armSweepTimer(); pair gave, expressed here as continuing
+     * the coroutine rather than returning from a plain function call. */
+    armSweepTimer();
 }
 
 void DetectLoop::armSweepTimer() noexcept
@@ -401,8 +414,19 @@ void DetectLoop::armSweepTimer() noexcept
             if (ec || stop_.load(std::memory_order_relaxed)) {
                 return;
             }
-            sweepRates();
-            armSweepTimer();   /* serial: the next wait starts only now */
+            try {
+                /* Detached: sweepRates() re-arms the timer itself once it
+                 * completes, which is what keeps sweeps serial. */
+                asio::co_spawn(io_context_, sweepRates(), asio::detached);
+            } catch (...) {
+                /* co_spawn() allocates the coroutine frame and can throw on a
+                 * memory-starved BMC. This handler is noexcept, and nothing
+                 * ran to re-arm the timer on this path, so do it here --
+                 * skipping one interval beats losing rate detection for good. */
+                std::cerr << "https_guard: could not schedule the connection-rate "
+                             "sweep; skipping this interval\n";
+                armSweepTimer();
+            }
         });
     } catch (...) {
         /* Losing the timer loses rate detection silently, which is the exact

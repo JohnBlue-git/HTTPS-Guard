@@ -11,26 +11,26 @@ about `DetectLoop` and the shape of the pipeline around it.
 ## What DetectLoop is, and what it deliberately is not
 
 ```
-libbpf poll thread                    │  DetectLoop, 2 threads
-                                      │
-hook->ringBufferHandler()             │
+libbpf poll thread                     │  DetectLoop, 2 threads
+                                       │
+hook->ringBufferHandler()              │
   └── submit(data, size, detections_) ─┼──▶ copy bytes + pointer list
         returns immediately            │        into a queued record
-                                      │              │
+                                       │              │
 ══════════════ thread boundary ════════│══════════════▼═══════════════
-                                      │   walk the list in order:
-                                      │     detections[0]->inspect(...)
-                                      │     detections[1]->inspect(...)   ◄─ first
-                                      │     ...                              verdict
-                                      │     detections[n-1] always matches   wins
-                                      │              │
-                                      │              ▼
-                                      │   dispatchVerdict(meta, verdict, ctx)
-                                      │              │
-                                      │   ┌──────────┴──────────┐
-                                      │   ▼                     ▼
-                                      │  enforce, if the      LogAction
-                                      │  verdict says so      (always)
+                                       │   walk the list in order:
+                                       │     detections[0]->inspect(...)
+                                       │     detections[1]->inspect(...)   ◄─ first
+                                       │     ...                              verdict
+                                       │     detections[n-1] always matches   wins
+                                       │              │
+                                       │              ▼
+                                       │   dispatchVerdict(meta, verdict, ctx)
+                                       │              │
+                                       │   ┌──────────┴──────────┐
+                                       │   ▼                     ▼
+                                       │  enforce, if the      LogAction
+                                       │  verdict says so      (always)
 ```
 
 `DetectLoop` owns a queue, some threads and a timer. It does **not** know what
@@ -70,8 +70,17 @@ detection is evaluated regardless, and results are gathered back in list order,
 so the lowest-index verdict still wins exactly as the sequential loop produced.
 
 The one place this remains `post()`, deliberately, is `enableRateSweeps()`
-arming the sweep timer: that call never has anything to await, and turning it
-into a coroutine would be pure overhead with no future case to prepare for.
+arming the sweep timer *for the first time*: that one call never has anything
+to await, and turning it into a coroutine would be pure overhead with no
+future case to prepare for. Every sweep after that runs the same way the
+record path does: `armSweepTimer()`'s timer handler `co_spawn()`s
+`sweepRates()`, which `co_await`s `ConnRateSweeper::sweep()` and evaluates each
+of the three counting rules directly against its own event, dispatching its
+verdict inline — no per-rule handler function, the same shape `process()` uses
+for `IDetection::inspect()`. `sweepRates()` re-arms the timer only once that
+`co_await` returns, which is what keeps sweeps serial (see `ConnRateSweeper`'s
+own class comment for why `sweep()` is a coroutine despite nothing in it
+awaiting anything yet, same reasoning as `inspect()` above).
 
 ### Admission is bounded explicitly
 

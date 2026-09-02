@@ -10,7 +10,7 @@ rule and its `DESIGN.md`.
 
 ## Layout
 
-### `core/` — grouped by duty, three directories
+### `core/` — grouped by duty, four directories
 
 ```
 core/contract/   what a detection must provide
@@ -25,19 +25,26 @@ core/event/      the vocabulary every detection speaks
   IPeerResolver.hpp       lazy /proc tuple resolution, so only the enforcing path pays
   tls_version.hpp         TlsVersion: a wire code -> a display string
 
-core/engine/     what drives the pipeline
+core/engine/     what drives the record path
   DetectLoop.{hpp,cpp}    the loop: singleton, asio, walks a submitted list
   dispatch.{hpp,cpp}      the shared tail: enforce if actionable, then log
+
+core/sweep/      what drives the counter path
+  ConnRateSweeper.{hpp,cpp}  timer-driven: reads the BPF per-source counters,
+                             evaluates the three rate_sweep/ rules, dispatches
+                             directly — the counter-path counterpart to
+                             engine/'s record path, not a rule of its own
 
 core/main.cpp    detect_runner — a standalone runner, like action_runner
 ```
 
-Three directories rather than one flat pile of thirteen files, split by the
+Four directories rather than one flat pile of fifteen files, split by the
 question each answers: *what must I implement*, *what do I speak*, *what runs
-me*. `main.cpp` stays at the top because it belongs to none of them.
+the record path*, *what runs the counter path*. `main.cpp` stays at the top
+because it belongs to none of them.
 
 **Includes stay unqualified** (`#include "event_meta.hpp"`, not
-`"event/event_meta.hpp"`), matching the rest of the tree — all three directories
+`"event/event_meta.hpp"`), matching the rest of the tree — all four directories
 are on the include path, so moving a file between them touches no `#include`
 anywhere.
 
@@ -91,9 +98,9 @@ never fires.
 | `cipher_suite/` | weak offered suites (+ the code-point table) | XDP | **no** — alert only |
 | `sni/` | malformed SNI always; mismatch only when configured | XDP | **no** — alert only |
 | `cert_access/` | an unrecognised process opened the HTTPS key | LSM | **no** |
-| `conn_rate/` | connection attempts per source per window (+ `ConnRateSweeper`) | synthesised | yes |
-| `slowloris/` | connections held open per source | synthesised | yes |
-| `renegotiation/` | TLS handshake records per source per window | synthesised | yes |
+| `rate_sweep/` (connection rate) | connection attempts per source per window | synthesised | yes |
+| `rate_sweep/` (Slowloris) | connections held open per source | synthesised | yes |
+| `rate_sweep/` (renegotiation) | TLS handshake records per source per window | synthesised | yes |
 | `traffic_observed/` | nothing — the always-matching terminal list entry | any | no |
 
 ## Why some rules enforce and others only alert

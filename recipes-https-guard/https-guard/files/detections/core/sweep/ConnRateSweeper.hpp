@@ -6,7 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "rate_sources.hpp"
+#include <boost/asio/awaitable.hpp>
+
+#include "dispatch.hpp"
 
 namespace https_guard {
 
@@ -38,19 +40,25 @@ public:
     ConnRateSweeper(int map_fd, Thresholds thresholds) noexcept;
 
     /**
-     * Reads the counters and classifies anything over its limit, dispatching
-     * verdicts through `ctx`.
+     * Reads the counters and, for each rule that is over its limit, evaluates
+     * that rule and dispatches its verdict directly -- the same shape
+     * `DetectLoop::process()` uses for a ring-buffer record: evaluate, get an
+     * `optional<Verdict>` back, dispatch it. There is no per-rule handler
+     * function in between; each rule's `evaluate()` and the `dispatchVerdict()`
+     * call sit next to each other in the loop below.
+     *
+     * A coroutine for the same reason `process()` is: nothing here awaits
+     * today -- `bpf_map_get_next_key()`/`bpf_map_lookup_elem()` are synchronous
+     * kernel calls with no device to wait for -- but `DetectLoop` spawns this
+     * with `co_spawn()` rather than calling it directly, which keeps the sweep
+     * path's shape consistent with the record path, ready for either to grow a
+     * genuine suspension point.
      *
      * Reports each window at most once per source: a flood produces a sustained
      * overage, and re-emitting every sweep would bury the log and re-run
      * enforcement against an address already blocklisted.
-     *
-     * Dispatches directly rather than returning events, because the three rules
-     * produce three unrelated concrete types and there is no longer a common
-     * base to return them as -- which is the point: each type carries only its
-     * own counter, so no rule can read another's.
      */
-    void sweep(const DispatchContext& ctx) noexcept;
+    boost::asio::awaitable<void> sweep(const DispatchContext& ctx);
 
     bool enabled() const noexcept
     {

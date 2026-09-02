@@ -221,8 +221,9 @@ private:
     boost::asio::awaitable<void> process(const RawRecord& rec);
 
 
-    /** Reads the rate counters and classifies anything over the threshold. */
-    void sweepRates() noexcept;
+    /** Awaits ConnRateSweeper::sweep(), then re-arms the timer. Spawned by
+     *  armSweepTimer() rather than called directly, mirroring handleRecord(). */
+    boost::asio::awaitable<void> sweepRates() noexcept;
 
     /** (Re)arms the sweep timer. Only ever called from the loop's threads. */
     void armSweepTimer() noexcept;
