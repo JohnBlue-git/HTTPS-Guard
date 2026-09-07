@@ -218,7 +218,7 @@ PACKAGECONFIG:pn-https-guard-openbmc ?= "daemon event-both"
 
 | Flag | Effect |
 |------|--------|
-| `daemon` **(default)** | Enables the real `https-guardd` (uprobe + optional XDP), disables the simulator. Requires a kernel with `CONFIG_BPF`/`CONFIG_UPROBE_EVENTS` (and `CONFIG_NET_XDP` for XDP — its absence is non-fatal, the daemon runs uprobe-only). Also turns the BPF object build on, which needs a target kernel built with `CONFIG_DEBUG_INFO_BTF`. |
+| `daemon` **(default)** | Enables the real `https-guardd` (uprobe + optional XDP), disables the simulator. Requires a kernel with `CONFIG_BPF`/`CONFIG_UPROBE_EVENTS` (and `CONFIG_NET_XDP` for XDP — its absence is non-fatal, the daemon runs uprobe-only). Also turns the BPF object build on: the kernel build must emit `${STAGING_KERNEL_BUILDDIR}/vmlinux` with `CONFIG_DEBUG_INFO_BTF=y`, from which native `bpftool` generates `vmlinux.h` during the recipe build. |
 | `simulation` | Enables `simulated-event-generator` instead, disables the real daemon. No kernel eBPF/XDP support and no BPF toolchain required — the fallback for a machine whose kernel lacks BTF. |
 | `both` | Enables both, for comparing real vs. simulated events side by side. |
 

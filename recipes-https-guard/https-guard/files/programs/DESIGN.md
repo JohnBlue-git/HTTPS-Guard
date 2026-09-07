@@ -191,6 +191,34 @@ of how many hook headers get added.
 Adding a hook means one `#include` there, one class here, one line in
 `main.cpp`, and its sources in `CMakeLists.txt` and the recipe's `SRC_URI`.
 
+## Kernel structs, CO-RE reads, and userspace structs
+
+`vmlinux.h` is generated from the target kernel's BTF. It describes
+**kernel-owned types** such as `struct xdp_md`, packet headers, `struct file`,
+and `struct path`; it does not describe OpenSSL's userspace `ssl_st`, and it
+does not define this project's ring-buffer event ABI. The `*_event.h` headers
+are plain C structs shared by the BPF and C++ builds, but they are
+project-owned wire structs rather than types from `vmlinux.h`.
+
+Use this decision rule when adding a BPF read:
+
+| Data being read | Preferred form | Reason |
+|---|---|---|
+| Packet data in XDP (`ethhdr`, `iphdr`, `tcphdr`) | Direct field access after `data_end` checks | The verifier needs explicit packet bounds checks; `BPF_CORE_READ()` does not replace them and adds no useful relocation here. |
+| A trusted kernel hook argument or embedded member (`file->f_path`) | Direct field access | The hook already provides a verifier-trusted pointer, and this is the simplest and cheapest access. |
+| A relocatable kernel pointer chain whose layout may vary between kernels | `BPF_CORE_READ()` or `bpf_core_read()` | CO-RE uses kernel BTF to relocate the field path at load time. Use it when direct access cannot safely express the pointer chain, and validate it on the target kernel. |
+| A userspace pointer (`ssl_st`, `buf`) | `bpf_probe_read_user()` with a known ABI/offset | Userspace types are absent from kernel BTF, so CO-RE cannot relocate them. |
+
+`BPF_CORE_READ()` is therefore not a blanket performance optimization. It is
+an ABI-relocation helper for kernel memory. Direct field access to a
+`vmlinux.h` type can itself receive CO-RE field relocation when compiled with
+BTF debug information; the two forms are not mutually exclusive. Prefer
+direct access when the verifier already knows the pointer and the access is
+bounded; use the helper when pointer chasing or its explicit read semantics
+make it necessary. In this tree `bpf_core_read.h` is not
+needed by the current hooks, so it is intentionally not included by the BPF
+translation unit.
+
 ## The raw event ABI
 
 Each hook's `ebpf/<hook>_event.h` defines the bytes it puts on the ring buffer.

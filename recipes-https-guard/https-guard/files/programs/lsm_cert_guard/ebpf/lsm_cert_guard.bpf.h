@@ -79,6 +79,11 @@
  * having no standard library); EACCES is always 13 on Linux. */
 #define HG_EACCES 13
 
+/* struct file and struct path are kernel types supplied by vmlinux.h.
+ * file_open gives us a trusted hook argument, so direct access to the
+ * embedded f_path is preferable here; BPF_CORE_READ() is for relocatable
+ * pointer chasing, not a general replacement for every kernel field read. */
+
 const volatile bool shadow_mode = true;
 
 /* Resolves `path` to a string and compares it against `expected`

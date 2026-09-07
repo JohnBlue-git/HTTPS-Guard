@@ -202,6 +202,20 @@ EXTRA_OECMAKE += " \
 
 do_configure[depends] += "virtual/kernel:do_compile"
 
+# Build-time vmlinux.h flow:
+#   1. virtual/kernel:do_compile produces the target kernel ELF at
+#      ${STAGING_KERNEL_BUILDDIR}/vmlinux. The kernel must have
+#      CONFIG_DEBUG_INFO_BTF=y, which stores kernel BTF in that ELF. The
+#      layer's recipes-kernel/linux/bpf-kernel-config.cfg enables it.
+#   2. This task symlinks that ELF to ${WORKDIR}/target-kernel-vmlinux.
+#   3. programs/CMakeLists.txt invokes native bpftool with
+#      "btf dump file ... format c" and writes ${B}/programs/vmlinux.h.
+#   4. clang -target bpf includes that generated header when compiling the
+#      single https_guard.bpf.o object.
+# vmlinux.h is therefore a generated build artifact, not a source file or a
+# target runtime package. The target still needs CONFIG_BPF and hook-specific
+# runtime options, but it does not need bpftool installed on the BMC.
+#
 # Userspace struct access (ssl_st) does NOT use CO-RE — see the note in
 # https_guard.bpf.c and CMakeLists.txt for the rationale.
 do_configure:prepend() {
@@ -211,6 +225,7 @@ do_configure:prepend() {
 
     target_vmlinux=""
 
+    # The preferred source is the kernel artifact staged by virtual/kernel.
     if [ -f "${STAGING_KERNEL_BUILDDIR}/vmlinux" ]; then
         target_vmlinux="${STAGING_KERNEL_BUILDDIR}/vmlinux"
     else
@@ -225,6 +240,7 @@ do_configure:prepend() {
         bbfatal "Unable to locate target kernel vmlinux for CO-RE generation"
     fi
 
+    # CMake consumes this stable path; it is only an input alias, not a copy.
     ln -sf "${target_vmlinux}" "${WORKDIR}/target-kernel-vmlinux"
 
     # Pre-build gen_ssl_offset with the NATIVE (build machine) compiler.

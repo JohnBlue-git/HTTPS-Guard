@@ -37,6 +37,12 @@
  * detection logic below stays uncluttered. */
 #include "../../../actions/blocklist/blocklist.bpf.h"
 
+/* Kernel types below (xdp_md, ethhdr, iphdr and tcphdr) come from
+ * vmlinux.h. They are packet/context access types, not this project's event
+ * structs. Direct field access is intentional: data/data_end bounds checks
+ * are required by the XDP verifier and BPF_CORE_READ() would not replace
+ * those checks or improve this hot path. */
+
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
 #endif

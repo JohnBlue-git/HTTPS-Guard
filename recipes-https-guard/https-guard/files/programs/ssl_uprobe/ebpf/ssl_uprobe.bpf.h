@@ -49,13 +49,17 @@
  *   and the output buffer remains zeroed.
  *
  * CO-RE NOTE:
- *   We do NOT use bpf_core_read() for ssl_st because CO-RE relocations
+ *   We do NOT use bpf_core_read() (or BPF_CORE_READ()) for ssl_st because
+ *   CO-RE relocations
  *   require the target type to exist in the kernel's BTF — but ssl_st is a
  *   userspace struct from libssl.so, not a kernel struct.  The kernel BTF
  *   has no type ID for it, so any CO-RE relocation for ssl_st fields will
  *   fail at program load time with "invalid CO-RE relocation".  Instead we
  *   read ssl->version directly from userspace memory using
  *   bpf_probe_read_user() with the build-time offset from gen_ssl_offset.c.
+ *   ssl_st is a userspace type and is intentionally not declared in
+ *   vmlinux.h; the event structs in ssl_uprobe_event.h are this project's
+ *   BPF-to-userspace wire structs, not kernel BTF structs.
  */
 #pragma once
 

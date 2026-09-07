@@ -118,6 +118,62 @@ One `CMakeLists.txt` per top-level concern (`actions`, `detections`, `programs`,
 -ffile-prefix-map for debug info
 ```
 
+### Where `vmlinux.h` comes from
+
+`vmlinux.h` is generated during the Yocto build; it is not checked into this
+repository and it is not installed on the BMC. The input is the target kernel
+ELF produced by `virtual/kernel:do_compile`, normally:
+
+```text
+${STAGING_KERNEL_BUILDDIR}/vmlinux
+```
+
+That kernel must be built with `CONFIG_DEBUG_INFO_BTF=y` so the ELF contains
+kernel BTF metadata. The layer enables this in
+[`bpf-kernel-config.cfg`](recipes-kernel/linux/bpf-kernel-config.cfg), along
+with the runtime features needed by the daemon such as `CONFIG_BPF`,
+`CONFIG_UPROBES`/`CONFIG_UPROBE_EVENTS`, and `CONFIG_NET_XDP`.
+
+During `do_configure:prepend()`, the recipe waits for the kernel build, checks
+that staged `vmlinux` exists, and creates the build-workspace alias
+`${WORKDIR}/target-kernel-vmlinux`. CMake then runs the native build dependency
+`bpftool`:
+
+```text
+bpftool btf dump file ${WORKDIR}/target-kernel-vmlinux format c
+```
+
+The generated C declaration header is written to `${B}/programs/vmlinux.h`
+and included by `programs/core/ebpf/https_guard.bpf.c` while clang compiles
+`https_guard.bpf.o`. The BMC needs the resulting BPF object and kernel runtime
+support, but does not need `bpftool` or `vmlinux.h` at runtime.
+
+### Choosing `vmlinux.h`, direct access, and `BPF_CORE_READ`
+
+The generated `vmlinux.h` contains kernel BTF types only. It is the source of
+the kernel context and packet types used by the BPF hooks (`xdp_md`, network
+headers, `file`, and `path`); it is not the declaration source for OpenSSL's
+userspace `ssl_st` or for HTTPS-Guard's ring-buffer event structs. The latter
+are plain C wire structs in each hook's `*_event.h`, compiled identically by
+clang and the C++ side.
+
+Use direct access to a `vmlinux.h` field when the pointer is already trusted by
+the hook or when reading packet data after explicit `data_end` bounds checks.
+Direct field access can itself receive CO-RE field relocation when the BPF
+object is compiled with BTF debug information. Use `BPF_CORE_READ()` /
+`bpf_core_read()` for a kernel pointer chain that needs explicit relocatable
+reads across kernel layouts. It is not a general faster version of `->`, and
+it cannot make an unchecked XDP packet access safe. For userspace memory, use
+the appropriate `bpf_probe_read_user()` strategy and a known userspace ABI or
+generated offset; CO-RE cannot relocate a type that is absent from kernel BTF.
+
+The current hooks have no kernel pointer chain that benefits from
+`BPF_CORE_READ()`: XDP uses verifier-required packet checks, LSM reads a
+trusted `file->f_path`, and the uprobe reads OpenSSL memory. The BPF object
+therefore deliberately keeps the CO-RE header out of its include list. See
+[`programs/DESIGN.md`](recipes-https-guard/https-guard/files/programs/DESIGN.md)
+for the per-access decision table.
+
 ### gen_ssl_offset.c
 
 A build-time host tool that determines the offset of `ssl_st.version` in OpenSSL's `ssl_st` struct.

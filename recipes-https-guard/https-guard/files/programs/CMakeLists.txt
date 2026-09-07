@@ -73,6 +73,8 @@ if(HTTPS_GUARD_BUILD_BPF)
     # CMAKE_CURRENT_BINARY_DIR (which would put it under <build>/programs/
     # now that this CMakeLists.txt lives in a subdirectory).
     set(HTTPS_GUARD_BPF_OBJECT ${CMAKE_BINARY_DIR}/https_guard.bpf.o)
+    # Generated from the target kernel ELF's BTF by native bpftool. This is a
+    # build-tree header, not a checked-in source file or a target package.
     set(HTTPS_GUARD_VMLINUX_HEADER ${CMAKE_CURRENT_BINARY_DIR}/vmlinux.h)
 
     add_custom_command(
@@ -81,7 +83,7 @@ if(HTTPS_GUARD_BUILD_BPF)
         COMMAND sh -c "${HTTPS_GUARD_BPFTOOL_EXECUTABLE} btf dump file '${HTTPS_GUARD_TARGET_VMLINUX}' format c > '${HTTPS_GUARD_VMLINUX_HEADER}'"
         DEPENDS ${HTTPS_GUARD_TARGET_VMLINUX}
         VERBATIM
-        COMMENT "Generating target-kernel vmlinux.h for CO-RE"
+        COMMENT "Generating target-kernel vmlinux.h from kernel BTF"
     )
 
     # Userspace struct access (ssl_st, OpenSSL):

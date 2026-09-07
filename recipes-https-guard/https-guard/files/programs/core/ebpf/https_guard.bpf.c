@@ -17,6 +17,13 @@
  * design rationale.
  */
 
+/*
+ * vmlinux.h supplies kernel-owned types used below, such as struct xdp_md,
+ * struct ethhdr, struct iphdr, struct tcphdr, struct file and struct path.
+ * Project-owned event structs are kept in the hook headers instead; they are
+ * the BPF-to-userspace wire ABI and must not be confused with kernel BTF.
+ */
+
 /* Tell bpf_tracing.h which architecture we are targeting. */
 #if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm) && \
     !defined(__TARGET_ARCH_arm64) && !defined(__TARGET_ARCH_powerpc) && \
@@ -26,7 +33,6 @@
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
