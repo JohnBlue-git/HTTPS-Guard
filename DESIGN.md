@@ -80,11 +80,11 @@ files/
 │   ├── blocklist/                          # the BPF map XDP reads + DESIGN.md
 │   ├── tcp/                                # netlink SOCK_DESTROY + DESIGN.md
 │   └── log/                                # Redfish JSON + coroutine-safe file I/O + DESIGN.md
-└── tests/                                  # Host-only, off when cross-compiling
-    ├── test_detectors.cpp                  # All eight rules + 12 static_asserts on the concepts
-    ├── test_uprobe_parsing.cpp             # The real detections, inspect()ing synthetic raw records
-    ├── test_client_hello_parsing.cpp       # The real parse_client_hello.h against hand-built wire bytes
-    └── detectloop/                         # Separate binary — DetectLoop scheduling; see its README
+└── tests/                                  # Host-only, off when cross-compiling; see TESTS.md
+    ├── parsing/client_hello_parsing_test.cpp   # The real parse_client_hello.h against hand-built wire bytes
+    ├── detections/                          # One file per family, mirroring detections/<family>/
+    ├── core/                                # EventMeta/peer resolution + cross-detection dispatch priority
+    └── detectloop/                          # Separate binary — DetectLoop scheduling; see TESTS.md
 ```
 
 ## Build System
@@ -98,13 +98,13 @@ One `CMakeLists.txt` per top-level concern (`actions`, `detections`, `programs`,
 - BPF object compilation with clang targeting `bpf`
 - CO-RE (Compile Once - Run Everywhere) via vmlinux.h
 - Native host tool compilation (gen_ssl_offset) for OpenSSL struct offset detection
-- Automatic Boost/doctest header fetching if not available in sysroot
+- Automatic Boost/GoogleTest header fetching if not available in sysroot
 
 **Build targets:**
 - `https_guardd` - Main daemon binary (root `CMakeLists.txt`)
 - `action_runner` - Test harness for ActionLoop (`actions/CMakeLists.txt`)
 - `https_guard.bpf.o` - BPF object, when `HTTPS_GUARD_BUILD_BPF=ON` (`programs/CMakeLists.txt`)
-- `https_guard_tests` - doctest unit tests, when `HTTPS_GUARD_BUILD_TESTS=ON` (default off when cross-compiling — see `tests/CMakeLists.txt`)
+- `https_guard_tests` - GoogleTest unit tests, when `HTTPS_GUARD_BUILD_TESTS=ON` (default off when cross-compiling — see `tests/CMakeLists.txt` and `tests/TESTS.md`)
 
 **A cross-compile trap worth knowing about:** a target's default output directory mirrors the *source* subdirectory it's defined in (`CMAKE_CURRENT_BINARY_DIR`), not the top-level build root. Moving a target's `add_executable`/custom-command into a concern's own `CMakeLists.txt` silently moves its output too. Three things the BitBake recipe expects to find flat under `${B}` are pinned back to `${CMAKE_BINARY_DIR}` explicitly for this reason: `https_guard.bpf.o` (`programs/CMakeLists.txt`), `action_runner`'s `RUNTIME_OUTPUT_DIRECTORY` (`actions/CMakeLists.txt`), and `ssl_version_offset.h`'s write location in the recipe's own `do_compile:prepend()`. `https_guardd` is unaffected — its `add_executable` stays in the root `CMakeLists.txt`, where `CMAKE_CURRENT_BINARY_DIR` already equals `CMAKE_BINARY_DIR`.
 
@@ -713,7 +713,7 @@ Process calls SSL_write(ssl, buf, num)
 ```
 $ curl -sk https://<bmc>/redfish/v1 -u root:0penBmc --tlsv1.2
 ```
-still produces a `tls_version=772` (0x0304 = TLS 1.3) uprobe event, classified `OK` / `HttpsTrafficObserved`. Testing the actual TLS < 1.2 violation path requires a legacy TLS client; the unit tests in `detections/` cover that path directly against synthetic input instead (see `tests/test_detectors.cpp`).
+still produces a `tls_version=772` (0x0304 = TLS 1.3) uprobe event, classified `OK` / `HttpsTrafficObserved`. Testing the actual TLS < 1.2 violation path requires a legacy TLS client; the unit tests in `detections/` cover that path directly against synthetic input instead (see `tests/detections/tls_version_test.cpp`).
 
 ## Configuration
 

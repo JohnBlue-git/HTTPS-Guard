@@ -1,4 +1,4 @@
-#include <doctest/doctest.h>
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
@@ -173,19 +173,19 @@ std::vector<uint16_t> capturedSuites(const hg_client_hello& evt)
 
 }  // namespace
 
-TEST_CASE("ClientHello parse: extracts the offered cipher suite list")
+TEST(ClientHelloParseTest, ExtractsOfferedCipherSuiteList)
 {
     const auto evt = parse(ClientHelloBuilder()
                                .cipherSuites({0x1301, 0x1302, 0xC02F})
                                .build());
 
-    CHECK(evt.cipher_suites_offered == 3);
-    CHECK(evt.cipher_suite_count == 3);
-    CHECK(capturedSuites(evt) == std::vector<uint16_t>{0x1301, 0x1302, 0xC02F});
-    CHECK(evt.sni_malformed == 0);
+    EXPECT_EQ(evt.cipher_suites_offered, 3);
+    EXPECT_EQ(evt.cipher_suite_count, 3);
+    EXPECT_EQ(capturedSuites(evt), (std::vector<uint16_t>{0x1301, 0x1302, 0xC02F}));
+    EXPECT_EQ(evt.sni_malformed, 0);
 }
 
-TEST_CASE("ClientHello parse: a non-empty session_id shifts every later field correctly")
+TEST(ClientHelloParseTest, NonEmptySessionIdShiftsLaterFieldsCorrectly)
 {
     // Session resumption is completely normal, and getting this skip wrong
     // would silently misread the cipher suites that follow it.
@@ -195,12 +195,12 @@ TEST_CASE("ClientHello parse: a non-empty session_id shifts every later field co
                                .sni("bmc.example.com")
                                .build());
 
-    CHECK(capturedSuites(evt) == std::vector<uint16_t>{0xC030});
-    CHECK(evt.sni_present == 1);
-    CHECK(std::string(evt.sni_hostname) == "bmc.example.com");
+    EXPECT_EQ(capturedSuites(evt), (std::vector<uint16_t>{0xC030}));
+    EXPECT_EQ(evt.sni_present, 1);
+    EXPECT_EQ(std::string(evt.sni_hostname), "bmc.example.com");
 }
 
-TEST_CASE("ClientHello parse: extracts SNI past unrelated extensions")
+TEST(ClientHelloParseTest, ExtractsSniPastUnrelatedExtensions)
 {
     const auto evt = parse(ClientHelloBuilder()
                                .padExtension(0x000B, 4)   // ec_point_formats
@@ -208,31 +208,31 @@ TEST_CASE("ClientHello parse: extracts SNI past unrelated extensions")
                                .sni("johnblue")
                                .build());
 
-    CHECK(evt.sni_present == 1);
-    CHECK(std::string(evt.sni_hostname) == "johnblue");
-    CHECK(evt.sni_malformed == 0);
+    EXPECT_EQ(evt.sni_present, 1);
+    EXPECT_EQ(std::string(evt.sni_hostname), "johnblue");
+    EXPECT_EQ(evt.sni_malformed, 0);
 }
 
-TEST_CASE("ClientHello parse: no SNI extension is not an anomaly")
+TEST(ClientHelloParseTest, NoSniExtensionIsNotAnomaly)
 {
     // The overwhelmingly common case for a BMC reached by IP address.
     const auto evt = parse(ClientHelloBuilder().build());
 
-    CHECK(evt.sni_present == 0);
-    CHECK(evt.sni_malformed == 0);
-    CHECK(std::string(evt.sni_hostname).empty());
+    EXPECT_EQ(evt.sni_present, 0);
+    EXPECT_EQ(evt.sni_malformed, 0);
+    EXPECT_TRUE(std::string(evt.sni_hostname).empty());
 }
 
-TEST_CASE("ClientHello parse: no extensions block at all is not an anomaly")
+TEST(ClientHelloParseTest, NoExtensionsBlockIsNotAnomaly)
 {
     const auto evt = parse(ClientHelloBuilder().omitExtensions().build());
 
-    CHECK(evt.sni_present == 0);
-    CHECK(evt.sni_malformed == 0);
-    CHECK(evt.cipher_suite_count == 2);  // still got the suites before it
+    EXPECT_EQ(evt.sni_present, 0);
+    EXPECT_EQ(evt.sni_malformed, 0);
+    EXPECT_EQ(evt.cipher_suite_count, 2);  // still got the suites before it
 }
 
-TEST_CASE("ClientHello parse: cipher suite capture truncates but reports the true count")
+TEST(ClientHelloParseTest, CipherSuiteCaptureTruncatesButReportsTrueCount)
 {
     // 40 offered > HG_MAX_CIPHER_SUITES (32) capacity: a detector must be
     // able to tell "I only saw part of the list" from "the list was short".
@@ -243,22 +243,22 @@ TEST_CASE("ClientHello parse: cipher suite capture truncates but reports the tru
 
     const auto evt = parse(ClientHelloBuilder().cipherSuites(many).build());
 
-    CHECK(evt.cipher_suites_offered == 40);
-    CHECK(evt.cipher_suite_count == HG_MAX_CIPHER_SUITES);
-    CHECK(evt.cipher_suites[0] == 0x1300);
-    CHECK(evt.cipher_suites[HG_MAX_CIPHER_SUITES - 1] == 0x131F);
+    EXPECT_EQ(evt.cipher_suites_offered, 40);
+    EXPECT_EQ(evt.cipher_suite_count, HG_MAX_CIPHER_SUITES);
+    EXPECT_EQ(evt.cipher_suites[0], 0x1300);
+    EXPECT_EQ(evt.cipher_suites[HG_MAX_CIPHER_SUITES - 1], 0x131F);
 }
 
-TEST_CASE("ClientHello parse: an over-long SNI is flagged rather than silently truncated")
+TEST(ClientHelloParseTest, OverLongSniIsFlaggedRatherThanTruncated)
 {
     const std::string long_host(HG_SNI_LEN + 20, 'a');
     const auto evt = parse(ClientHelloBuilder().sni(long_host).build());
 
-    CHECK(evt.sni_malformed == 1);
-    CHECK(std::strlen(evt.sni_hostname) == HG_SNI_LEN - 1);
+    EXPECT_EQ(evt.sni_malformed, 1);
+    EXPECT_EQ(std::strlen(evt.sni_hostname), HG_SNI_LEN - 1);
 }
 
-TEST_CASE("ClientHello parse: odd cipher_suites_length is flagged malformed")
+TEST(ClientHelloParseTest, OddCipherSuitesLengthIsFlaggedMalformed)
 {
     // Suite IDs are 2 bytes, so an odd length can't be a real list.
     const auto evt = parse(ClientHelloBuilder()
@@ -266,40 +266,40 @@ TEST_CASE("ClientHello parse: odd cipher_suites_length is flagged malformed")
                                .forceCipherSuitesLen(3)
                                .build());
 
-    CHECK(evt.sni_malformed == 1);
+    EXPECT_EQ(evt.sni_malformed, 1);
 }
 
-TEST_CASE("ClientHello parse: zero cipher_suites_length is flagged malformed")
+TEST(ClientHelloParseTest, ZeroCipherSuitesLengthIsFlaggedMalformed)
 {
     const auto evt = parse(ClientHelloBuilder()
                                .cipherSuites({})
                                .forceCipherSuitesLen(0)
                                .build());
 
-    CHECK(evt.sni_malformed == 1);
+    EXPECT_EQ(evt.sni_malformed, 1);
 }
 
-TEST_CASE("ClientHello parse: an unknown SNI name_type is flagged malformed")
+TEST(ClientHelloParseTest, UnknownSniNameTypeIsFlaggedMalformed)
 {
     const auto evt = parse(ClientHelloBuilder()
                                .sni("bmc.example.com")
                                .sniNameType(0x07)  // only 0 (host_name) is defined
                                .build());
 
-    CHECK(evt.sni_malformed == 1);
-    CHECK(evt.sni_present == 0);
+    EXPECT_EQ(evt.sni_malformed, 1);
+    EXPECT_EQ(evt.sni_present, 0);
 }
 
-TEST_CASE("ClientHello parse: SNI list_len inconsistent with name_len is flagged")
+TEST(ClientHelloParseTest, SniListLenInconsistentWithNameLenIsFlagged)
 {
     const auto evt = parse(ClientHelloBuilder()
                                .sniWithBadNameLen("bmc", 900)
                                .build());
 
-    CHECK(evt.sni_malformed == 1);
+    EXPECT_EQ(evt.sni_malformed, 1);
 }
 
-TEST_CASE("ClientHello parse: a hostname cut off by the packet end is flagged, not reported as complete")
+TEST(ClientHelloParseTest, HostnameCutOffByPacketEndIsFlaggedNotComplete)
 {
     // Regression guard for a real bypass: a packet ending mid-hostname used
     // to yield sni_present with a PREFIX and no malformed flag, so a crafted
@@ -310,11 +310,11 @@ TEST_CASE("ClientHello parse: a hostname cut off by the packet end is flagged, n
 
     const auto evt = parse(body);
 
-    CHECK(evt.sni_malformed == 1);
-    CHECK(std::string(evt.sni_hostname) != "bmc.evil.com");
+    EXPECT_EQ(evt.sni_malformed, 1);
+    EXPECT_NE(std::string(evt.sni_hostname), "bmc.evil.com");
 }
 
-TEST_CASE("ClientHello parse: truncated packet never reads past the end")
+TEST(ClientHelloParseTest, TruncatedPacketNeverReadsPastEnd)
 {
     // Every prefix of a valid ClientHello must parse without reading out of
     // bounds. Under ASan/UBSan this is the test that would actually catch a
@@ -338,9 +338,9 @@ TEST_CASE("ClientHello parse: truncated packet never reads past the end")
         // whole name (see parse_client_hello.h — this is a bypass guard,
         // and this loop is what caught it missing).
         if (evt.sni_present && std::string(evt.sni_hostname) != "bmc.example.com") {
-            CHECK(evt.sni_malformed == 1);
+            EXPECT_EQ(evt.sni_malformed, 1);
         }
-        CHECK(evt.cipher_suite_count <= HG_MAX_CIPHER_SUITES);
-        CHECK(std::strlen(evt.sni_hostname) < HG_SNI_LEN);
+        EXPECT_LE(evt.cipher_suite_count, HG_MAX_CIPHER_SUITES);
+        EXPECT_LT(std::strlen(evt.sni_hostname), HG_SNI_LEN);
     }
 }

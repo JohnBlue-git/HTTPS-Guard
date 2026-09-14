@@ -70,8 +70,8 @@ void dispatchVerdict(const EventMeta&, const Verdict& v, const DispatchContext&)
  * per-source handler to stub here: sweep() evaluates each one and calls
  * dispatchVerdict() directly (stubbed above), so the real, header-only rule
  * classes compile and run for real against whatever bpf_map_lookup_elem()
- * below returns -- covered in depth by tests/test_detectors.cpp, exercised
- * here only incidentally by the sweep-cadence check.
+ * below returns -- covered in depth by tests/detections/rate_sweep_test.cpp,
+ * exercised here only incidentally by the sweep-cadence check.
  *
  * ConnRateSweeper's only two libbpf calls. Recording the timestamp of each
  * sweep's first call is how sweep cadence is observed. */

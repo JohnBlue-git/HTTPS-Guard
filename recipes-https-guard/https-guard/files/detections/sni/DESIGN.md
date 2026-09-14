@@ -109,7 +109,7 @@ Ethernet ─▶ IPv4? ─▶ blocklist_check(saddr) ─▶ TCP, port 443?
 **The parse lives in `ebpf/parse_client_hello.h`, and it is shared verbatim with
 the host tests.** It is written using only pointer arithmetic and `uint*_t` — no
 BPF helpers — so the *actual shipped parser* compiles and runs host-side. That is
-why `tests/test_client_hello_parsing.cpp` exercises the same code the kernel runs
+why `tests/parsing/client_hello_parsing_test.cpp` exercises the same code the kernel runs
 rather than a reimplementation that could drift from it.
 
 **Its byte-at-a-time read helpers exist to satisfy the verifier.** The

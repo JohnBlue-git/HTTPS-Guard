@@ -1,41 +1,58 @@
 # Unit-test target: exercises pure C++ logic — currently the detections/
-# layer (IDetector implementations) — with no kernel/BPF/root/QEMU
-# dependency. Uses doctest (single-header, MIT) fetched the same way
-# Boost is fetched above when not already present on the system, so
-# this doesn't introduce a new dependency-management pattern.
+# layer (IDetector implementations) — with no kernel/BPF/root/QEMU access at
+# runtime (nothing here opens a BPF map, kills a socket or needs privilege).
+# It does link libbpf and actions_lib (see the comment below) since
+# detections_lib's object files need those symbols to resolve, even though no
+# test ever calls into them. Uses GoogleTest (BSD-3-Clause) fetched the same
+# way Boost is fetched above when not already present on the system, so this
+# doesn't introduce a new dependency-management pattern.
 
-find_package(doctest QUIET)
+find_package(GTest QUIET)
 
-if(NOT doctest_FOUND)
-    message(STATUS "doctest not found on system; fetching doctest v2.4.11 via CMake FetchContent")
+if(NOT GTest_FOUND)
+    message(STATUS "GoogleTest not found on system; fetching GoogleTest v1.15.2 via CMake FetchContent")
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
-        doctest
-        URL https://github.com/doctest/doctest/archive/refs/tags/v2.4.11.tar.gz
+        googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.tar.gz
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
-    FetchContent_MakeAvailable(doctest)
+    FetchContent_MakeAvailable(googletest)
 endif()
 
+# One file per detection family, mirroring detections/<family>/, plus
+# parsing/ (the shared wire parser) and core/ (the engine-level contracts:
+# EventMeta/peer resolution, and cross-detection dispatch priority). See
+# TESTS.md for the layout and the reasoning behind it.
 add_executable(https_guard_tests
-    test_detectors.cpp
-    test_uprobe_parsing.cpp
-    test_client_hello_parsing.cpp
+    parsing/client_hello_parsing_test.cpp
+    detections/tls_version_test.cpp
+    detections/payload_anomaly_test.cpp
+    detections/cert_access_test.cpp
+    detections/cipher_suite_test.cpp
+    detections/sni_test.cpp
+    detections/rate_sweep_test.cpp
+    detections/traffic_observed_test.cpp
+    core/event_meta_test.cpp
+    core/dispatch_priority_test.cpp
 )
-target_link_libraries(https_guard_tests PRIVATE doctest::doctest detections_lib)
+# detections_lib is an OBJECT library whose sources (dispatch.cpp,
+# ConnRateSweeper.cpp) call into actions_lib and raw libbpf. Object libraries
+# don't auto-chain a second level of object-library links, so — matching the
+# same explicit listing detect_runner already uses in detections/CMakeLists.txt
+# — actions_lib and libbpf must be named here too, or the final link fails
+# with undefined references, even though no TEST_CASE ever calls into either
+# at runtime: nothing here constructs a DetectLoop, dispatches a verdict, or
+# touches a BPF map, only the plain parsers and *Detector rule classes.
+target_link_libraries(https_guard_tests PRIVATE GTest::gtest_main detections_lib actions_lib ${LIBBPF_LIBRARIES})
+target_link_directories(https_guard_tests PRIVATE ${LIBBPF_LIBRARY_DIRS})
 
-# These tests exercise the real parsers and the real rules with no kernel, no
-# root and no actions linked. That is possible because everything they touch is
-# deliberately dependency-free: each source's parse() is header-only,
-# parse_client_hello.h is shared verbatim with the BPF program, and the rules
-# are concept-bound templates over plain event structs.
-#
-# detections_lib is linked for the rest of the classification tree; the paths
-# below are the few headers that live under programs/ because they are the
-# BPF<->userspace wire format rather than code.
+# The paths below are the few headers that live under programs/ because they
+# are the BPF<->userspace wire format rather than code.
 target_include_directories(https_guard_tests PRIVATE
     # The raw <hook>_event.h wire structs, and boundedString(). Every source's
-    # parse() is header-only for exactly this reason: the tests exercise the
-    # real parser, and they must not have to link the actions to do it.
+    # parse() is header-only, so the tests exercise the real parser directly
+    # rather than a reimplementation of it.
     ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/ebpf
     ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
     ${CMAKE_SOURCE_DIR}/programs/lsm_cert_guard/ebpf

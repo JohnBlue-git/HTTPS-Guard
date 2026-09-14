@@ -5,9 +5,14 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 
 DEPENDS += "libbpf pkgconfig clang-native bpftool-native nlohmann-json boost openssl"
+# googletest (meta-oe) is only needed to cross-compile the tests/ ptest binary;
+# find_package(GTest) in tests/CMakeLists.txt picks it up from the sysroot this
+# stages, so building with ptest enabled never needs network access to fetch it.
+DEPENDS:append = " ${@bb.utils.contains('PTEST_ENABLED', '1', 'googletest', '', d)}"
 inherit systemd
 inherit cmake
 inherit pkgconfig
+inherit ptest
 
 # =============================================================================
 # PACKAGECONFIG: choose which systemd services are auto-enabled
@@ -69,113 +74,14 @@ PACKAGECONFIG[journal-only] = ""
 PACKAGECONFIG[event-both] = ""
 
 SRC_URI = " \
-    file://service/https-guard-event-bridge.sh \
-    file://service/https-guard-event-bridge.service \
-    file://service/https-guard-daemon.sh \
-    file://service/https-guard-daemon.service \
-    file://service/simulated-event-generator.service \
-    file://service/simulated-event-generator.sh \
+    file://service/ \
     file://https-guard.conf \
     file://CMakeLists.txt \
-    file://programs/DESIGN.md \
-    file://detections/DESIGN.md \
-    file://actions/DESIGN.md \
-    file://actions/log/DESIGN.md \
-    file://actions/blocklist/DESIGN.md \
-    file://actions/tcp/DESIGN.md \
-    file://scripts/gen_ssl_offset.c \
-    file://programs/CMakeLists.txt \
-    file://programs/core/ebpf/https_guard.bpf.c \
-    file://programs/core/main.cpp \
-    file://programs/core/src/HttpGuardProgram.hpp \
-    file://programs/core/src/HttpGuardProgram.cpp \
-    file://programs/core/src/BpfProgram.hpp \
-    file://programs/core/src/BpfProgram.cpp \
-    file://programs/ssl_uprobe/src/proc_peer_resolver.hpp \
-    file://programs/ssl_uprobe/ebpf/ssl_uprobe.bpf.h \
-    file://programs/ssl_uprobe/ebpf/ssl_uprobe_event.h \
-    file://programs/ssl_uprobe/src/SslUprobeProgram.hpp \
-    file://programs/ssl_uprobe/src/SslUprobeProgram.cpp \
-    file://programs/xdp_tls/ebpf/xdp_tls.bpf.h \
-    file://programs/xdp_tls/ebpf/xdp_tls_event.h \
-    file://programs/xdp_tls/ebpf/parse_client_hello.h \
-    file://programs/xdp_tls/ebpf/conn_rate.bpf.h \
-    file://programs/xdp_tls/src/XdpTlsProgram.hpp \
-    file://programs/xdp_tls/src/XdpTlsProgram.cpp \
-    file://programs/lsm_cert_guard/ebpf/lsm_cert_guard.bpf.h \
-    file://programs/lsm_cert_guard/ebpf/lsm_cert_guard_event.h \
-    file://programs/lsm_cert_guard/src/LsmCertGuardProgram.hpp \
-    file://programs/lsm_cert_guard/src/LsmCertGuardProgram.cpp \
-    file://programs/utils/bounded_string.hpp \
-    file://detections/CMakeLists.txt \
-    file://detections/core/event/hg_event_source.h \
-    file://detections/core/engine/DetectLoop.hpp \
-    file://detections/core/engine/DetectLoop.cpp \
-    file://detections/core/main.cpp \
-    file://detections/core/event/IPeerResolver.hpp \
-    file://detections/core/contract/Verdict.hpp \
-    file://detections/core/contract/IDetection.hpp \
-    file://detections/core/event/event_meta_from.hpp \
-    file://detections/core/contract/detection_traits.hpp \
-    file://detections/traffic_observed/TrafficObservedDetection.hpp \
-    file://detections/traffic_observed/DESIGN.md \
-    file://detections/tls_version/TlsVersionEvent.hpp \
-    file://detections/tls_version/TlsVersionDetection.hpp \
-    file://detections/payload_anomaly/PayloadEvent.hpp \
-    file://detections/payload_anomaly/PayloadAnomalyDetection.hpp \
-    file://detections/cipher_suite/CipherSuiteEvent.hpp \
-    file://detections/cipher_suite/CipherSuiteDetection.hpp \
-    file://detections/sni/SniEvent.hpp \
-    file://detections/sni/SniDetection.hpp \
-    file://detections/cert_access/CertAccessEvent.hpp \
-    file://detections/cert_access/CertAccessDetection.hpp \
-    file://detections/tls_version/DESIGN.md \
-    file://detections/payload_anomaly/DESIGN.md \
-    file://detections/cipher_suite/DESIGN.md \
-    file://detections/sni/DESIGN.md \
-    file://detections/cert_access/DESIGN.md \
-    file://detections/rate_sweep/DESIGN.md \
-    file://detections/core/event/event_meta.hpp \
-    file://detections/core/engine/dispatch.hpp \
-    file://detections/core/engine/dispatch.cpp \
-    file://detections/tls_version/TlsVersionDetector.hpp \
-    file://detections/core/event/tls_version.hpp \
-    file://detections/payload_anomaly/PayloadAnomalyDetector.hpp \
-    file://detections/cert_access/CertAccessDetector.hpp \
-    file://detections/rate_sweep/ConnRateEvent.hpp \
-    file://detections/rate_sweep/ConnRateDetector.hpp \
-    file://detections/core/sweep/ConnRateSweeper.hpp \
-    file://detections/core/sweep/ConnRateSweeper.cpp \
-    file://detections/rate_sweep/SlowlorisEvent.hpp \
-    file://detections/rate_sweep/SlowlorisDetector.hpp \
-    file://detections/rate_sweep/RenegotiationEvent.hpp \
-    file://detections/rate_sweep/RenegotiationDetector.hpp \
-    file://detections/cipher_suite/CipherSuiteDetector.hpp \
-    file://detections/cipher_suite/weak_cipher_suites.hpp \
-    file://detections/sni/SniDetector.hpp \
-    file://actions/CMakeLists.txt \
-    file://actions/core/main.cpp \
-    file://actions/core/ActionLoop.hpp \
-    file://actions/core/ActionLoop.cpp \
-    file://actions/log/async_mutex.hpp \
-    file://actions/log/LogAction.hpp \
-    file://actions/log/LogAction.cpp \
-    file://actions/log/redfish_event_message.hpp \
-    file://actions/blocklist/Blocklist.hpp \
-    file://actions/blocklist/Blocklist.cpp \
-    file://actions/blocklist/blocklist.bpf.h \
-    file://actions/blocklist/BlocklistAction.hpp \
-    file://actions/blocklist/BlocklistAction.cpp \
-    file://actions/tcp/TcpDestroyer.hpp \
-    file://actions/tcp/TcpDestroyer.cpp \
-    file://actions/tcp/BlockTcpAction.hpp \
-    file://actions/tcp/BlockTcpAction.cpp \
-    file://tests/CMakeLists.txt \
-    file://tests/test_detectors.cpp \
-    file://tests/test_uprobe_parsing.cpp \
-    file://tests/test_client_hello_parsing.cpp \
-    file://tests/detectloop/detectloop_harness.cpp \
-    file://tests/detectloop/README.md \
+    file://scripts/ \
+    file://programs/ \
+    file://detections/ \
+    file://actions/ \
+    file://tests/ \
 "
 
 S = "${UNPACKDIR}"
@@ -191,6 +97,7 @@ EXTRA_OECMAKE += " \
     -DHTTPS_GUARD_BPF_BINARY_PREFIX_MAP=${B}=/usr/src/debug/${PN}/${PV} \
     -DHTTPS_GUARD_BPF_SYSROOT_PREFIX_MAP=${RECIPE_SYSROOT}= \
     -DHTTPS_GUARD_BPF_SYSROOT_NATIVE_PREFIX_MAP=${RECIPE_SYSROOT_NATIVE}= \
+    ${@bb.utils.contains('PTEST_ENABLED', '1', '-DHTTPS_GUARD_BUILD_TESTS=ON', '', d)} \
 "
 
 # Note: We intentionally do NOT set HTTPS_GUARD_BPF_SYSROOT_INCLUDE here.
@@ -356,6 +263,16 @@ do_install() {
     install -d ${D}${sysconfdir}/default
     sed -e "s/@@EVENT_MODE@@/${HTTPS_GUARD_EVENT_MODE}/g" \
         ${S}/https-guard.conf > ${D}${sysconfdir}/default/https-guard
+}
+
+# Only runs when PTEST_ENABLED (ptest.bbclass deletes the task otherwise), at
+# which point EXTRA_OECMAKE above already forced HTTPS_GUARD_BUILD_TESTS=ON,
+# so ${B}/tests/https_guard_tests (see CLAUDE.md's note on cmake output paths
+# mirroring source subdirectories) exists to install here.
+do_install_ptest() {
+    install -d ${D}${PTEST_PATH}
+    install -m 0755 ${B}/tests/https_guard_tests ${D}${PTEST_PATH}/https_guard_tests
+    install -m 0755 ${S}/tests/run-ptest ${D}${PTEST_PATH}/run-ptest
 }
 
 FILES:${PN} += " \

@@ -280,17 +280,18 @@ unambiguously a win) are in [`DESIGN.md`](DESIGN.md).
 
 ## Testing
 
-`../tests/test_detectors.cpp` covers all eight rules — a clearly-violating
-input, a clearly-clean one, and each rule's real boundaries: the exact TLS
-threshold, the `violation_hint` override, case-insensitivity, empty input, `N`
-triggers while `N-1` does not for each counting rule, and
-zero-threshold-means-disabled (the most consequential boundary, since treating 0
-as a threshold everything exceeds would blocklist every source that ever
-connects).
+`../tests/detections/` covers all eight rules, one file per family (see
+`../tests/TESTS.md`) — a clearly-violating input, a clearly-clean one, and
+each rule's real boundaries: the exact TLS threshold, the `violation_hint`
+override, case-insensitivity, empty input, `N` triggers while `N-1` does not
+for each counting rule, and zero-threshold-means-disabled (the most
+consequential boundary, since treating 0 as a threshold everything exceeds
+would blocklist every source that ever connects). `../tests/core/` covers
+`EventMeta`/peer resolution and the cross-detection dispatch-priority
+property separately from any single rule.
 
-Alongside them are 12 `static_assert`s pinning which concepts each event does
-and does not satisfy. `../tests/detectloop/` covers the loop's scheduling
-separately; see its README for why it is a separate binary.
+`../tests/detectloop/` covers the loop's scheduling separately; see
+`../tests/TESTS.md` for why it is a separate binary.
 
 This is the one seam explicitly designed to be testable without a kernel, root
 or QEMU. A new rule should get the same treatment before it is considered done.

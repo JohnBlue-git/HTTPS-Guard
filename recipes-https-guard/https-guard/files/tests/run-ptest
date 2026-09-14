@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs the cross-compiled https_guard_tests GoogleTest binary and translates
+# its [ RUN ]/[ OK ]/[ FAILED ] lines into ptest-runner's PASS:/FAIL: format.
+# Tracking the pending RUN name (rather than matching OK/FAILED lines on
+# their own) is what keeps GoogleTest's end-of-run summary -- which reprints
+# "[  FAILED  ] Suite.Test" for every failure a second time -- from being
+# counted twice.
+cd "$(dirname "$0")" || exit 1
+
+./https_guard_tests 2>&1 | awk '
+    /^\[ RUN      \] / { pending = $0; sub(/^\[ RUN      \] /, "", pending); next }
+    /^\[       OK \] / { if (pending != "") { print "PASS: " pending; pending = "" } }
+    /^\[  FAILED  \] / { if (pending != "") { print "FAIL: " pending; pending = "" } }
+'
