@@ -1,158 +1,258 @@
 # Tests
 
-Host-side unit tests for `detections/` — no kernel, BPF, root or QEMU access
-at *runtime*: no test ever opens a BPF map, kills a socket or needs
-privilege. `https_guard_tests` does link `libbpf` and `actions_lib` at build
-time regardless (see the comment in `CMakeLists.txt`) — `detections_lib`'s
-object files need those symbols to resolve even though nothing here calls
-into them. Built with GoogleTest, fetched via CMake `FetchContent` the same
-way Boost is (see `../CMakeLists.txt`) when it isn't already on the system.
-Off by default when cross-compiling for the target image
-(`HTTPS_GUARD_BUILD_TESTS`, see the root `CMakeLists.txt`), since these exist
-for development, not for the BMC.
+Host-side tests for `detections/` and the DetectLoop scheduling boundary. They
+need no kernel, BPF runtime, root or QEMU access: no test opens a BPF map, kills
+a socket or needs privilege.
+
+The suite uses GoogleTest and GoogleMock. CMake fetches GoogleTest v1.15.2 when
+the `GTest::gmock` target is not already available. GMock injects behavior at
+the existing `IDetection` interface, so tests can return selected verdicts,
+throw exceptions, and verify concurrent calls without changing production
+interfaces. Purpose-built probes remain for timing and arrival-order checks,
+where recorded measurements are clearer than call expectations.
+
+`HTTPS_GUARD_BUILD_TESTS` is off by default when cross-compiling for the target
+image. These are development and ptest targets, not daemon runtime code.
+
+### GoogleTest and GoogleMock basics
+
+GoogleTest (`gtest`) supplies the test case macro, test runner and assertions.
+Tests are grouped by a suite name and a case name; both names appear in the
+GoogleTest output:
+
+```cpp
+TEST(TlsVersionDetectorTest, FlagsLegacyVersion)
+{
+      TlsVersionEvent event;
+      event.tls_version = 0x0302;  // TLS 1.1
+
+      const auto verdict = TlsVersionDetector{}.evaluate(event);
+
+      ASSERT_TRUE(verdict.has_value());  // stop if later access needs a value
+      EXPECT_EQ(verdict->severity, "Critical");
+      EXPECT_TRUE(verdict->actionable);
+}
+```
+
+Use `ASSERT_*` when a failed condition makes the rest of the test unsafe or
+meaningless. Use `EXPECT_*` when later assertions can still provide useful
+failure information. Common assertions in this repository are `EXPECT_EQ`,
+`EXPECT_TRUE`, `EXPECT_FALSE`, `ASSERT_TRUE` and `ASSERT_NE`.
+
+GoogleMock (`gmock`) supplies mock objects for virtual interfaces. Include
+`<gmock/gmock.h>`, derive a mock from the production interface, and declare
+methods with `MOCK_METHOD`:
+
+```cpp
+class MockPeerResolver final : public IPeerResolver
+{
+public:
+      MOCK_METHOD(bool, resolvePeer, (EventMeta&), (const, noexcept, override));
+};
+```
+
+Then describe the interaction before exercising the real code. This example
+proves that parsing stores the resolver but does not perform the expensive
+peer lookup:
+
+```cpp
+MockPeerResolver resolver;
+EXPECT_CALL(resolver, resolvePeer(::testing::_)).Times(0);
+
+EventMeta meta;
+TrafficObservedDetection<struct uprobe_event> detection{&resolver};
+detection.inspect(&raw, sizeof(raw), meta);
+
+EXPECT_EQ(meta.peer_resolver, &resolver);
+EXPECT_EQ(meta.remote_ip_v4, 0u);
+```
+
+`::testing::_` matches any argument. Other useful matchers include
+`Eq(value)`, `NotNull()` and `Field(&Type::member, matcher)`. `Times(1)` means
+exactly one call; `Times(0)` means the method must not be called. A mock's
+default behavior can be set with `ON_CALL`, while `EXPECT_CALL` states the
+interaction the test requires:
+
+```cpp
+EXPECT_CALL(resolver, resolvePeer(::testing::_))
+      .Times(1)
+      .WillOnce(::testing::Invoke([](EventMeta& resolved) noexcept {
+            resolved.remote_ip_v4 = 0x0100000A;
+            return true;
+      }));
+
+EXPECT_TRUE(meta.ensurePeerResolved());
+EXPECT_TRUE(meta.ensurePeerResolved());  // memoized: still only one call
+```
+
+`Return(value)` is enough for a method with no output parameter; `Invoke`
+lets the fake method mutate an output reference and return a value. The
+`event_meta_test.cpp` tests use these two actions to verify both successful
+and failed resolution, including the no-retry behavior.
+
+For the DetectLoop fan-out, GMock injects two `IDetection` objects and verifies
+that both are evaluated even though the lower-index verdict wins:
+
+```cpp
+EXPECT_CALL(first, inspect(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(::testing::Return(std::optional<Verdict>{verdict_a}));
+EXPECT_CALL(second, inspect(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(::testing::Return(std::optional<Verdict>{verdict_b}));
+
+const std::array<const IDetection*, 2> detections{&first, &second};
+loop.submit(bytes, sizeof(bytes), detections);
+```
+
+The production detector/parser is real in these examples. GMock replaces only
+the collaborator at an interface boundary; mocking the detector under test
+would merely verify the mock setup instead of verifying classification.
+
+```text
+GTest:  real detector/parser -> real result -> assertions
+GMock:  real pipeline        -> injected collaborator -> call expectations
+```
+
+Build and run the tests with:
+
+```sh
+ctest --test-dir build --output-on-failure
+# or run one GoogleTest binary directly:
+./build/tests/https_guard_tests --gtest_filter=TlsVersionDetectorTest.*
+```
 
 ## Layout
 
-One file per detection family, mirroring `detections/<family>/`, so a test
-for a detection lives at the same address as the detection itself:
-
-```
+```text
 tests/
 ├── parsing/
-│   └── client_hello_parsing_test.cpp   # programs/xdp_tls/ebpf/parse_client_hello.h
+│   └── client_hello_parsing_test.cpp
 ├── detections/
-│   ├── tls_version_test.cpp            # detections/tls_version/
-│   ├── payload_anomaly_test.cpp        # detections/payload_anomaly/
-│   ├── cert_access_test.cpp            # detections/cert_access/
-│   ├── cipher_suite_test.cpp           # detections/cipher_suite/
-│   ├── sni_test.cpp                    # detections/sni/
-│   ├── rate_sweep_test.cpp             # detections/rate_sweep/ (ConnRate, Slowloris, Renegotiation)
-│   └── traffic_observed_test.cpp       # detections/traffic_observed/
+│   ├── tls_version_test.cpp
+│   ├── payload_anomaly_test.cpp
+│   ├── cert_access_test.cpp
+│   ├── cipher_suite_test.cpp
+│   ├── sni_test.cpp
+│   ├── rate_sweep_test.cpp
+│   └── traffic_observed_test.cpp
 ├── core/
-│   ├── event_meta_test.cpp             # detections/core/event/ — EventMeta, lazy peer resolution
-│   └── dispatch_priority_test.cpp      # detections/core/engine/ — cross-detection ordering
+│   ├── event_meta_test.cpp
+│   └── dispatch_priority_test.cpp
 ├── support/
-│   └── make_uprobe_event.hpp           # shared raw-record builder, used by 3 of the files above
-├── run-ptest                           # ptest entry point — see "Running on target (ptest)" below
-└── detectloop/                         # DetectLoop scheduling harness — see below
+│   └── make_uprobe_event.hpp
+├── detectloop/
+│   └── detectloop_harness.cpp
+├── run-ptest
+└── CMakeLists.txt
 ```
 
-`support/make_uprobe_event.hpp` exists because three files
-(`tls_version_test.cpp`, `payload_anomaly_test.cpp`,
-`traffic_observed_test.cpp`) each need a real `uprobe_event` wire record to
-drive a detection's `inspect()` end-to-end; it's shared rather than
-duplicated three times.
+`parsing/` contains parser tests. `support/` contains shared fixtures and
+builders used by several tests; it is intentionally separate from a generic
+`utils/` directory so the role of each helper remains clear.
 
-`core/` holds what doesn't belong to any single family: `EventMeta` and its
-lazy peer-resolution contract (`event_meta_test.cpp`), and the property that
-list order — not any per-detection precedence field — decides which verdict
-a hook dispatches when more than one detection would fire on the same record
-(`dispatch_priority_test.cpp`).
+The ordinary `https_guard_tests` target tests real parsers and detector rules.
+It links the existing `detections_lib` and `actions_lib` object targets because
+their objects and usage requirements are already part of the project build.
 
-Each detection's rule (`*Detector`, pure classification) and its
-`IDetection` wrapper (parse + classify from a raw record, see
-`../detections/CLAUDE.md`) are tested together in one file per family —
-splitting them further would scatter tests for the same detection across two
-files for no benefit.
+The separate `detectloop_harness` target tests scheduling properties of the
+real `DetectLoop.cpp` and `ConnRateSweeper.cpp`. It uses a GMock
+`IDetection` for the fan-out and priority test, plus local link-time doubles
+for `ActionLoop`, actions, `dispatchVerdict()` and the two libbpf map calls.
+It does not link the complete `detections_lib` or `actions_lib` objects, since
+those would reintroduce the collaborators being replaced.
 
-## Building and running (host)
+The current test split is deliberate:
 
-```sh
-cmake -S .. -B build -DHTTPS_GUARD_BUILD_TESTS=ON
-cmake --build build --target https_guard_tests
-ctest --test-dir build
-```
+| Test area | Framework/style | What it proves |
+|---|---|---|
+| `parsing/` | GTest, real parser | Wire bytes are parsed correctly and safely. |
+| `detections/` | GTest, real detector and detection wrapper | Rules, boundaries and returned verdicts are correct. |
+| `core/dispatch_priority_test.cpp` | GTest, real detection list | Real detection order produces the expected winner. |
+| `core/event_meta_test.cpp` | GTest + GMock `IPeerResolver` | Lazy resolution, exactly-once memoization and no retry after failure. |
+| `detectloop/` | GTest-style checks + GMock `IDetection` | Scheduling, fan-out, exception boundaries and priority injection. |
 
-## Running on target (ptest)
+## DetectLoop harness
 
-`https-guard-openbmc.bb` also wires this suite into BitBake's `ptest`
-mechanism, so it can run as the real cross-compiled binary on the target (or
-QEMU) rather than only host-side. With `ptest` in `DISTRO_FEATURES`:
-
-- `DEPENDS` picks up `googletest` (`meta-oe`), so `find_package(GTest)` in
-  `CMakeLists.txt` finds a real cross-compiled GTest in the sysroot and the
-  `FetchContent` fallback (which needs network access, unavailable mid-build)
-  is never reached.
-- `EXTRA_OECMAKE` forces `HTTPS_GUARD_BUILD_TESTS=ON`, so the normal
-  `do_compile` cross-compiles `https_guard_tests` alongside `https_guardd`.
-- `do_install_ptest()` installs the binary and `run-ptest` under
-  `${PTEST_PATH}` (`/usr/lib/https-guard-openbmc/ptest`), producing an
-  `https-guard-openbmc-ptest` package.
-- `run-ptest` runs the binary and translates GoogleTest's `[ RUN ]`/`[ OK ]`/
-  `[ FAILED ]` lines into the `PASS:`/`FAIL:` lines `ptest-runner` expects.
-
-None of this touches a normal build: `ptest.bbclass` deletes the
-`*_ptest_base` tasks entirely when `ptest` isn't in `DISTRO_FEATURES`, so
-`HTTPS_GUARD_BUILD_TESTS` stays at its ordinary cross-compiling default
-(`OFF`) and `googletest` is never added to `DEPENDS`.
-
-To exercise it: build with `ptest` enabled, install
-`https-guard-openbmc-ptest` into the image (or the `ptest-runner` package
-image feature), then on the target run `ptest-runner` or
-`/usr/lib/https-guard-openbmc/ptest/run-ptest` directly.
-
-## The DetectLoop harness (`detectloop/`)
-
-`detectloop/detectloop_harness.cpp` exercises the **real**
-`detections/core/engine/DetectLoop.cpp` — the Boost.Asio loop that owns
-parse → classify → dispatch — for properties that are about its
-*scheduling* rather than about any detection rule:
+The harness covers properties that belong to the loop rather than an
+individual detection rule:
 
 | Check | Why it is here |
 |---|---|
-| Admission is bounded, drop-newest, counted | `asio::post()` is an unbounded queue. On a ~1GB BMC an OOM takes *all* detection with it, where a drop costs one event. |
-| Records classified in arrival order | Justifies drop-newest: what is kept is a coherent prefix of history. |
-| The sweep is not starved by a record backlog | This exact failure shipped once (ticket 05) and a single-threaded `io_context` reintroduces it by FIFO fairness alone. |
-| A throwing detector costs one event, not the daemon | The handlers are `noexcept`; without the per-item boundary a `bad_alloc` is `std::terminate`. |
-| Oversized / null / empty `submit()`, and `stop()` idempotence | Boundaries libbpf's callback can actually hit. |
+| Admission is bounded, drop-newest, counted | `asio::post()` is unbounded; one dropped event is preferable to an OOM that kills all detection. |
+| Records are classified in arrival order | The record strand preserves a coherent prefix when newest records are dropped. |
+| The sweep is not starved by a record backlog | The timer runs outside the record strand on the second worker. |
+| A throwing detector costs one event, not the daemon | The per-record `noexcept` boundary catches detector failures. |
+| Oversized/null/empty submit and idempotent stop | These are boundaries the libbpf callback can actually reach. |
+| Lowest-index verdict wins | GMock verifies every detection is called, while dispatch still chooses the first result. |
 
-### Why it is not part of `https_guard_tests`
+The test boundary is:
 
-`tests/CMakeLists.txt` builds a binary that deliberately links **nothing**
-with a kernel dependency, which is what lets the real parsers be tested
-rather than reimplementations. `DetectLoop.cpp` does not fit that: it pulls
-in the actions and `nlohmann/json`, and `ConnRateSweeper.cpp` calls libbpf.
-
-So this harness replaces the collaborators at **link time** — `ActionLoop`,
-the three actions and libbpf's two map calls are defined in the harness
-itself — and only `DetectLoop.cpp` and `ConnRateSweeper.cpp` are compiled
-from real source (as is `rate_sweep/`'s three rule headers, which
-`ConnRateSweeper.cpp` now calls directly — they're header-only and pull in
-no kernel dependency, so nothing about them needs stubbing). Recording the
-timestamp of each `bpf_map_get_next_key(fd, nullptr, …)` is how sweep
-cadence is observed.
-
-### Building it
-
-Needs `boost` (host), plus `nlohmann/json.hpp` and `bpf/bpf.h` on the
-include path — the latter two are most easily taken from the recipe
-sysroot, since both are header-only for what this uses:
-
-```sh
-SR=<build>/tmp/work/<arch>/https-guard-openbmc/1.0/recipe-sysroot/usr/include
-mkdir -p /tmp/hginc && cp -r "$SR/nlohmann" "$SR/bpf" /tmp/hginc/
-
-cd recipes-https-guard/https-guard/files
-g++ -std=c++20 -g -O1 -fsanitize=address,undefined -DBOOST_ERROR_CODE_HEADER_ONLY \
-    -I/tmp/hginc \
-    -Idetections/core/contract -Idetections/core/event -Idetections/core/engine \
-    -Idetections/core/sweep -Idetections/tls_version -Idetections/rate_sweep \
-    -Iactions -Iactions/core -Iactions/log -Iprograms/xdp_tls/ebpf \
-    tests/detectloop/detectloop_harness.cpp \
-    detections/core/engine/DetectLoop.cpp detections/core/sweep/ConnRateSweeper.cpp \
-    -o /tmp/dl -lpthread
-/tmp/dl
+```text
+real code under test
+  DetectLoop.cpp
+  ConnRateSweeper.cpp
+  rate_sweep rule headers
+        |
+        v
+injected collaborators
+  GMock IDetection instances
+  local action/dispatch doubles
+  local bpf_map_lookup_elem/get_next_key doubles
 ```
 
-Exits non-zero on failure. Also run it with `-fsanitize=thread` instead —
-the sweep runs concurrently with a record by design, so this is the one
-place in the project where a data race is possible, and TSan is what proves
-detector statelessness is holding. (TSan may need `setarch -R` on recent
-kernels.)
+The doubles keep the harness independent of a kernel and make scheduling
+observable. In particular, the fake `bpf_map_get_next_key()` records the time
+at which each sweep starts. The rate rules remain real header-only code.
 
-**Folding this into the CMake test target is a genuine follow-up**, not a
-dead end: the top-level `CMakeLists.txt` already requires `nlohmann_json` and
-`libbpf` to configure at all, so a second test executable compiling
-`DetectLoop.cpp` with these doubles would build wherever the project does.
-It is left out here only because that change could not be verified on the
-development host used for this work, which has no `cmake`.
+## CMake build graph
+
+Build both test executables through the same root CMake invocation:
+
+```sh
+cmake -S recipes-https-guard/https-guard/files -B build \
+      -DHTTPS_GUARD_BUILD_TESTS=ON -DHTTPS_GUARD_BUILD_BPF=OFF \
+      -DHTTPS_GUARD_FETCH_LIBBPF=ON
+cmake --build build --target https_guard_tests detectloop_harness
+ctest --test-dir build
+```
+
+```text
+root CMakeLists.txt
+├─ discover libbpf, nlohmann_json and Boost once
+│  └─ optional HTTPS_GUARD_FETCH_LIBBPF uses ExternalProject for libbpf's Makefile
+├─ if HTTPS_GUARD_BUILD_TESTS
+│  ├─ find_package(Threads)
+│  └─ https_guard_test_deps (INTERFACE)
+│     └─ shared test include paths, libraries and compile flags
+├─ actions/     └─ actions_lib (OBJECT)
+├─ detections/  └─ detections_lib (OBJECT)
+├─ programs/    └─ programs_lib (OBJECT) + optional BPF object
+└─ tests/
+   ├─ FetchContent GoogleTest/GMock once when GTest::gmock is unavailable
+   ├─ https_guard_tests
+   │  └─ GTest + detections_lib + actions_lib + https_guard_test_deps
+   └─ detectloop_harness
+      └─ GMock + real engine sources + local link-time doubles
+```
+
+`https_guard_test_deps` is created in the root [CMakeLists.txt](../CMakeLists.txt)
+and consumed by [tests/CMakeLists.txt](CMakeLists.txt). This keeps package
+discovery and common host flags in one place. The harness's production source
+selection remains explicit so its doubles cannot be shadowed by real object
+library definitions.
+
+For sanitizer runs, add `-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -g`
+to the configure command and rebuild `detectloop_harness`. ThreadSanitizer is
+also useful for the concurrent sweep, though it may need `setarch -R` on recent
+kernels.
+
+## Running on target (ptest)
+
+The recipe wires `https_guard_tests` into BitBake's ptest mechanism. With
+`ptest` in `DISTRO_FEATURES`, `DEPENDS` supplies cross-compiled googletest,
+`HTTPS_GUARD_BUILD_TESTS=ON` is forced, and `do_install_ptest()` installs the
+test binary and `run-ptest` under `${PTEST_PATH}`. The test runner translates
+GoogleTest output into the `PASS:`/`FAIL:` lines expected by `ptest-runner`.
+
+Without `ptest`, the ptest tasks are removed and the normal cross-compiled
+build keeps tests disabled. To exercise ptest, install
+`https-guard-openbmc-ptest` and run `ptest-runner` on the target.

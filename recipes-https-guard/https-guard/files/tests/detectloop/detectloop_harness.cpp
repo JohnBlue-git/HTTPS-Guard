@@ -18,6 +18,7 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <gmock/gmock.h>
 
 #include "DetectLoop.hpp"
 #include "dispatch.hpp"
@@ -96,6 +97,18 @@ static constexpr hg_event_source kTestSource = HG_SOURCE_UPROBE;
  * to build a backlog. Plugged in as an IDetection, which is exactly
  * what the composition root uses -- so the harness drives the real seam rather
  * than a test-only one. */
+/* GMock drives the same IDetection seam used by production hooks. The custom
+ * probe below remains for timing and arrival-order measurements, which are
+ * observations rather than call expectations. */
+class MockDetection final : public IDetection {
+public:
+    MOCK_METHOD(std::string_view, name, (), (const, noexcept, override));
+    MOCK_METHOD(std::optional<Verdict>, inspect,
+                (const void*, std::size_t, EventMeta&), (const, override));
+};
+
+/* Stands in for a source handler when the test needs timing or order data.
+ * It is plugged in through IDetection exactly as production hooks do. */
 class SlowDetection final : public IDetection {
 public:
     std::string_view name() const noexcept override { return "harness_slow"; }
@@ -266,9 +279,27 @@ int main()
      * despite the concurrent fan-out that replaced the sequential early-exit
      * loop -- see detections/DESIGN.md */
     {
-        SlowDetection a, b;
-        a.message_id = "A";
-        b.message_id = "B";
+        MockDetection a, b;
+        Verdict verdict_a;
+        verdict_a.severity = "OK";
+        verdict_a.message_id = "A";
+        Verdict verdict_b;
+        verdict_b.severity = "OK";
+        verdict_b.message_id = "B";
+        EXPECT_CALL(a, name()).WillRepeatedly(::testing::Return("mock_a"));
+        EXPECT_CALL(b, name()).WillRepeatedly(::testing::Return("mock_b"));
+        EXPECT_CALL(a, inspect(::testing::_, ::testing::_, ::testing::_))
+            .WillOnce(::testing::Invoke([verdict_a](const void*, std::size_t,
+                                                     EventMeta& meta) {
+                meta.pid = 0;
+                return std::optional<Verdict>(verdict_a);
+            }));
+        EXPECT_CALL(b, inspect(::testing::_, ::testing::_, ::testing::_))
+            .WillOnce(::testing::Invoke([verdict_b](const void*, std::size_t,
+                                                     EventMeta& meta) {
+                meta.pid = 0;
+                return std::optional<Verdict>(verdict_b);
+            }));
         const std::array<const IDetection*, 2> detections{&a, &b};
 
         auto loop_owner = DetectLoop::createForTesting();
@@ -278,11 +309,13 @@ int main()
         const int before_dispatched = g_dispatched.load();
         submitSeq(loop, detections, 0);
 
-        for (int spin = 0; spin < 200 && (a.handled.load() < 1 || b.handled.load() < 1); ++spin)
+        for (int spin = 0; spin < 200 && g_dispatched.load() == before_dispatched; ++spin)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-        check(a.handled.load() == 1, "fan-out: index-0 detection was evaluated");
-        check(b.handled.load() == 1, "fan-out: index-1 detection was evaluated too (no early-exit)");
+        const bool a_called = ::testing::Mock::VerifyAndClearExpectations(&a);
+        const bool b_called = ::testing::Mock::VerifyAndClearExpectations(&b);
+        check(a_called, "fan-out: index-0 GMock detection was evaluated");
+        check(b_called, "fan-out: index-1 GMock detection was evaluated too (no early-exit)");
         check(g_dispatched.load() == before_dispatched + 1,
               "exactly one verdict dispatched per record");
         {

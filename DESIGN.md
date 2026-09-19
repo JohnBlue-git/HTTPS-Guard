@@ -100,11 +100,48 @@ One `CMakeLists.txt` per top-level concern (`actions`, `detections`, `programs`,
 - Native host tool compilation (gen_ssl_offset) for OpenSSL struct offset detection
 - Automatic Boost/GoogleTest header fetching if not available in sysroot
 
+**CMake build graph:** the root project discovers external dependencies once,
+then exposes the common host-side test settings through
+`https_guard_test_deps`. The two test executables intentionally have different
+production-code boundaries: the unit-test binary links the existing object
+libraries, while the DetectLoop harness compiles only the engine sources it
+tests so its local doubles can replace actions, dispatch and libbpf calls.
+
+```text
+recipes-https-guard/https-guard/files/CMakeLists.txt
+├─ find_package(PkgConfig, nlohmann_json, Boost)
+│  └─ optional HTTPS_GUARD_FETCH_LIBBPF builds libbpf via ExternalProject
+│
+├─ if HTTPS_GUARD_BUILD_TESTS
+│  ├─ find_package(Threads)
+│  └─ add_library(https_guard_test_deps INTERFACE)
+│     └─ shared test include paths, libbpf, nlohmann_json, Threads, Boost definition
+│
+├─ add_subdirectory(actions)     └─ actions_lib (OBJECT)
+├─ add_subdirectory(detections)  └─ detections_lib (OBJECT)
+├─ add_subdirectory(programs)    └─ programs_lib + optional BPF object
+│
+└─ add_subdirectory(tests)
+    ├─ FetchContent GoogleTest/GMock once when GTest::gmock is unavailable
+    ├─ https_guard_tests
+    │  └─ GTest + detections_lib + actions_lib + https_guard_test_deps
+    └─ detectloop_harness
+        └─ GMock + real DetectLoop.cpp/ConnRateSweeper.cpp
+            + local action/dispatch/libbpf doubles
+```
+
+The shared interface target is the dependency hand-off between the root and
+tests; it prevents tests from repeating package discovery and common link
+flags. `detectloop_harness` does not link `detections_lib` or `actions_lib`
+because those object libraries contain the real collaborators that the harness
+replaces at link time.
+
 **Build targets:**
 - `https_guardd` - Main daemon binary (root `CMakeLists.txt`)
 - `action_runner` - Test harness for ActionLoop (`actions/CMakeLists.txt`)
 - `https_guard.bpf.o` - BPF object, when `HTTPS_GUARD_BUILD_BPF=ON` (`programs/CMakeLists.txt`)
 - `https_guard_tests` - GoogleTest unit tests, when `HTTPS_GUARD_BUILD_TESTS=ON` (default off when cross-compiling — see `tests/CMakeLists.txt` and `tests/TESTS.md`)
+- `detectloop_harness` - GMock-backed scheduling harness using the real detection engine sources, when `HTTPS_GUARD_BUILD_TESTS=ON`
 
 **A cross-compile trap worth knowing about:** a target's default output directory mirrors the *source* subdirectory it's defined in (`CMAKE_CURRENT_BINARY_DIR`), not the top-level build root. Moving a target's `add_executable`/custom-command into a concern's own `CMakeLists.txt` silently moves its output too. Three things the BitBake recipe expects to find flat under `${B}` are pinned back to `${CMAKE_BINARY_DIR}` explicitly for this reason: `https_guard.bpf.o` (`programs/CMakeLists.txt`), `action_runner`'s `RUNTIME_OUTPUT_DIRECTORY` (`actions/CMakeLists.txt`), and `ssl_version_offset.h`'s write location in the recipe's own `do_compile:prepend()`. `https_guardd` is unaffected — its `add_executable` stays in the root `CMakeLists.txt`, where `CMAKE_CURRENT_BINARY_DIR` already equals `CMAKE_BINARY_DIR`.
 

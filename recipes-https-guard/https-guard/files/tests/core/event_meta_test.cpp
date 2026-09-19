@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include <cstdint>
 
@@ -43,28 +43,10 @@ TEST(EventMetaTest, BothSourcesAgreeOnWhichFieldHoldsThePeerDespiteOppositeWireV
 
 namespace {
 
-class CountingResolver final : public IPeerResolver
+class MockPeerResolver final : public IPeerResolver
 {
 public:
-    explicit CountingResolver(bool succeed) noexcept : succeed_(succeed) {}
-
-    bool resolvePeer(EventMeta& meta) const noexcept override
-    {
-        ++calls;
-        if (!succeed_) {
-            return false;   // leaves the tuple zeroed, as the real one does
-        }
-        meta.local_ip_v4  = 0x0F00000A;
-        meta.remote_ip_v4 = 0x0100000A;
-        meta.local_port   = 443;
-        meta.remote_port  = 51000;
-        return true;
-    }
-
-    mutable int calls = 0;
-
-private:
-    bool succeed_;
+    MOCK_METHOD(bool, resolvePeer, (EventMeta&), (const, noexcept, override));
 };
 
 }  // namespace
@@ -73,40 +55,52 @@ TEST(EventMetaTest, PeerResolutionDoesNotHappenDuringParsing)
 {
     // The whole saving: reading /proc is the most expensive thing in the
     // pipeline, and only the enforcing path needs the result.
-    CountingResolver resolver{true};
+    MockPeerResolver resolver;
+    EXPECT_CALL(resolver, resolvePeer(::testing::_)).Times(0);
     const auto raw = makeUprobeEvent(HG_UPROBE_DIR_WRITE, 0x0304, "bmcweb", "HTTP/1.1 200 OK");
 
     EventMeta meta;
     const TrafficObservedDetection<struct uprobe_event> detection{&resolver};
     (void)detection.inspect(&raw, sizeof(raw), meta);
 
-    EXPECT_EQ(resolver.calls, 0);
     EXPECT_EQ(meta.peer_resolver, &resolver);
     EXPECT_EQ(meta.remote_ip_v4, 0u);
 }
 
 TEST(EventMetaTest, PeerResolutionIsMemoisedRepeatedAsksCostOneProcRead)
 {
-    CountingResolver resolver{true};
+    MockPeerResolver resolver;
     EventMeta meta;
     meta.peer_resolver = &resolver;
+
+    EXPECT_CALL(resolver, resolvePeer(::testing::_))
+        .Times(1)
+        .WillOnce(::testing::Invoke([](EventMeta& resolved) noexcept {
+            resolved.local_ip_v4  = 0x0F00000A;
+            resolved.remote_ip_v4 = 0x0100000A;
+            resolved.local_port   = 443;
+            resolved.remote_port  = 51000;
+            return true;
+        }));
 
     EXPECT_TRUE(meta.ensurePeerResolved());
     EXPECT_TRUE(meta.ensurePeerResolved());
     EXPECT_TRUE(meta.ensurePeerResolved());
-    EXPECT_EQ(resolver.calls, 1);
     EXPECT_EQ(meta.remote_ip_v4, 0x0100000A);
 }
 
 TEST(EventMetaTest, AFailedResolutionIsRememberedNotRetried)
 {
-    CountingResolver resolver{false};
+    MockPeerResolver resolver;
     EventMeta meta;
     meta.peer_resolver = &resolver;
 
+    EXPECT_CALL(resolver, resolvePeer(::testing::_))
+        .Times(1)
+        .WillOnce(::testing::Return(false));
+
     EXPECT_FALSE(meta.ensurePeerResolved());
     EXPECT_FALSE(meta.ensurePeerResolved());
-    EXPECT_EQ(resolver.calls, 1);
     EXPECT_EQ(meta.remote_ip_v4, 0u);   // fail-closed: nothing to enforce against
 }
 

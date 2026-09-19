@@ -9,8 +9,8 @@
 
 find_package(GTest QUIET)
 
-if(NOT GTest_FOUND)
-    message(STATUS "GoogleTest not found on system; fetching GoogleTest v1.15.2 via CMake FetchContent")
+if(NOT TARGET GTest::gmock)
+    message(STATUS "GoogleTest/GMock not found on system; fetching GoogleTest v1.15.2 via CMake FetchContent")
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
         googletest
@@ -44,8 +44,13 @@ add_executable(https_guard_tests
 # with undefined references, even though no TEST_CASE ever calls into either
 # at runtime: nothing here constructs a DetectLoop, dispatches a verdict, or
 # touches a BPF map, only the plain parsers and *Detector rule classes.
-target_link_libraries(https_guard_tests PRIVATE GTest::gtest_main detections_lib actions_lib ${LIBBPF_LIBRARIES})
-target_link_directories(https_guard_tests PRIVATE ${LIBBPF_LIBRARY_DIRS})
+target_link_libraries(https_guard_tests PRIVATE
+    GTest::gtest_main
+    GTest::gmock
+    detections_lib
+    actions_lib
+    https_guard_test_deps
+)
 
 # The paths below are the few headers that live under programs/ because they
 # are the BPF<->userspace wire format rather than code.
@@ -59,5 +64,32 @@ target_include_directories(https_guard_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/programs/utils
 )
 
+# Compile only the production engine sources exercised by this harness. Its
+# link-time doubles replace actions, dispatch and libbpf, so the complete
+# detections_lib/actions_lib object libraries must not be linked here.
+add_executable(detectloop_harness
+    detectloop/detectloop_harness.cpp
+    ${CMAKE_SOURCE_DIR}/detections/core/engine/DetectLoop.cpp
+    ${CMAKE_SOURCE_DIR}/detections/core/sweep/ConnRateSweeper.cpp
+)
+target_include_directories(detectloop_harness PRIVATE
+    ${CMAKE_SOURCE_DIR}/detections/core/contract
+    ${CMAKE_SOURCE_DIR}/detections/core/event
+    ${CMAKE_SOURCE_DIR}/detections/core/engine
+    ${CMAKE_SOURCE_DIR}/detections/core/sweep
+    ${CMAKE_SOURCE_DIR}/detections/rate_sweep
+    ${CMAKE_SOURCE_DIR}/actions
+    ${CMAKE_SOURCE_DIR}/actions/core
+    ${CMAKE_SOURCE_DIR}/actions/log
+    ${CMAKE_SOURCE_DIR}/actions/blocklist
+    ${CMAKE_SOURCE_DIR}/actions/tcp
+    ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
+)
+target_link_libraries(detectloop_harness PRIVATE
+    GTest::gmock
+    https_guard_test_deps
+)
+
 include(CTest)
 add_test(NAME https_guard_tests COMMAND https_guard_tests)
+add_test(NAME detectloop_harness COMMAND detectloop_harness)
