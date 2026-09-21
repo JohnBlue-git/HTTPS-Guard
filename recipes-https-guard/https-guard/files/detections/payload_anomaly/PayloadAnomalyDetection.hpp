@@ -43,6 +43,10 @@ public:
         {
             fillConnection(raw->conn, meta);
         }
+        else if constexpr (HasResolvedConnectionTuple<RawT>)
+        {
+            fillResolvedConnection(raw->resolved_conn, meta, resolver_);
+        }
         else
         {
             meta.peer_resolver = resolver_;

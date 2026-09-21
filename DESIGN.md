@@ -287,7 +287,7 @@ and then nests whatever that hook alone can observe:
 
 | Hook | Layout | Size |
 |---|---|---|
-| `ssl_uprobe` | `hdr` · `direction` · `hg_uprobe_tls` | 184 B |
+| `ssl_uprobe` | `hdr` · `direction` · `hg_uprobe_tls` · `hg_uprobe_conn` | 224 B |
 | `xdp_tls` | `hdr` · `hg_conn_tuple` · `hg_xdp_tls` · `hg_client_hello` | 352 B |
 | `lsm_cert_guard` | `hdr` · `hg_cert_access` | 56 B |
 

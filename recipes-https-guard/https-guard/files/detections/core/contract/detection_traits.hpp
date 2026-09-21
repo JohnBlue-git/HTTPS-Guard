@@ -22,6 +22,21 @@ namespace https_guard {
 template <class RawT>
 concept HasConnectionTuple = requires(const RawT& r) { r.conn; };
 
+/*
+ * A connection tuple that may or may not actually be populated at runtime --
+ * distinct from HasConnectionTuple, whose tuple is always valid once it
+ * exists (the wire/XDP case). ssl_uprobe's kernel-side session binding
+ * resolves a tuple only sometimes, signalled by an explicit `resolved` flag
+ * rather than an all-zero address (see hg_uprobe_conn's own comment), so a
+ * detection serving this source needs a runtime check, not just a
+ * compile-time "does the field exist" one. Kept as its own concept, on its
+ * own field name (`resolved_conn`, not `conn`), rather than overloading
+ * HasConnectionTuple's existing meaning for its other user (XDP-only
+ * detections that call fillConnection() unconditionally).
+ */
+template <class RawT>
+concept HasResolvedConnectionTuple = requires(const RawT& r) { r.resolved_conn.resolved; };
+
 template <class RawT>
 concept HasTlsFields = requires(const RawT& r) { r.tls.version; };
 
