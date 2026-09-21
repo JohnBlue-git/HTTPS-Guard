@@ -33,10 +33,40 @@ TEST(EventMetaTest, BothSourcesAgreeOnWhichFieldHoldsThePeerDespiteOppositeWireV
     EventMeta meta;
     (void)TrafficObservedDetection<struct xdp_event>{}.inspect(&raw, sizeof(raw), meta);
 
-    EXPECT_EQ(meta.remote_ip_v4, kPeer);
-    EXPECT_EQ(meta.local_ip_v4, kUs);
+    EXPECT_EQ(meta.remote_ip.v4(), kPeer);
+    EXPECT_EQ(meta.local_ip.v4(), kUs);
+    EXPECT_EQ(meta.remote_ip.family, IpFamily::kV4);
+    EXPECT_EQ(meta.local_ip.family, IpFamily::kV4);
     EXPECT_EQ(meta.local_port, 443);
     EXPECT_EQ(meta.remote_port, 51000);
+}
+
+TEST(IpAddressTest, SetV4RoundTripsTheAddressAndTagsTheFamily)
+{
+    IpAddress addr;
+    EXPECT_FALSE(addr.isSet());   // default-constructed: nothing written yet
+
+    addr.setV4(0x0100000A);
+
+    EXPECT_EQ(addr.family, IpFamily::kV4);
+    EXPECT_EQ(addr.v4(), 0x0100000A);
+    EXPECT_TRUE(addr.isSet());
+}
+
+TEST(IpAddressTest, CanRepresentAnIpv6AddressDistinctFromIpv4)
+{
+    // No production producer fills this yet (ssl_uprobe's kernel-side
+    // binding is a later ticket) -- this pins that the representation itself
+    // is dual-stack-capable, independent of who eventually populates it.
+    IpAddress addr;
+    addr.family = IpFamily::kV6;
+    addr.bytes  = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01};  // 2001:db8::1
+
+    EXPECT_EQ(addr.family, IpFamily::kV6);
+    EXPECT_TRUE(addr.isSet());
+    // The first 4 bytes alone must not be mistaken for a v4 reading -- v4()
+    // is only meaningful when family is kV4, which callers must check first.
+    EXPECT_NE(addr.bytes[15], 0);  // the address's last byte carries real data
 }
 
 // --- lazy peer resolution ---------------------------------------------------
@@ -64,7 +94,7 @@ TEST(EventMetaTest, PeerResolutionDoesNotHappenDuringParsing)
     (void)detection.inspect(&raw, sizeof(raw), meta);
 
     EXPECT_EQ(meta.peer_resolver, &resolver);
-    EXPECT_EQ(meta.remote_ip_v4, 0u);
+    EXPECT_FALSE(meta.remote_ip.isSet());
 }
 
 TEST(EventMetaTest, PeerResolutionIsMemoisedRepeatedAsksCostOneProcRead)
@@ -76,17 +106,17 @@ TEST(EventMetaTest, PeerResolutionIsMemoisedRepeatedAsksCostOneProcRead)
     EXPECT_CALL(resolver, resolvePeer(::testing::_))
         .Times(1)
         .WillOnce(::testing::Invoke([](EventMeta& resolved) noexcept {
-            resolved.local_ip_v4  = 0x0F00000A;
-            resolved.remote_ip_v4 = 0x0100000A;
-            resolved.local_port   = 443;
-            resolved.remote_port  = 51000;
+            resolved.local_ip.setV4(0x0F00000A);
+            resolved.remote_ip.setV4(0x0100000A);
+            resolved.local_port  = 443;
+            resolved.remote_port = 51000;
             return true;
         }));
 
     EXPECT_TRUE(meta.ensurePeerResolved());
     EXPECT_TRUE(meta.ensurePeerResolved());
     EXPECT_TRUE(meta.ensurePeerResolved());
-    EXPECT_EQ(meta.remote_ip_v4, 0x0100000A);
+    EXPECT_EQ(meta.remote_ip.v4(), 0x0100000A);
 }
 
 TEST(EventMetaTest, AFailedResolutionIsRememberedNotRetried)
@@ -101,20 +131,20 @@ TEST(EventMetaTest, AFailedResolutionIsRememberedNotRetried)
 
     EXPECT_FALSE(meta.ensurePeerResolved());
     EXPECT_FALSE(meta.ensurePeerResolved());
-    EXPECT_EQ(meta.remote_ip_v4, 0u);   // fail-closed: nothing to enforce against
+    EXPECT_FALSE(meta.remote_ip.isSet());   // fail-closed: nothing to enforce against
 }
 
 TEST(EventMetaTest, AnEventThatAlreadyKnowsItsAddressNeedsNoResolverToEnforce)
 {
     // Pins the regression that silently disabled enforcement for XDP and
-    // connection-rate events: both fill remote_ip_v4 directly and carry no
+    // connection-rate events: both fill remote_ip directly and carry no
     // resolver, so gating enforcement on ensurePeerResolved() returning true
     // skipped them entirely.
     EventMeta meta;
-    meta.remote_ip_v4 = 0x0100000A;
-    meta.local_ip_v4  = 0x0F00000A;
+    meta.remote_ip.setV4(0x0100000A);
+    meta.local_ip.setV4(0x0F00000A);
 
     EXPECT_EQ(meta.peer_resolver, nullptr);
     EXPECT_FALSE(meta.ensurePeerResolved());   // nothing to resolve...
-    EXPECT_NE(meta.remote_ip_v4, 0u);          // ...but the address is there
+    EXPECT_TRUE(meta.remote_ip.isSet());       // ...but the address is there
 }

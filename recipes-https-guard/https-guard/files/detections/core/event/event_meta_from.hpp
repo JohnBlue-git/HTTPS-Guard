@@ -38,11 +38,11 @@ inline void fillEnvelope(const RawT& raw, EventMeta& meta) noexcept
 template <class ConnT>
 inline void fillConnection(const ConnT& conn, EventMeta& meta) noexcept
 {
-    meta.local_ip_v4  = conn.dst_ip_v4;
-    meta.remote_ip_v4 = conn.src_ip_v4;
-    meta.local_port   = conn.dst_port;
-    meta.remote_port  = conn.src_port;
-    meta.source_ip    = boundedString(conn.src_ip_str);
+    meta.local_ip.setV4(conn.dst_ip_v4);
+    meta.remote_ip.setV4(conn.src_ip_v4);
+    meta.local_port  = conn.dst_port;
+    meta.remote_port = conn.src_port;
+    meta.source_ip   = boundedString(conn.src_ip_str);
 }
 
 }  // namespace https_guard

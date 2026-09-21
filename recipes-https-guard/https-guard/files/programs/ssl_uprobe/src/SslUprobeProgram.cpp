@@ -133,10 +133,10 @@ bool SslUprobeProgram::resolvePeer(EventMeta& meta) const noexcept
         return false;
     }
 
-    meta.local_ip_v4  = peer.entry.local_ip_v4;
-    meta.remote_ip_v4 = peer.entry.remote_ip_v4;
-    meta.local_port   = peer.entry.local_port;
-    meta.remote_port  = peer.entry.remote_port;
+    meta.local_ip.setV4(peer.entry.local_ip_v4);
+    meta.remote_ip.setV4(peer.entry.remote_ip_v4);
+    meta.local_port  = peer.entry.local_port;
+    meta.remote_port = peer.entry.remote_port;
     return true;
 }
 

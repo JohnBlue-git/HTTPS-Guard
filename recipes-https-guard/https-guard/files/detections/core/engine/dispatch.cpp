@@ -80,7 +80,7 @@ void dispatchVerdict(const EventMeta& meta,
          * SOCK_DESTROY needs the connection to still exist. The synchronous call
          * here maximises the chance the socket is still there to destroy. */
         meta.ensurePeerResolved();
-        if (meta.remote_ip_v4 != 0)
+        if (meta.remote_ip.isSet())
         {
             /* Tearing down a connection only makes sense when we know which
              * connection. A rate violation is attributed to an address, not a
@@ -88,19 +88,32 @@ void dispatchVerdict(const EventMeta& meta,
              * destroy a zero tuple produced a guaranteed -ENOENT and a
              * misleading "SOCK_DESTROY failed" line. The blocklist below is the
              * meaningful response for that case. */
-            const bool have_full_tuple = meta.local_ip_v4 != 0 &&
+            const bool have_full_tuple = meta.local_ip.isSet() &&
                                           meta.local_port != 0 &&
                                           meta.remote_port != 0;
-            if (have_full_tuple)
+
+            /* Both actions below are IPv4-only today, matching every producer
+             * of this tuple as of this change. A kV6 tuple falls through
+             * both `if`s untouched rather than being misread as kV4 -- a
+             * later ticket (the ssl_uprobe kernel-side session binding) adds
+             * the IPv6-capable teardown and the "blocklisting skipped, map is
+             * IPv4-only" log line; nothing produces a kV6 tuple yet, so
+             * there is nothing to log here today. */
+            if (have_full_tuple &&
+                meta.local_ip.family == IpFamily::kV4 &&
+                meta.remote_ip.family == IpFamily::kV4)
             {
                 response.push_back(std::make_unique<BlockTcpAction>(
-                    meta.local_ip_v4, meta.remote_ip_v4,
+                    meta.local_ip.v4(), meta.remote_ip.v4(),
                     meta.local_port, meta.remote_port, verdict.message));
             }
 
-            response.push_back(std::make_unique<BlocklistAddAction>(
-                meta.remote_ip_v4,   /* block the peer, never our own address */
-                ctx.blocklist_ttl, verdict.message));
+            if (meta.remote_ip.family == IpFamily::kV4)
+            {
+                response.push_back(std::make_unique<BlocklistAddAction>(
+                    meta.remote_ip.v4(),   /* block the peer, never our own address */
+                    ctx.blocklist_ttl, verdict.message));
+            }
         }
         else
         {

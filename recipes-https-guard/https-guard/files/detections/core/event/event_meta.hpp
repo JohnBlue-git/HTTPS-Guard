@@ -1,11 +1,67 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "IPeerResolver.hpp"
 
 namespace https_guard {
+
+/** Which shape the bytes in an `IpAddress` are. */
+enum class IpFamily : std::uint8_t {
+    kV4,
+    kV6,
+};
+
+/**
+ * A local or remote endpoint address, IPv4 or IPv6, tagged explicitly rather
+ * than assumed.
+ *
+ * Byte order matches the convention the rest of this struct already uses:
+ * NETWORK byte order, so the bytes are exactly what inet_ntop/inet_ntop6 and
+ * netlink's __be32/struct in6_addr fields expect verbatim. For `kV4`, only
+ * the first 4 bytes are meaningful; the remaining 12 are zero and unused.
+ *
+ * As of this type's introduction, every producer in this codebase only ever
+ * sets `kV4` -- the wire (XDP) hook, the `/proc`-based uprobe fallback, and
+ * the rate-sweep synthesised events are all IPv4-only today. The tag exists
+ * so a future producer (ssl_uprobe's kernel-side session binding) can supply
+ * an IPv6 tuple without every consumer needing to change again.
+ */
+struct IpAddress {
+    IpFamily family = IpFamily::kV4;
+    std::array<std::uint8_t, 16> bytes{};
+
+    /** True once something has actually been written here. */
+    bool isSet() const noexcept
+    {
+        return std::any_of(bytes.begin(), bytes.end(),
+                            [](std::uint8_t b) noexcept { return b != 0; });
+    }
+
+    /**
+     * The address as a plain 32-bit IPv4 value (network byte order).
+     * Only meaningful when `family == IpFamily::kV4` -- callers must check
+     * that first; this simply reads the first 4 bytes regardless of family.
+     */
+    std::uint32_t v4() const noexcept
+    {
+        std::uint32_t v = 0;
+        std::memcpy(&v, bytes.data(), sizeof(v));
+        return v;
+    }
+
+    /** Sets this address to an IPv4 value (network byte order) and tags it kV4. */
+    void setV4(std::uint32_t v) noexcept
+    {
+        family = IpFamily::kV4;
+        bytes.fill(0);
+        std::memcpy(bytes.data(), &v, sizeof(v));
+    }
+};
 
 /**
  * What every event has, regardless of which hook or sweeper produced it.
@@ -48,13 +104,18 @@ struct EventMeta {
     //
     // Byte order:
     //   - addresses are NETWORK byte order (memory bytes as on the wire, so
-    //     inet_ntop and netlink's __be32 fields take them verbatim)
+    //     inet_ntop and netlink's __be32/in6_addr fields take them verbatim)
     //   - ports are HOST byte order (print directly; convert with htons()
     //     at any boundary wanting network order)
-    std::uint32_t local_ip_v4  = 0;
-    std::uint32_t remote_ip_v4 = 0;
-    std::uint16_t local_port   = 0;
-    std::uint16_t remote_port  = 0;
+    //
+    // local_ip_v4/remote_ip_v4 (plain uint32_t) were folded into IpAddress
+    // above so a producer that knows an IPv6 peer can say so; every producer
+    // as of this change still only ever sets kV4, so isSet()/v4()/setV4()
+    // read exactly like the old zero-means-unset uint32_t did.
+    IpAddress     local_ip;
+    IpAddress     remote_ip;
+    std::uint16_t local_port  = 0;
+    std::uint16_t remote_port = 0;
 
     /** Printable peer address, when the producer knows it. */
     std::string source_ip;

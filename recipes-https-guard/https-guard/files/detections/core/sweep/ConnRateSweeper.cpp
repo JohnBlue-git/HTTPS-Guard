@@ -138,8 +138,8 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
                 if (prev == reported_rate_.end() || prev->second != entry.window_start_ns)
                 {
                     EventMeta meta;
-                    meta.remote_ip_v4 = key;
-                    meta.source_ip    = describe(key);
+                    meta.remote_ip.setV4(key);
+                    meta.source_ip = describe(key);
                     meta.timestamp_ns = now_ns;
                     const ConnRateEvent evt(meta, entry.syn_count,
                                              HTTPS_GUARD_CONN_RATE_WINDOW_SEC,
@@ -159,8 +159,8 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
                 if (prev == reported_reneg_.end() || prev->second != entry.window_start_ns)
                 {
                     EventMeta meta;
-                    meta.remote_ip_v4 = key;
-                    meta.source_ip    = describe(key);
+                    meta.remote_ip.setV4(key);
+                    meta.source_ip = describe(key);
                     meta.timestamp_ns = now_ns;
                     const RenegotiationEvent evt(meta, entry.hello_count,
                                                   HTTPS_GUARD_CONN_RATE_WINDOW_SEC,
@@ -185,8 +185,8 @@ boost::asio::awaitable<void> ConnRateSweeper::sweep(const DispatchContext& ctx)
                 if (prev == reported_open_.end() || level > prev->second)
                 {
                     EventMeta meta;
-                    meta.remote_ip_v4 = key;
-                    meta.source_ip    = describe(key);
+                    meta.remote_ip.setV4(key);
+                    meta.source_ip = describe(key);
                     meta.timestamp_ns = now_ns;
                     const SlowlorisEvent evt(meta, level, thresholds_.open_conns);
                     if (auto v = kSlowlorisRule.evaluate(evt))
