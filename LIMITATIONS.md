@@ -106,21 +106,47 @@ the image does not carry. Treat those as host-side or bridged-debugging steps.
   testing. Connection-rate detection *is* actionable, deliberately, because a
   flood is ongoing harm — which makes its threshold safety-critical rather
   than a tuning detail.
-- **Uprobe events often cannot be attributed to a connection.** A uprobe
-  carries no socket identity, so the peer is resolved by intersecting the
-  process's owned socket inodes with established connections. When a process
-  owns more than one, the event is deliberately left unresolved and
-  enforcement declines rather than guessing — acting on the wrong connection
-  would blocklist an uninvolved host. Resolving this properly needs the socket
-  fd read out of the `SSL` object's `BIO` in BPF.
-- **Open question:** during a live request, bmcweb's own file descriptors were
-  observed to be unix-domain and listening sockets rather than an established
-  TCP socket, so uprobe-path enforcement may rarely resolve for bmcweb at all.
-  If that holds, `/proc`-based attribution is the wrong mechanism rather than
-  a buggy one. Not yet settled.
+- **A uprobe carries no socket identity by itself.** The original mechanism
+  resolved the peer by intersecting the process's owned socket inodes with
+  `/proc/<pid>/net/tcp`'s established connections — which fails closed the
+  moment a process owns more than one such connection, since there is no way
+  to tell which one a given event belongs to and acting on the wrong one would
+  blocklist an uninvolved host. This was bmcweb's normal case (any BMC serving
+  more than one client at once), so it was also the common failure.
+- **Kernel-side session binding (`ssl_uprobe`'s `tcp_recvmsg`/`tcp_sendmsg`
+  kprobes plus `SSL_accept`/`SSL_connect`/`SSL_free` uprobes) now resolves this
+  without `/proc`**, for both IPv4 and IPv6, port 443 only — see
+  `programs/DESIGN.md`'s "Kernel-side session binding" section for the
+  mechanism and `detections/DESIGN.md` for how a resolved tuple reaches
+  `EventMeta`. It is entirely additive: `/proc`-based `ProcPeerResolver`
+  remains the fallback, unchanged, whenever the binding does not apply —
+  chiefly a connection that predates the daemon's attach (nothing recorded its
+  tuple before the socket started being used), a non-OpenSSL-API caller this
+  binding's uprobes never see, or the rare thread-affinity miss described
+  next. Fixes the common bmcweb case; does not claim to resolve every uprobe
+  event.
+- **The binding trusts calling-thread affinity between record and consume,
+  and is safe by construction if that trust is misplaced.** A kprobe records
+  "the port-443 socket this thread most recently touched"; `SSL_accept`/
+  `SSL_connect` consume that record (read then delete) for whichever `SSL*`
+  they were called with. If a thread ever touches an unrelated port-443
+  socket between the two, the record is simply wrong for that binding attempt
+  — but the consume-once-then-delete design means a wrong or stale record can
+  only ever be used *once* and is gone immediately after, so this can under-
+  bind (falls back to `/proc`, as if the mechanism did not exist for that
+  event) but cannot mis-bind a live session to the wrong peer indefinitely.
+  Not independently load-tested against a thread-pool server that interleaves
+  many connections' I/O on one thread; bmcweb's own live multi-connection
+  case was verified directly (see `.scratch/dual-stack-peer-attribution/`).
 - **Connection teardown needs a full 4-tuple.** Verdicts attributed to an
   address rather than a connection (connection-rate violations) blocklist the
   source but cannot tear down a specific socket.
+- **The blocklist (BPF map, checked by XDP) is IPv4-only.** An IPv6-attributed
+  verdict still tears down the exact connection via `SOCK_DESTROY`, but
+  blocklisting is skipped and logged rather than silently doing nothing — see
+  `actions/blocklist/BlocklistAction.hpp`. Extending the blocklist to IPv6
+  would need a wider map key and an XDP-side lookup change; not attempted
+  since only the uprobe path currently produces an IPv6-attributed tuple.
 - **`SOCK_DESTROY` requires `CONFIG_INET_DIAG`.** It is enabled in
   `recipes-kernel/linux/bpf-kernel-config.cfg`; on a kernel without it, every
   teardown fails with `-ENOENT` from `sock_diag` before the 4-tuple is even

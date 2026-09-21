@@ -204,10 +204,16 @@ it cannot make an unchecked XDP packet access safe. For userspace memory, use
 the appropriate `bpf_probe_read_user()` strategy and a known userspace ABI or
 generated offset; CO-RE cannot relocate a type that is absent from kernel BTF.
 
-The current hooks have no kernel pointer chain that benefits from
-`BPF_CORE_READ()`: XDP uses verifier-required packet checks, LSM reads a
-trusted `file->f_path`, and the uprobe reads OpenSSL memory. The BPF object
-therefore deliberately keeps the CO-RE header out of its include list. See
+Most hooks have no kernel pointer chain that benefits from `BPF_CORE_READ()`:
+XDP uses verifier-required packet checks, LSM reads a trusted `file->f_path`,
+and the uprobe's own event capture reads OpenSSL memory (via
+`bpf_probe_read_user()`, since `ssl_st` has no BTF). The one exception is
+`ssl_uprobe`'s kernel-side session binding (`programs/ssl_uprobe/ebpf/ssl_uprobe.bpf.h`),
+which reads `struct sock` fields from a `tcp_recvmsg`/`tcp_sendmsg` kprobe's
+untyped `pt_regs`-derived pointer — `struct sock` *does* have kernel BTF,
+unlike `ssl_st`, which is exactly why this one path uses `BPF_CORE_READ_INTO()`
+instead of a build-time offset. `bpf_core_read.h` is therefore included from
+`programs/core/ebpf/https_guard.bpf.c`. See
 [`programs/DESIGN.md`](recipes-https-guard/https-guard/files/programs/DESIGN.md)
 for the per-access decision table.
 

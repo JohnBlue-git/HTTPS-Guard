@@ -123,6 +123,41 @@ The reason is in
 of the `SSL_read` pair failing is logged but non-fatal, since `SSL_write` alone
 still works. The daemon refuses to start only if *zero* hooks attach.
 
+**Kernel-side session binding** (five more programs, all non-fatal — see
+`detections/DESIGN.md`'s peer-attribution notes and `LIMITATIONS.md`) resolves
+an `SSL*` to its socket 4-tuple without `/proc`, so attribution keeps working
+once a process — chiefly bmcweb — owns more than one established connection,
+which is exactly where the `/proc`-based `ProcPeerResolver` fails closed:
+
+| Program | Section | Role |
+|---|---|---|
+| `https_guard_tcp_recvmsg` | `kprobe/tcp_recvmsg` | records the calling thread's port-443 socket tuple |
+| `https_guard_tcp_sendmsg` | `kprobe/tcp_sendmsg` | same, for the send path |
+| `https_guard_ssl_accept` | `uprobe/ssl_accept` | binds `SSL*` to the calling thread's most recently recorded tuple (server side) |
+| `https_guard_ssl_connect` | `uprobe/ssl_connect` | same, client side |
+| `https_guard_ssl_free` | `uprobe/ssl_free` | releases the binding promptly rather than waiting on LRU eviction |
+
+The two kprobes read `struct sock` fields via `BPF_CORE_READ_INTO()` — real
+kernel BTF, unlike `ssl_st` — filtered to port 443 on either end before
+recording anything, so there is no per-packet cost on unrelated traffic. A
+dual-stack listener (bmcweb binds `::`) reports `skc_family == AF_INET6` for
+an IPv4 peer exactly as for a real IPv6 one; only the legacy
+`skc_rcv_saddr`/`skc_daddr` fields are populated for that IPv4-mapped case; a
+nonzero legacy field is therefore checked *before* trusting family alone (see
+the comment at `read_sock_tuple_if_port_443()` in
+`ssl_uprobe/ebpf/ssl_uprobe.bpf.h`) — verified live: without that check, every
+dual-stack-accepted IPv4 peer (i.e. every real bmcweb connection) resolved to
+an all-zero address and fell through to the same fail-closed `/proc` gap this
+mechanism exists to fix.
+
+Binding happens once, at `SSL_accept`/`SSL_connect`'s *entry*: the thread's
+most recent port-443 kprobe record is consumed (read then deleted) into a
+session map keyed by the `SSL*` — a wrong thread-affinity assumption can only
+under-bind (event falls back to `/proc`, unchanged), never mis-bind, since a
+stale record is deleted the first time anything reads it. Both maps are
+`LRU_HASH`, matching this project's existing per-source-counter-map precedent
+for "bounded, self-cleaning" state.
+
 ### `xdp_tls` — XDP on the NIC RX path
 
 Attaches with `bpf_program__attach_xdp()`, which returns a real `bpf_link*`, so
@@ -215,8 +250,11 @@ an ABI-relocation helper for kernel memory. Direct field access to a
 BTF debug information; the two forms are not mutually exclusive. Prefer
 direct access when the verifier already knows the pointer and the access is
 bounded; use the helper when pointer chasing or its explicit read semantics
-make it necessary. In this tree `bpf_core_read.h` is not
-needed by the current hooks, so it is intentionally not included by the BPF
+make it necessary. `ssl_uprobe`'s kernel-side session binding is this tree's
+one relocatable-kernel-pointer-chain case (row three): its `tcp_recvmsg`/
+`tcp_sendmsg` kprobes read `struct sock` fields — real kernel BTF, unlike
+`ssl_st` — from an untyped `pt_regs`-derived pointer via
+`BPF_CORE_READ_INTO()`, so `bpf_core_read.h` is included by the BPF
 translation unit.
 
 ## The raw event ABI

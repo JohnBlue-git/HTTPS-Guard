@@ -35,6 +35,13 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+/* bpf_core_read.h supports ssl_uprobe's kernel-side session binding: reading
+ * struct sock fields (kernel BTF, real, relocatable across kernel configs)
+ * through a kprobe's untyped pt_regs-derived pointer -- unlike ssl_st, whose
+ * *absence* from kernel BTF is why the uprobe side still uses a build-time
+ * offset (gen_ssl_offset.c) instead. See programs/DESIGN.md. */
 
 /* Shared event-source discriminator (used by both hooks' event structs) */
 #include "hg_event_source.h"

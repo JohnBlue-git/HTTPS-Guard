@@ -112,6 +112,253 @@ read_tls_version(const void *ssl)
  *   - arg2: buf  (pointer to plaintext already being sent — valid at entry)
  *   - arg3: num  (length in bytes)
  */
+/* =========================================================================
+ * Kernel-side session binding.
+ *
+ * Resolves an SSL_write/SSL_read event's own connection tuple entirely in
+ * BPF, without /proc: a kprobe on tcp_recvmsg/tcp_sendmsg records the port-
+ * 443 socket a thread most recently touched; SSL_accept/SSL_connect
+ * consumes that record (exactly once) to bind the calling SSL session to
+ * it; SSL_write/SSL_read then look the session up by its own ssl pointer
+ * and embed the tuple directly into the event they already submit.
+ * SSL_free clears the binding. See LIMITATIONS.md for the thread-affinity
+ * assumption this relies on and why it is safe to ship unverified: the
+ * single-use per-thread key means a wrong assumption only ever under-binds
+ * (falls back to /proc), never mis-binds.
+ *
+ * LRU_HASH, not HASH, for both maps -- the same reasoning xdp_tls's
+ * per-source counter map already uses: bounded by construction, and a
+ * thread or session whose binding is never consumed/freed (a non-TLS
+ * process touching port 443, a session freed by a path this hook doesn't
+ * observe) ages out under turnover instead of leaking forever.
+ * ========================================================================= */
+
+#define HG_SESSION_TUPLE_PORT 443
+/* Stable Linux UAPI values (include/linux/socket.h), never change across
+ * architectures or kernel versions -- not sourced from vmlinux.h because
+ * these are #defines, not BTF-visible types. */
+#define HG_AF_INET  2
+#define HG_AF_INET6 10
+
+struct hg_bound_tuple {
+    __u8  is_ipv6;
+    __u8  padding[7];
+    __u8  local_addr[16];
+    __u8  remote_addr[16];
+    __u16 local_port;   /* host byte order */
+    __u16 remote_port;  /* host byte order */
+    __u64 timestamp_ns;
+};
+
+/* {pid_tgid -> the port-443 socket this thread most recently touched}. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __type(value, struct hg_bound_tuple);
+} https_guard_thread_tuple_map SEC(".maps");
+
+/* {SSL* (as an integer) -> its bound tuple}. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u64);
+    __type(value, struct hg_bound_tuple);
+} https_guard_session_tuple_map SEC(".maps");
+
+/*
+ * Populates *out from a kernel struct sock*, iff local or remote port is
+ * 443. sk is untrusted/untyped as far as the verifier is concerned -- it
+ * comes from a classic kprobe's pt_regs, not a BTF-typed fentry/LSM
+ * argument -- so every field is read via BPF_CORE_READ_INTO(), the same
+ * "don't dereference directly, read explicitly" rule this file already
+ * applies to ssl (bpf_probe_read_user()), just for kernel memory instead of
+ * userspace memory, and with CO-RE relocation since struct sock (unlike
+ * ssl_st) actually has kernel BTF to relocate against.
+ *
+ * skc_num (local port) is host byte order; skc_dport (remote port) is
+ * network byte order -- a real, well-known kernel inconsistency, not a
+ * copy-paste mismatch between the two reads below.
+ */
+static __always_inline int
+read_sock_tuple_if_port_443(struct sock *sk, struct hg_bound_tuple *out)
+{
+    __u16 family = 0, num_host = 0, dport_be = 0;
+
+    /* sk_family/sk_num/sk_dport/sk_daddr/... are #define aliases for
+     * __sk_common.skc_* in the kernel's own include/net/sock.h -- real
+     * macros, not BTF-visible members, so vmlinux.h (a BTF dump: types
+     * only, no preprocessor) does not have them. The first build of this
+     * code assumed otherwise and failed with "no member named 'sk_family'
+     * in 'struct sock'"; the real, relocatable path is __sk_common.skc_*. */
+    BPF_CORE_READ_INTO(&family, sk, __sk_common.skc_family);
+    BPF_CORE_READ_INTO(&num_host, sk, __sk_common.skc_num);
+    BPF_CORE_READ_INTO(&dport_be, sk, __sk_common.skc_dport);
+    __u16 dport_host = bpf_ntohs(dport_be);
+
+    if (num_host != HG_SESSION_TUPLE_PORT && dport_host != HG_SESSION_TUPLE_PORT)
+    {
+        return 0;
+    }
+
+    __builtin_memset(out, 0, sizeof(*out));
+    out->local_port   = num_host;
+    out->remote_port  = dport_host;
+    out->timestamp_ns = bpf_ktime_get_ns();
+
+    /* A dual-stack listener (bmcweb binds "::") reports skc_family == AF_INET6
+     * for an IPv4 peer same as for a real IPv6 one -- but only sets the
+     * legacy skc_rcv_saddr/skc_daddr for the IPv4-mapped case; the
+     * skc_v6_rcv_saddr/skc_v6_daddr fields (checked first, so a real IPv6
+     * peer still takes that branch) are left all-zero rather than holding an
+     * an actual ::ffff:a.b.c.d form. So a nonzero legacy field is the signal
+     * that this AF_INET6 socket's peer is really IPv4 -- checked before
+     * trusting family alone, which is what made every dual-stack-accepted
+     * IPv4 peer resolve to an all-zero address (verified live: bmcweb's own
+     * connections never attributed, while a plain AF_INET-socket client's
+     * did). */
+    __u32 legacy_saddr = 0, legacy_daddr = 0;
+    BPF_CORE_READ_INTO(&legacy_saddr, sk, __sk_common.skc_rcv_saddr);
+    BPF_CORE_READ_INTO(&legacy_daddr, sk, __sk_common.skc_daddr);
+
+    if (family == HG_AF_INET6 && legacy_daddr == 0)
+    {
+        out->is_ipv6 = 1;
+        BPF_CORE_READ_INTO(out->local_addr, sk, __sk_common.skc_v6_rcv_saddr);
+        BPF_CORE_READ_INTO(out->remote_addr, sk, __sk_common.skc_v6_daddr);
+    }
+    else
+    {
+        __builtin_memcpy(out->local_addr, &legacy_saddr, sizeof(legacy_saddr));
+        __builtin_memcpy(out->remote_addr, &legacy_daddr, sizeof(legacy_daddr));
+    }
+
+    return 1;
+}
+
+/* tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
+ * tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+ * Both take sk as arg1 -- verified against this project's own target kernel
+ * source (net/ipv4/tcp.c, v6.18), not assumed, since this signature is not
+ * part of any stable kernel ABI and has changed across versions before. */
+SEC("kprobe/tcp_recvmsg")
+int https_guard_tcp_recvmsg(struct pt_regs *ctx)
+{
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    struct hg_bound_tuple tup;
+
+    if (!sk || !read_sock_tuple_if_port_443(sk, &tup))
+    {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&https_guard_thread_tuple_map, &pid_tgid, &tup, BPF_ANY);
+    return 0;
+}
+
+SEC("kprobe/tcp_sendmsg")
+int https_guard_tcp_sendmsg(struct pt_regs *ctx)
+{
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    struct hg_bound_tuple tup;
+
+    if (!sk || !read_sock_tuple_if_port_443(sk, &tup))
+    {
+        return 0;
+    }
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&https_guard_thread_tuple_map, &pid_tgid, &tup, BPF_ANY);
+    return 0;
+}
+
+/*
+ * Binds `ssl` to the calling thread's most recently recorded port-443
+ * tuple, consuming it (read then delete) so it cannot be reused by a later,
+ * unrelated handshake on the same thread -- the safety property that keeps
+ * a wrong thread-affinity assumption from ever mis-binding, only
+ * under-binding. Does nothing if this thread has no such record: the
+ * event(s) for this session simply fall back to /proc, exactly as if this
+ * mechanism did not exist.
+ */
+static __always_inline void bind_session_from_thread(const void *ssl)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct hg_bound_tuple *tup =
+        bpf_map_lookup_elem(&https_guard_thread_tuple_map, &pid_tgid);
+    if (!tup)
+    {
+        return;
+    }
+
+    __u64 ssl_key = (__u64)(uintptr_t)ssl;
+    bpf_map_update_elem(&https_guard_session_tuple_map, &ssl_key, tup, BPF_ANY);
+    bpf_map_delete_elem(&https_guard_thread_tuple_map, &pid_tgid);
+}
+
+/* SSL_accept(SSL *ssl) -- a connection this box accepted (bmcweb's normal
+ * case). SSL_connect(SSL *ssl) -- one this box initiated (e.g. a local
+ * openssl s_client). Either way arg1 is the SSL*. */
+SEC("uprobe/ssl_accept")
+int https_guard_ssl_accept(struct pt_regs *ctx)
+{
+    const void *ssl = (const void *)PT_REGS_PARM1(ctx);
+    if (ssl)
+    {
+        bind_session_from_thread(ssl);
+    }
+    return 0;
+}
+
+SEC("uprobe/ssl_connect")
+int https_guard_ssl_connect(struct pt_regs *ctx)
+{
+    const void *ssl = (const void *)PT_REGS_PARM1(ctx);
+    if (ssl)
+    {
+        bind_session_from_thread(ssl);
+    }
+    return 0;
+}
+
+/* SSL_free(SSL *ssl) -- releases this session's binding promptly, rather
+ * than waiting for LRU eviction under turnover. */
+SEC("uprobe/ssl_free")
+int https_guard_ssl_free(struct pt_regs *ctx)
+{
+    const void *ssl = (const void *)PT_REGS_PARM1(ctx);
+    if (ssl)
+    {
+        __u64 ssl_key = (__u64)(uintptr_t)ssl;
+        bpf_map_delete_elem(&https_guard_session_tuple_map, &ssl_key);
+    }
+    return 0;
+}
+
+/* Looks `ssl` up in the session map and, on a hit, fills *out (resolved=1).
+ * On a miss *out is left however the caller already zeroed it (resolved=0)
+ * -- called right after __builtin_memset(evt, 0, sizeof(*evt)) in both
+ * SSL_write and SSL_read's handlers below. */
+static __always_inline void
+fill_resolved_conn(const void *ssl, struct hg_uprobe_conn *out)
+{
+    __u64 ssl_key = (__u64)(uintptr_t)ssl;
+    struct hg_bound_tuple *tup =
+        bpf_map_lookup_elem(&https_guard_session_tuple_map, &ssl_key);
+    if (!tup)
+    {
+        return;
+    }
+
+    out->resolved     = 1;
+    out->is_ipv6      = tup->is_ipv6;
+    out->local_port   = tup->local_port;
+    out->remote_port  = tup->remote_port;
+    __builtin_memcpy(out->local_addr, tup->local_addr, sizeof(out->local_addr));
+    __builtin_memcpy(out->remote_addr, tup->remote_addr, sizeof(out->remote_addr));
+}
+
 SEC("uprobe/ssl_write")
 int https_guard_ssl_write(struct pt_regs *ctx)
 {
@@ -142,6 +389,7 @@ int https_guard_ssl_write(struct pt_regs *ctx)
     /* PURELY OBSERVATIONAL - no classification, no event_type, no severity.
      * Just capture raw data and let userspace decide what it means. */
     evt->tls.version = read_tls_version(ssl);
+    fill_resolved_conn(ssl, &evt->resolved_conn);
 
     /* Capture a snippet of the plaintext payload for anomaly detection */
     int copy_sz = num < (int)sizeof(evt->tls.payload_snippet) - 1
@@ -243,6 +491,7 @@ int https_guard_ssl_read_exit(struct pt_regs *ctx)
     fill_uprobe_event_fields(evt, HG_UPROBE_DIR_READ);
 
     evt->tls.version = read_tls_version((const void *)ssl);
+    fill_resolved_conn((const void *)ssl, &evt->resolved_conn);
 
     int copy_sz = num_read < (int)sizeof(evt->tls.payload_snippet) - 1
                       ? num_read

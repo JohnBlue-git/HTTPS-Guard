@@ -80,6 +80,36 @@ bool attachOneUprobe(bpf_object* obj, std::vector<bpf_link*>& links,
     return true;
 }
 
+/* Attaches one kprobe by BPF program name + kernel function name. Simpler
+ * than attachOneUprobe(): a kprobe targets a kernel symbol directly, no
+ * library path or entry/return distinction needed here (both new kprobes
+ * are entry-only). */
+bool attachOneKprobe(bpf_object* obj, std::vector<bpf_link*>& links,
+                      const char* bpf_prog_name, const char* target_func) noexcept
+{
+    bpf_program* prog = bpf_object__find_program_by_name(obj, bpf_prog_name);
+    if (!prog)
+    {
+        std::cerr << "https_guard: kprobe program '" << bpf_prog_name
+                  << "' not found in BPF object\n";
+        return false;
+    }
+
+    bpf_link* link = bpf_program__attach_kprobe(prog, /*retprobe=*/false, target_func);
+    if (!link || libbpf_get_error(link))
+    {
+        int err = libbpf_get_error(link);
+        std::cerr << "https_guard: failed to attach kprobe '" << target_func
+                  << "' (err=" << err << ", " << strerror(-err) << ")\n";
+        return false;
+    }
+
+    std::cerr << "https_guard: " << bpf_prog_name << " attached to kernel function "
+              << target_func << " (link fd=" << bpf_link__fd(link) << ")\n";
+    links.push_back(link);
+    return true;
+}
+
 }  // namespace
 
 bool SslUprobeProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) noexcept
@@ -102,6 +132,30 @@ bool SslUprobeProgram::attach(bpf_object* obj, std::vector<bpf_link*>& links) no
     {
         std::cerr << "https_guard: SSL_read mirror did not fully attach"
                      " (non-fatal, SSL_write detection is unaffected)\n";
+    }
+
+    /* Kernel-side session binding: resolves ssl_uprobe events to a 4-tuple
+     * without /proc, and unlike ProcPeerResolver keeps working once a
+     * process owns more than one established connection -- see
+     * LIMITATIONS.md. Entirely additive and non-fatal: /proc-based
+     * ProcPeerResolver remains the fallback whether or not this attaches. */
+    const bool have_accept  = attachOneUprobe(
+        obj, links, "https_guard_ssl_accept", "SSL_accept", openssl_lib_path_, false);
+    const bool have_connect = attachOneUprobe(
+        obj, links, "https_guard_ssl_connect", "SSL_connect", openssl_lib_path_, false);
+    const bool have_free    = attachOneUprobe(
+        obj, links, "https_guard_ssl_free", "SSL_free", openssl_lib_path_, false);
+    const bool have_recvmsg = attachOneKprobe(obj, links, "https_guard_tcp_recvmsg", "tcp_recvmsg");
+    const bool have_sendmsg = attachOneKprobe(obj, links, "https_guard_tcp_sendmsg", "tcp_sendmsg");
+
+    if (!have_accept || !have_connect || !have_free || !have_recvmsg || !have_sendmsg)
+    {
+        std::cerr << "https_guard: kernel-side session binding did not fully attach"
+                     " (non-fatal, falling back to /proc-based attribution)\n";
+    }
+    else
+    {
+        std::cerr << "https_guard: kernel-side session binding attached\n";
     }
 
     return have_write;
