@@ -13,6 +13,11 @@ namespace https_guard {
 /* Refresh / insert a single source IP into the blocklist. */
 class BlocklistAddAction final : public IAction {
 public:
+    // IPv4-only: this daemon's blocklist BPF map is keyed on a 32-bit
+    // address and stays that way -- an IPv6-attributed verdict is enforced
+    // via BlockTcpAction alone (see dispatch.cpp). Deliberately not renamed
+    // to match EventMeta's IpAddress; this constructor's whole reason to
+    // stay uint32_t is documenting "this call cannot take a v6 address".
     BlocklistAddAction(std::uint32_t src_ip_v4,
                        std::chrono::seconds ttl,
                        std::string reason) noexcept;

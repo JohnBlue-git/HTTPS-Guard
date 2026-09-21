@@ -35,6 +35,7 @@ add_executable(https_guard_tests
     detections/traffic_observed_test.cpp
     core/event_meta_test.cpp
     core/dispatch_priority_test.cpp
+    actions/tcp_destroyer_test.cpp
 )
 # detections_lib is an OBJECT library whose sources (dispatch.cpp,
 # ConnRateSweeper.cpp) call into actions_lib and raw libbpf. Object libraries

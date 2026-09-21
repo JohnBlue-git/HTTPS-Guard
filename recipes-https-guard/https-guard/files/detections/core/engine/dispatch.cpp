@@ -92,27 +92,36 @@ void dispatchVerdict(const EventMeta& meta,
                                           meta.local_port != 0 &&
                                           meta.remote_port != 0;
 
-            /* Both actions below are IPv4-only today, matching every producer
-             * of this tuple as of this change. A kV6 tuple falls through
-             * both `if`s untouched rather than being misread as kV4 -- a
-             * later ticket (the ssl_uprobe kernel-side session binding) adds
-             * the IPv6-capable teardown and the "blocklisting skipped, map is
-             * IPv4-only" log line; nothing produces a kV6 tuple yet, so
-             * there is nothing to log here today. */
-            if (have_full_tuple &&
-                meta.local_ip.family == IpFamily::kV4 &&
-                meta.remote_ip.family == IpFamily::kV4)
+            /* Teardown works for either family -- BlockTcpAction/TcpDestroyer
+             * take a dual-stack tuple directly. Trust remote_ip's family for
+             * both ends: a single TCP connection has one family throughout,
+             * and every producer of this tuple sets both ends consistently. */
+            if (have_full_tuple)
             {
+                const bool is_ipv6 = meta.remote_ip.family == IpFamily::kV6;
                 response.push_back(std::make_unique<BlockTcpAction>(
-                    meta.local_ip.v4(), meta.remote_ip.v4(),
+                    is_ipv6, meta.local_ip.bytes, meta.remote_ip.bytes,
                     meta.local_port, meta.remote_port, verdict.message));
             }
 
+            /* The blocklist BPF map is IPv4-only, deliberately staying that
+             * way (see actions/blocklist/BlocklistAction.hpp) -- so an
+             * IPv6-attributed verdict is enforced by teardown alone. Say so
+             * rather than silently doing nothing: an operator reading "0
+             * countermeasures for a Critical verdict" without this line
+             * would reasonably suspect enforcement was broken rather than
+             * intentionally partial for this one address family. */
             if (meta.remote_ip.family == IpFamily::kV4)
             {
                 response.push_back(std::make_unique<BlocklistAddAction>(
                     meta.remote_ip.v4(),   /* block the peer, never our own address */
                     ctx.blocklist_ttl, verdict.message));
+            }
+            else
+            {
+                std::cerr << "https_guard: verdict against an IPv6 source — "
+                             "blocklisting skipped (blocklist map is IPv4-only), "
+                             "connection teardown still applies\n";
             }
         }
         else

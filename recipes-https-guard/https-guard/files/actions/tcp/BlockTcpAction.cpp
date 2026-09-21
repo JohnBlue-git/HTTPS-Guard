@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -9,13 +10,15 @@
 
 namespace https_guard {
 
-BlockTcpAction::BlockTcpAction(std::uint32_t local_ip_v4,
-                               std::uint32_t remote_ip_v4,
+BlockTcpAction::BlockTcpAction(bool is_ipv6,
+                               std::array<std::uint8_t, 16> local_addr,
+                               std::array<std::uint8_t, 16> remote_addr,
                                std::uint16_t local_port,
                                std::uint16_t remote_port,
                                std::string reason) noexcept
-    : local_ip_v4_(local_ip_v4)
-    , remote_ip_v4_(remote_ip_v4)
+    : is_ipv6_(is_ipv6)
+    , local_addr_(local_addr)
+    , remote_addr_(remote_addr)
     , local_port_(local_port)
     , remote_port_(remote_port)
     , reason_(std::move(reason))
@@ -24,7 +27,7 @@ BlockTcpAction::BlockTcpAction(std::uint32_t local_ip_v4,
 boost::asio::awaitable<void> BlockTcpAction::execute_async()
 {
     TcpDestroyer destroyer(
-        local_ip_v4_, remote_ip_v4_,
+        is_ipv6_, local_addr_, remote_addr_,
         local_port_, remote_port_, reason_);
 
     /*

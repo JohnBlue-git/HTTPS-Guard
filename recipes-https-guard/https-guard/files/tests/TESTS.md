@@ -137,6 +137,8 @@ tests/
 ├── core/
 │   ├── event_meta_test.cpp
 │   └── dispatch_priority_test.cpp
+├── actions/
+│   └── tcp_destroyer_test.cpp
 ├── support/
 │   └── make_uprobe_event.hpp
 ├── detectloop/
@@ -167,7 +169,8 @@ The current test split is deliberate:
 | `parsing/` | GTest, real parser | Wire bytes are parsed correctly and safely. |
 | `detections/` | GTest, real detector and detection wrapper | Rules, boundaries and returned verdicts are correct. |
 | `core/dispatch_priority_test.cpp` | GTest, real detection list | Real detection order produces the expected winner. |
-| `core/event_meta_test.cpp` | GTest + GMock `IPeerResolver` | Lazy resolution, exactly-once memoization and no retry after failure. |
+| `core/event_meta_test.cpp` | GTest + GMock `IPeerResolver` | Lazy resolution, exactly-once memoization and no retry after failure; `IpAddress`'s dual-stack representation. |
+| `actions/tcp_destroyer_test.cpp` | GTest, real `TcpDestroyer::populateRequest()` | The netlink request's field population — family selection, local/remote orientation, port byte order — in isolation from the real socket. |
 | `detectloop/` | GTest-style checks + GMock `IDetection` | Scheduling, fan-out, exception boundaries and priority injection. |
 
 ## DetectLoop harness

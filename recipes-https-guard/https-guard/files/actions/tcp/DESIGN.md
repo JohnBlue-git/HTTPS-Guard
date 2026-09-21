@@ -32,6 +32,29 @@ The tuple is **local first, then remote**, which netlink requires. `EventMeta`'s
 role-based naming exists so that is unambiguous; under `src_`/`dst_` the XDP
 tuple was inverted here while the uprobe one was correct.
 
+This field-population logic — family selection, orientation, port byte
+order — is now `TcpDestroyer::populateRequest()`, a pure static function with
+no socket and no I/O, unit-tested in `tests/actions/tcp_destroyer_test.cpp`.
+It didn't exist when the bugs above were live; the tests pin both incidents
+by name (a swapped orientation, a byte-swapped port) so they cannot recur
+silently.
+
+## Dual-stack (IPv4 and IPv6)
+
+`TcpDestroyer`/`BlockTcpAction` take a `bool is_ipv6` plus a 16-byte address
+for each end, rather than a bare `uint32_t` — the same convention
+`EventMeta::IpAddress` uses, so a caller building one of these from an
+`EventMeta` copies `.bytes` straight across. For an IPv4 tuple, only the
+first 4 bytes are meaningful; `populateRequest()` copies all 16 regardless,
+which is correct for both families since an IPv4 `IpAddress` already carries
+zero bytes past the first 4.
+
+The blocklist half of enforcement (`actions/blocklist/`) stays IPv4-only —
+its BPF map is keyed on a 32-bit address, deliberately not extended here. An
+IPv6-attributed verdict is therefore enforced by teardown alone;
+`dispatchVerdict()` logs that blocklisting was skipped rather than leaving
+that silent.
+
 ## The `-ENOENT` story, kept because the lesson generalises
 
 `SOCK_DESTROY` failed on **every event, for every hook, for a long time**, and

@@ -25,20 +25,20 @@
 namespace https_guard {
 namespace {
 
-/* Minimal Netlink message for SOCK_DESTROY on an AF_INET TCP 4-tuple. */
+/* Minimal Netlink message for SOCK_DESTROY on a TCP 4-tuple, AF_INET or
+ * AF_INET6 (sdiag_family, set by populateRequest() below, decides which). */
 struct diag_nl_msg {
     struct nlmsghdr          nlh;
     struct inet_diag_req_v2  req;
 };
 
-/* Format a network-byte-order IPv4 address for logging. */
-std::string formatIp(std::uint32_t ip) noexcept
+/* Format a network-byte-order address (either family) for logging. */
+std::string formatIp(bool is_ipv6, const std::array<std::uint8_t, 16>& addr) noexcept
 {
-    std::array<char, INET_ADDRSTRLEN> buf{};
-    struct in_addr addr {};
-    addr.s_addr = ip;
-    if (inet_ntop(AF_INET, &addr, buf.data(), buf.size()) == nullptr) {
-        return std::string{"0.0.0.0"};
+    std::array<char, INET6_ADDRSTRLEN> buf{};
+    const int family = is_ipv6 ? AF_INET6 : AF_INET;
+    if (inet_ntop(family, addr.data(), buf.data(), buf.size()) == nullptr) {
+        return std::string{is_ipv6 ? "::" : "0.0.0.0"};
     }
     return std::string{buf.data()};
 }
@@ -68,13 +68,50 @@ void buildDestroyRequest(const struct diag_nl_msg& msg,
 
 }  // anonymous namespace
 
-TcpDestroyer::TcpDestroyer(std::uint32_t local_ip_v4,
-                           std::uint32_t remote_ip_v4,
+void TcpDestroyer::populateRequest(struct inet_diag_req_v2& req,
+                                    bool is_ipv6,
+                                    const std::array<std::uint8_t, 16>& local_addr,
+                                    const std::array<std::uint8_t, 16>& remote_addr,
+                                    std::uint16_t local_port,
+                                    std::uint16_t remote_port) noexcept
+{
+    req.sdiag_family   = is_ipv6 ? AF_INET6 : AF_INET;
+    req.sdiag_protocol = IPPROTO_TCP;
+    req.idiag_states   = 0xFFF;  /* all TCP states */
+
+    /* See the header and DESIGN.md: idiag_sport/idiag_dport are __be16,
+     * ports arrive here in this project's host-byte-order convention, so
+     * htons() applies at exactly this boundary. */
+    req.id.idiag_sport = htons(local_port);
+    req.id.idiag_dport = htons(remote_port);
+
+    /* idiag_src/idiag_dst are __be32[4] -- 16 bytes either way. For AF_INET
+     * the kernel reads only the first word; for AF_INET6 it reads all four
+     * as one address. Copying all 16 bytes verbatim is correct for both,
+     * since an IPv4 tuple already carries zero bytes past the first 4 (see
+     * EventMeta::IpAddress::setV4()) -- there is no family-specific branch
+     * needed here beyond sdiag_family itself. */
+    static_assert(sizeof(req.id.idiag_src) == 16 && sizeof(req.id.idiag_dst) == 16,
+                  "inet_diag_sockid's address fields changed shape");
+    std::memcpy(req.id.idiag_src, local_addr.data(), sizeof(req.id.idiag_src));
+    std::memcpy(req.id.idiag_dst, remote_addr.data(), sizeof(req.id.idiag_dst));
+
+    /* idiag_cookie must be all-ones: "don't care / match any socket" --
+     * a zero cookie would require an exact cookie match, which is almost
+     * never what we want. */
+    req.id.idiag_cookie[0] = ~0ULL;
+    req.id.idiag_cookie[1] = ~0ULL;
+}
+
+TcpDestroyer::TcpDestroyer(bool is_ipv6,
+                           std::array<std::uint8_t, 16> local_addr,
+                           std::array<std::uint8_t, 16> remote_addr,
                            std::uint16_t local_port,
                            std::uint16_t remote_port,
                            std::string reason) noexcept
-    : local_ip_v4_(local_ip_v4)
-    , remote_ip_v4_(remote_ip_v4)
+    : is_ipv6_(is_ipv6)
+    , local_addr_(local_addr)
+    , remote_addr_(remote_addr)
     , local_port_(local_port)
     , remote_port_(remote_port)
     , reason_(std::move(reason))
@@ -124,47 +161,20 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
     msg.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     msg.nlh.nlmsg_seq   = 1;
 
-    msg.req.sdiag_family   = AF_INET;
-    msg.req.sdiag_protocol = IPPROTO_TCP;
-    msg.req.idiag_states   = 0xFFF;               /* all TCP states */
-
     /*
-     * Byte order at this boundary -- the reason SOCK_DESTROY never worked
-     * before.
+     * Byte order and orientation at this boundary -- the reason
+     * SOCK_DESTROY never worked before, twice over (see DESIGN.md for the
+     * full story: a byte-swapped port, then an inverted local/remote tuple,
+     * both hidden behind a misleading -ENOENT that turned out to mean
+     * "CONFIG_INET_DIAG is not built in", not "these arguments are wrong").
      *
-     * EventMeta's convention (see detections/core/event_meta.hpp) is:
-     *   - addresses: NETWORK byte order
-     *   - ports:     HOST byte order
-     *
-     * inet_diag_sockid wants both in network byte order: idiag_src/idiag_dst
-     * are __be32 and idiag_sport/idiag_dport are __be16. So the addresses
-     * copy verbatim, but the ports must be converted here.
-     *
-     * Orientation: inet_diag_sockid's src/sport is the socket's LOCAL end
-     * and dst/dport the peer, which is why this class takes local_ and
-     * remote_ parameters rather than src/dst. Under the old src/dst names the XDP hook passed
-     * these inverted (an ingress packet's source is the peer, not us), so
-     * even a byte-order-correct request described a socket that does not
-     * exist.
-     *
-     * The previous code asserted in a comment that *all* of these fields
-     * were already network order and copied the ports verbatim too. They
-     * were not, so the kernel was asked for a byte-swapped port -- e.g. 443
-     * (0x01BB) looked up as 47873 (0xBB01) -- matched nothing, and returned
-     * -ENOENT every time. Every "connection blocked" message this daemon
-     * has ever emitted was therefore inaccurate.
-     *
-     * idiag_cookie must be initialised to all-ones (~0ULL); the kernel
-     * interprets this as "don't care / match any socket".  A zero
-     * cookie would require an exact cookie match which is almost never
-     * what we want.
+     * populateRequest() carries this logic now, as a pure function that can
+     * be (and is, in tests/actions/tcp_destroyer_test.cpp) checked directly
+     * without a real socket -- exactly the coverage that would have caught
+     * both bugs the first time.
      */
-    msg.req.id.idiag_sport  = htons(local_port_);
-    msg.req.id.idiag_dport  = htons(remote_port_);
-    msg.req.id.idiag_src[0] = local_ip_v4_;
-    msg.req.id.idiag_dst[0] = remote_ip_v4_;
-    msg.req.id.idiag_cookie[0] = ~0ULL;
-    msg.req.id.idiag_cookie[1] = ~0ULL;
+    populateRequest(msg.req, is_ipv6_, local_addr_, remote_addr_,
+                     local_port_, remote_port_);
 
     /* ------------------------------------------------------------------
      * Truly async Netlink I/O via Boost.Asio's reactor.
@@ -247,14 +257,14 @@ boost::asio::awaitable<bool> TcpDestroyer::async_execute() noexcept
 
         if (nl_err == 0) {
             std::cerr << "BlockTcpAction: destroyed TCP connection "
-                      << formatIp(local_ip_v4_) << ":" << local_port_
-                      << " -> " << formatIp(remote_ip_v4_) << ":" << remote_port_
+                      << formatIp(is_ipv6_, local_addr_) << ":" << local_port_
+                      << " -> " << formatIp(is_ipv6_, remote_addr_) << ":" << remote_port_
                       << " reason=" << reason_ << "\n";
             co_return true;
         } else {
             std::cerr << "BlockTcpAction: SOCK_DESTROY failed for "
-                      << formatIp(local_ip_v4_) << ":" << local_port_
-                      << " -> " << formatIp(remote_ip_v4_) << ":" << remote_port_
+                      << formatIp(is_ipv6_, local_addr_) << ":" << local_port_
+                      << " -> " << formatIp(is_ipv6_, remote_addr_) << ":" << remote_port_
                       << " reason=" << reason_
                       << " netlink_error=" << nl_err
                       << " (" << std::strerror(-nl_err) << ")\n";

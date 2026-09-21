@@ -45,8 +45,9 @@ boost::asio::awaitable<void> LogAction::execute_async() { co_return; }
 BlocklistAddAction::BlocklistAddAction(std::uint32_t ip, std::chrono::seconds ttl, std::string r) noexcept
     : src_ip_v4_(ip), ttl_(ttl), reason_(std::move(r)) {}
 boost::asio::awaitable<void> BlocklistAddAction::execute_async() { co_return; }
-BlockTcpAction::BlockTcpAction(std::uint32_t a, std::uint32_t b, std::uint16_t c, std::uint16_t d, std::string r) noexcept
-    : local_ip_v4_(a), remote_ip_v4_(b), local_port_(c), remote_port_(d), reason_(std::move(r)) {}
+BlockTcpAction::BlockTcpAction(bool is_ipv6, std::array<std::uint8_t, 16> a, std::array<std::uint8_t, 16> b,
+                               std::uint16_t c, std::uint16_t d, std::string r) noexcept
+    : is_ipv6_(is_ipv6), local_addr_(a), remote_addr_(b), local_port_(c), remote_port_(d), reason_(std::move(r)) {}
 boost::asio::awaitable<void> BlockTcpAction::execute_async() { co_return; }
 
 }  // namespace https_guard
