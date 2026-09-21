@@ -72,6 +72,7 @@ add_executable(detectloop_harness
     detectloop/detectloop_harness.cpp
     ${CMAKE_SOURCE_DIR}/detections/core/engine/DetectLoop.cpp
     ${CMAKE_SOURCE_DIR}/detections/core/sweep/ConnRateSweeper.cpp
+    ${CMAKE_SOURCE_DIR}/detections/core/sweep/SessionTupleSweeper.cpp
 )
 target_include_directories(detectloop_harness PRIVATE
     ${CMAKE_SOURCE_DIR}/detections/core/contract
@@ -85,6 +86,7 @@ target_include_directories(detectloop_harness PRIVATE
     ${CMAKE_SOURCE_DIR}/actions/blocklist
     ${CMAKE_SOURCE_DIR}/actions/tcp
     ${CMAKE_SOURCE_DIR}/programs/xdp_tls/ebpf
+    ${CMAKE_SOURCE_DIR}/programs/ssl_uprobe/ebpf
 )
 target_link_libraries(detectloop_harness PRIVATE
     GTest::gmock

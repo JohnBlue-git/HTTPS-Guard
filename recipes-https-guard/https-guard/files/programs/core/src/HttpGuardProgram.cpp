@@ -7,6 +7,7 @@
 #include "DetectLoop.hpp"
 #include "blocklist/Blocklist.hpp"
 #include "conn_rate.bpf.h"
+#include "ssl_uprobe_session_map.h"
 
 namespace https_guard {
 
@@ -207,6 +208,14 @@ void HttpGuardProgram::enableRateSweeps(ConnRateSweeper::Thresholds thresholds) 
      * treats that, and a zero threshold, as "disabled". */
     DetectLoop::getInstance().enableRateSweeps(
         getMapFd(HTTPS_GUARD_CONN_RATE_MAP_NAME), thresholds);
+}
+
+void HttpGuardProgram::enableSessionTupleSweeps() noexcept
+{
+    /* Same "-1 means disabled" contract as enableRateSweeps() above. */
+    DetectLoop::getInstance().enableSessionTupleSweeps(
+        getMapFd(HTTPS_GUARD_THREAD_TUPLE_MAP_NAME),
+        getMapFd(HTTPS_GUARD_SESSION_TUPLE_MAP_NAME));
 }
 
 const IPeerResolver* HttpGuardProgram::peerResolver() const noexcept

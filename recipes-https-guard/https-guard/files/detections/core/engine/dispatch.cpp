@@ -117,11 +117,17 @@ void dispatchVerdict(const EventMeta& meta,
                     meta.remote_ip.v4(),   /* block the peer, never our own address */
                     ctx.blocklist_ttl, verdict.message));
             }
-            else
+            else if (have_full_tuple)
             {
                 std::cerr << "https_guard: verdict against an IPv6 source — "
                              "blocklisting skipped (blocklist map is IPv4-only), "
                              "connection teardown still applies\n";
+            }
+            else
+            {
+                std::cerr << "https_guard: verdict against an IPv6 source — "
+                             "blocklisting skipped (blocklist map is IPv4-only), "
+                             "no connection tuple to tear down either\n";
             }
         }
         else

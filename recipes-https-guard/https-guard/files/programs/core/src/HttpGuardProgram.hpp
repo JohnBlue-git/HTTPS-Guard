@@ -71,6 +71,14 @@ public:
      */
     void enableRateSweeps(ConnRateSweeper::Thresholds thresholds) noexcept;
 
+    /**
+     * Starts periodic eviction of ssl_uprobe's session-binding maps. Must be
+     * called after loadFilter(), same as enableRateSweeps() -- if ssl_uprobe
+     * didn't attach or its kernel-side binding didn't load, the maps won't be
+     * found and this is inert.
+     */
+    void enableSessionTupleSweeps() noexcept;
+
 private:
     bool openObject() noexcept;
     void closeObject() noexcept;

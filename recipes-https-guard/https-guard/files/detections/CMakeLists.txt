@@ -26,6 +26,7 @@ add_library(detections_lib OBJECT
     core/engine/DetectLoop.cpp
     core/engine/dispatch.cpp
     core/sweep/ConnRateSweeper.cpp
+    core/sweep/SessionTupleSweeper.cpp
 )
 
 target_include_directories(detections_lib

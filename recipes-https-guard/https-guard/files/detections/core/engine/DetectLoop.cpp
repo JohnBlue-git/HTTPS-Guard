@@ -426,13 +426,14 @@ asio::awaitable<void> DetectLoop::process(const RawRecord& rec)
 }
 
 
-asio::awaitable<void> DetectLoop::sweepRates() noexcept
+asio::awaitable<void> DetectLoop::sweepAll() noexcept
 {
     // Same per-item boundary as event processing: a throw here must cost the
     // sweep, not the daemon. Mirrors handleRecord() catching around
-    // co_await process(rec) -- ConnRateSweeper::sweep() is not itself
-    // noexcept, for the same reason process() is not: this is the layer that
-    // catches.
+    // co_await process(rec) -- neither sweeper's sweep() is itself noexcept,
+    // for the same reason process() is not: this is the layer that catches.
+    // Each sweeper's failure is independent of the other's, so one throwing
+    // must not skip the other.
     if (rate_sweeper_)
     {
         /* Named, not a temporary bound to sweep()'s const& parameter: sweep()
@@ -455,7 +456,23 @@ asio::awaitable<void> DetectLoop::sweepRates() noexcept
         }
     }
 
-    /* Re-arm only now that this sweep has actually finished -- the same
+    if (tuple_sweeper_)
+    {
+        try
+        {
+            co_await tuple_sweeper_->sweep();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "https_guard: session-tuple sweep threw: " << e.what() << "\n";
+        }
+        catch (...)
+        {
+            std::cerr << "https_guard: session-tuple sweep threw an unknown exception\n";
+        }
+    }
+
+    /* Re-arm only now that every sweep has actually finished -- the same
      * "serial: the next wait starts only now" guarantee the old synchronous
      * sweepRates(); armSweepTimer(); pair gave, expressed here as continuing
      * the coroutine rather than returning from a plain function call. */
@@ -479,17 +496,17 @@ void DetectLoop::armSweepTimer() noexcept
             }
             try
             {
-                /* Detached: sweepRates() re-arms the timer itself once it
+                /* Detached: sweepAll() re-arms the timer itself once it
                  * completes, which is what keeps sweeps serial. */
-                asio::co_spawn(io_context_, sweepRates(), asio::detached);
+                asio::co_spawn(io_context_, sweepAll(), asio::detached);
             }
             catch (...)
             {
                 /* co_spawn() allocates the coroutine frame and can throw on a
                  * memory-starved BMC. This handler is noexcept, and nothing
                  * ran to re-arm the timer on this path, so do it here --
-                 * skipping one interval beats losing rate detection for good. */
-                std::cerr << "https_guard: could not schedule the connection-rate "
+                 * skipping one interval beats losing every sweep for good. */
+                std::cerr << "https_guard: could not schedule the periodic "
                              "sweep; skipping this interval\n";
                 armSweepTimer();
             }
@@ -497,10 +514,35 @@ void DetectLoop::armSweepTimer() noexcept
     }
     catch (...)
     {
-        /* Losing the timer loses rate detection silently, which is the exact
-         * failure mode this feature is supposed to report on. */
-        std::cerr << "https_guard: could not arm the connection-rate sweep "
-                     "timer; rate detection is now inactive\n";
+        /* Losing the timer loses every configured sweeper silently, which is
+         * the exact failure mode this feature is supposed to report on. */
+        std::cerr << "https_guard: could not arm the periodic sweep timer; "
+                     "rate/session-tuple sweeps are now inactive\n";
+    }
+}
+
+void DetectLoop::ensureSweepTimerStarted() noexcept
+{
+    if (sweep_timer_started_.exchange(true, std::memory_order_relaxed))
+    {
+        return;   // already running -- the same tick already covers every sweeper
+    }
+
+    /* Arm from inside the loop rather than here: the worker threads are
+     * already running, and posting is also what publishes the sweeper(s) to
+     * them. Not on the record strand -- the whole point is that the sweep
+     * does not queue behind records. */
+    try
+    {
+        asio::post(io_context_, [this] { armSweepTimer(); });
+    }
+    catch (...)
+    {
+        std::cerr << "https_guard: could not start the periodic sweep timer; "
+                     "rate/session-tuple sweeps are inactive\n";
+        sweep_timer_started_.store(false, std::memory_order_relaxed);
+        rate_sweeper_.reset();
+        tuple_sweeper_.reset();
     }
 }
 
@@ -514,20 +556,19 @@ void DetectLoop::enableRateSweeps(int conn_rate_map_fd,
         return;
     }
 
-    /* Arm from inside the loop rather than here: the worker threads are
-     * already running, and posting is also what publishes rate_sweeper_ to
-     * them. Not on the record strand -- the whole point is that the sweep
-     * does not queue behind records. */
-    try
+    ensureSweepTimerStarted();
+}
+
+void DetectLoop::enableSessionTupleSweeps(int thread_map_fd, int session_map_fd) noexcept
+{
+    tuple_sweeper_ = std::make_unique<SessionTupleSweeper>(thread_map_fd, session_map_fd);
+    if (!tuple_sweeper_->enabled())
     {
-        asio::post(io_context_, [this] { armSweepTimer(); });
+        tuple_sweeper_.reset();   // keep the hot path free of a disabled sweeper
+        return;
     }
-    catch (...)
-    {
-        std::cerr << "https_guard: could not start the connection-rate sweep; "
-                     "rate detection is inactive\n";
-        rate_sweeper_.reset();
-    }
+
+    ensureSweepTimerStarted();
 }
 
 }  // namespace https_guard

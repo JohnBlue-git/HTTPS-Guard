@@ -1,10 +1,10 @@
 /* Scheduling tests for the real detections/core/DetectLoop.cpp.
  *
  * Not part of the https_guard_tests binary, and not a reimplementation:
- * DetectLoop.cpp and ConnRateSweeper.cpp are compiled from real source, while
- * their collaborators (ActionLoop, the three actions, libbpf's two map calls)
- * are replaced at LINK time. See README.md in this directory for what each
- * check is for and how to build it.
+ * DetectLoop.cpp, ConnRateSweeper.cpp and SessionTupleSweeper.cpp are
+ * compiled from real source, while their collaborators (ActionLoop, the
+ * three actions, libbpf's three map calls) are replaced at LINK time. See
+ * README.md in this directory for what each check is for and how to build it.
  */
 #include <array>
 #include <atomic>
@@ -75,8 +75,12 @@ void dispatchVerdict(const EventMeta&, const Verdict& v, const DispatchContext&)
  * below returns -- covered in depth by tests/detections/rate_sweep_test.cpp,
  * exercised here only incidentally by the sweep-cadence check.
  *
- * ConnRateSweeper's only two libbpf calls. Recording the timestamp of each
- * sweep's first call is how sweep cadence is observed. */
+ * Shared by ConnRateSweeper and SessionTupleSweeper: both call these same
+ * three libbpf functions, unconditionally reporting an empty map, so neither
+ * sweeper's own logic ever runs here -- this file is only testing that the
+ * driving timer keeps ticking, for whichever sweepers are enabled. Recording
+ * the timestamp of each bpf_map_get_next_key(..., nullptr, ...) (the start of
+ * one map's walk) is how sweep cadence is observed. */
 static std::mutex              g_sweep_mu;
 static std::vector<clk::time_point> g_sweeps;
 
@@ -89,6 +93,7 @@ extern "C" int bpf_map_get_next_key(int, const void* key, void*)
     return -1;              /* map empty */
 }
 extern "C" int bpf_map_lookup_elem(int, const void*, void*) { return -1; }
+extern "C" int bpf_map_delete_elem(int, const void*) { return -1; }
 
 /* ---- test doubles for the pipeline's own seams -------------------------- */
 
@@ -226,6 +231,12 @@ int main()
         loop.configure(al, std::chrono::seconds(60), "/dev/null");
         loop.enableRateSweeps(3 /* any fd >= 0 */,
                               ConnRateSweeper::Thresholds{100, 100, 100});
+        /* Also enables the session-tuple sweeper on the same loop, both
+         * sharing one timer (see DetectLoop::ensureSweepTimerStarted()). If
+         * that sharing ever double-armed the timer instead of starting it
+         * once, this would show up here as a broken/erratic cadence below,
+         * same signal this block already checks for a record backlog. */
+        loop.enableSessionTupleSweeps(4, 5 /* any fds >= 0 */);
 
         /* 3000 x 5ms = ~15s of backlog, against a 2s sweep interval. */
         for (std::uint32_t i = 0; i < 3000; ++i) submitSeq(loop, detections, i);

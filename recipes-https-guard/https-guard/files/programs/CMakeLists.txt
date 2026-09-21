@@ -181,6 +181,7 @@ if(HTTPS_GUARD_BUILD_BPF)
             ${CMAKE_SOURCE_DIR}/detections/core/event/hg_event_source.h
             ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe_event.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/ssl_uprobe/ebpf/ssl_uprobe_session_map.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls.bpf.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/xdp_tls_event.h
             ${CMAKE_CURRENT_SOURCE_DIR}/xdp_tls/ebpf/conn_rate.bpf.h

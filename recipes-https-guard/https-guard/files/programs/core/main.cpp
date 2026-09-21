@@ -155,6 +155,10 @@ int main(int argc, char** argv)
     program.enableRateSweeps(https_guard::ConnRateSweeper::Thresholds{
         cfg.rate_threshold, cfg.slowloris_threshold, cfg.reneg_threshold});
 
+    /* Same "after load" requirement -- the session-binding maps only exist
+     * once ssl_uprobe's kernel-side binding has loaded. Inert if it didn't. */
+    program.enableSessionTupleSweeps();
+
     std::cerr << "HTTPS-Guard daemon started\n"
               << "  interface: " << cfg.iface << "\n"
               << "  ssl lib:   " << cfg.openssl_lib_path << "\n"

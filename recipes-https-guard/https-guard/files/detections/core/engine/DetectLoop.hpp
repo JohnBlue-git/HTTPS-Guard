@@ -24,6 +24,7 @@
 #include "hg_event_source.h"
 #include "core/ActionLoop.hpp"
 #include "ConnRateSweeper.hpp"
+#include "SessionTupleSweeper.hpp"
 
 namespace https_guard {
 
@@ -182,6 +183,13 @@ public:
     void enableRateSweeps(int conn_rate_map_fd,
                           ConnRateSweeper::Thresholds thresholds) noexcept;
 
+    /**
+     * Starts periodic sweeping of ssl_uprobe's session-binding maps. Optional,
+     * same as enableRateSweeps(): a map fd of -1 (the maps didn't exist in the
+     * loaded BPF object) leaves this inert.
+     */
+    void enableSessionTupleSweeps(int thread_map_fd, int session_map_fd) noexcept;
+
     ~DetectLoop() noexcept;
 
     DetectLoop(const DetectLoop&) = delete;
@@ -221,12 +229,20 @@ private:
     boost::asio::awaitable<void> process(const RawRecord& rec);
 
 
-    /** Awaits ConnRateSweeper::sweep(), then re-arms the timer. Spawned by
-     *  armSweepTimer() rather than called directly, mirroring handleRecord(). */
-    boost::asio::awaitable<void> sweepRates() noexcept;
+    /** Awaits every configured sweeper in turn, then re-arms the timer.
+     *  Spawned by armSweepTimer() rather than called directly, mirroring
+     *  handleRecord(). One shared timer for every sweeper -- see
+     *  ensureSweepTimerStarted() -- rather than one per sweeper, since
+     *  neither runs often enough or costs enough to need its own cadence. */
+    boost::asio::awaitable<void> sweepAll() noexcept;
 
     /** (Re)arms the sweep timer. Only ever called from the loop's threads. */
     void armSweepTimer() noexcept;
+
+    /** Posts the first armSweepTimer() call, exactly once regardless of how
+     *  many enable*Sweeps() methods are called or in what order. Called from
+     *  each of them; a second call is a no-op. */
+    void ensureSweepTimerStarted() noexcept;
 
     /** Counts a dropped record and says so, rate-limited. */
     void countDrop(const char* why) noexcept;
@@ -237,9 +253,12 @@ private:
      * wait behind a backlog of them. See the class comment. */
     static constexpr std::size_t kThreadCount = 2;
 
-    /* How often the rate counters are read. Short enough that a sustained
+    /* How often every configured sweeper runs -- the rate counters and
+     * ssl_uprobe's session-binding maps alike. Short enough that a sustained
      * flood is blocklisted promptly, long enough that the sweep itself is
-     * negligible next to the traffic it is watching. */
+     * negligible next to the traffic it is watching; the tuple sweep has no
+     * timing requirement of its own; it is a memory-hygiene backstop, so
+     * riding the same tick costs it nothing. */
     static constexpr auto kSweepInterval = std::chrono::seconds(2);
 
     /* All five are written once by configure() and read by the worker
@@ -262,7 +281,9 @@ private:
     std::atomic<bool>          stop_{false};
     std::atomic<std::size_t>   in_flight_{0};
     std::atomic<std::uint64_t> dropped_{0};
-    std::unique_ptr<ConnRateSweeper> rate_sweeper_;
+    std::atomic<bool>          sweep_timer_started_{false};
+    std::unique_ptr<ConnRateSweeper>     rate_sweeper_;
+    std::unique_ptr<SessionTupleSweeper> tuple_sweeper_;
 };
 
 }  // namespace https_guard

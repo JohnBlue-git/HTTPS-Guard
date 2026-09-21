@@ -64,6 +64,7 @@
 #pragma once
 
 #include "ssl_uprobe_event.h"
+#include "ssl_uprobe_session_map.h"
 
 /* Build-time generated header with the offset of ssl_st.version.
  * Produced by scripts/gen_ssl_offset.c, which uses hardcoded
@@ -140,15 +141,8 @@ read_tls_version(const void *ssl)
 #define HG_AF_INET  2
 #define HG_AF_INET6 10
 
-struct hg_bound_tuple {
-    __u8  is_ipv6;
-    __u8  padding[7];
-    __u8  local_addr[16];
-    __u8  remote_addr[16];
-    __u16 local_port;   /* host byte order */
-    __u16 remote_port;  /* host byte order */
-    __u64 timestamp_ns;
-};
+/* struct hg_bound_tuple is shared with userspace -- see
+ * ssl_uprobe_session_map.h, included above. */
 
 /* {pid_tgid -> the port-443 socket this thread most recently touched}. */
 struct {
