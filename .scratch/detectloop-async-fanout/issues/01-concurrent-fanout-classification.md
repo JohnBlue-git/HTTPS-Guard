@@ -12,14 +12,18 @@ to state the new rationale instead of contradicting the shipped code.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `submit()` schedules `handleRecord(rec)` via `asio::co_spawn(record_strand_, ..., asio::detached)`, not `asio::post`
-- [ ] `handleRecord()` and `process()` are coroutines (`boost::asio::awaitable<void>`)
-- [ ] `process()` fans out every submitted detection's `inspect()` call concurrently via `asio::experimental::make_parallel_group` + `wait_for_all()`, gathers results in original list order, and dispatches the lowest-index non-`nullopt` verdict — matching today's "first match in list order wins" outcome
-- [ ] Every detection in a record's list is invoked even after an earlier one has already produced a verdict (no early-exit)
-- [ ] `enableRateSweeps()`'s `asio::post(io_context_, ...)` call is left unchanged
-- [ ] `rec.detections[]`'s array-of-`IDetection*` representation is left unchanged
-- [ ] `detections/DESIGN.md`'s "`post()`, not `co_spawn()`" section is rewritten to explain the new tradeoff (readiness for a future I/O-bound detection) rather than contradicting the code
-- [ ] All existing `tests/detectloop/detectloop_harness.cpp` checks pass unchanged: bounded admission (drop-newest past the cap), FIFO order across records (strand), the rate sweep not starved by a record backlog, a throwing detection costing one event not the daemon, the submitted pointer view not dangling, oversized/undersized records and `stop()` idempotence
-- [ ] A new `detectloop_harness.cpp` case: a record submitted with more than one detection where an early-index detection matches — assert every later-index detection in that record's list was still invoked (no early-exit), and that the dispatched verdict is still the one from the lowest matching index
+- [x] `submit()` schedules `handleRecord(rec)` via `asio::co_spawn(record_strand_, ..., asio::detached)`, not `asio::post`
+- [x] `handleRecord()` and `process()` are coroutines (`boost::asio::awaitable<void>`)
+- [x] `process()` fans out every submitted detection's `inspect()` call concurrently via `asio::experimental::make_parallel_group` + `wait_for_all()`, gathers results in original list order, and dispatches the lowest-index non-`nullopt` verdict — matching today's "first match in list order wins" outcome
+- [x] Every detection in a record's list is invoked even after an earlier one has already produced a verdict (no early-exit)
+- [x] `enableRateSweeps()`'s `asio::post(io_context_, ...)` call is left unchanged
+- [x] `rec.detections[]`'s array-of-`IDetection*` representation is left unchanged
+- [x] `detections/DESIGN.md`'s "`post()`, not `co_spawn()`" section is rewritten to explain the new tradeoff (readiness for a future I/O-bound detection) rather than contradicting the code
+- [x] All existing `tests/detectloop/detectloop_harness.cpp` checks pass unchanged: bounded admission (drop-newest past the cap), FIFO order across records (strand), the rate sweep not starved by a record backlog, a throwing detection costing one event not the daemon, the submitted pointer view not dangling, oversized/undersized records and `stop()` idempotence
+- [x] A new `detectloop_harness.cpp` case: a record submitted with more than one detection where an early-index detection matches — assert every later-index detection in that record's list was still invoked (no early-exit), and that the dispatched verdict is still the one from the lowest matching index
+
+## Comments
+
+Status was stale — this had already shipped (verified against the running code, not just re-read from this file): `DetectLoop.cpp`'s `submit()`/`handleRecord()`/`process()` match every criterion above, `detections/DESIGN.md` already carries the rewritten "`co_spawn()`, ready for a detection that awaits" section, and `tests/detectloop/detectloop_harness.cpp` test 4a is exactly the no-early-exit/lowest-index-wins case this ticket asked for. Confirmed by re-running the harness (all checks pass) during an unrelated session that touched `DetectLoop.cpp`'s sweep-timer wiring.
