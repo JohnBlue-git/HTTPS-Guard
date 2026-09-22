@@ -1,6 +1,6 @@
 # HTTPS-Guard — Design Reference
 
-> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html) — rendered via htmlpreview: [DESIGN.html (rendered)](https://htmlpreview.github.io/?https://github.com/JohnBlue-git/HTTPS-Guard//main/DESIGN.html) (predates the current file layout — see the [Doc Rewrites ticket](.scratch/extend-detection-coverage/issues/07-doc-rewrites.md) once it lands).
+> **This is the detailed reference.** For build instructions, QEMU setup, and deployment, see the [top-level README](../README.md). For a diagram-first architecture walkthrough, see [DESIGN.html](DESIGN.html) — rendered via htmlpreview: [DESIGN.html (rendered)](https://htmlpreview.github.io/?https://github.com/JohnBlue-git/HTTPS-Guard//main/docs/DESIGN.html)
 
 This document covers the complete source code under `recipes-https-guard/https-guard/files/` — the eBPF programs, C++ daemon, enforcement actions, BitBake recipe, and security model. HTTPS-Guard implements a **Detect → Classify → Dispatch** pipeline, and the source tree is organized around exactly those three stages:
 
@@ -13,7 +13,7 @@ This document covers the complete source code under `recipes-https-guard/https-g
 - [Source Code Structure](#source-code-structure)
 - [Build System](#build-system)
 - [The Detect Layer: `programs/`](#the-detect-layer-programs)
-- [The Classify Layer: `detections/`](#the-classify-layer-detectors)
+- [The Classify Layer: `detections/`](#the-classify-layer-detections)
 - [The Dispatch Layer: `actions/`](#the-dispatch-layer-actions)
 - [Event Processing Pipeline](#event-processing-pipeline)
 - [Security Model](#security-model)
@@ -36,7 +36,7 @@ files/
 │   │   │   ├── BpfProgram.{hpp,cpp}        # Base class every hook inherits; default ringBufferHandler() submits
 │   │   │   └── HttpGuardProgram.{hpp,cpp}  # Owns the object, the ring buffer and the poll loop; HOLDS the hooks
 │   │   └── main.cpp                        # Composition root — the only place naming concrete hooks and handlers
-│   ├── ssl_uprobe/                         # PRIMARY hook — attachment mechanics in its DESIGN.md
+│   ├── ssl_uprobe/                         # PRIMARY hook — attachment mechanics in docs/PROGRAM.md
 │   │   ├── ebpf/{ssl_uprobe.bpf.h,ssl_uprobe_event.h}
 │   │   └── src/{SslUprobeProgram.{hpp,cpp},proc_peer_resolver.hpp}
 │   ├── xdp_tls/                            # AUXILIARY hook
@@ -48,7 +48,7 @@ files/
 │   └── utils/bounded_string.hpp            # Fixed-size char[] → std::string
 ├── detections/                             # Classify — event types, parsing, rules, engine. No libbpf.
 │   ├── CMakeLists.txt                      # detections_lib (OBJECT) + the detect_runner binary
-│   ├── DESIGN.md                           # The pipeline: DetectLoop, admission, threading
+│   ├── DETECTIONS.md                        # The pipeline: DetectLoop, admission, threading
 │   ├── core/                               # Grouped by duty: contract / event / engine / sweep
 │   │   ├── contract/                       #   what a detection must provide
 │   │   │   ├── IDetection.hpp              #     inspect(data, size, meta) -> optional<Verdict>
@@ -66,20 +66,20 @@ files/
 │   │   ├── sweep/                          #   what drives the counter path
 │   │   │   └── ConnRateSweeper.{hpp,cpp}   #     timer-driven: sweeps BPF counters, evaluates + dispatches the 3 rate_sweep/ rules
 │   │   └── main.cpp                        #   detect_runner — standalone runner for the loop
-│   ├── tls_version/                        # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
-│   ├── payload_anomaly/                    # event + rule + IDetection + DESIGN.md  (uprobe + XDP)
-│   ├── cipher_suite/                       # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
-│   ├── sni/                                # event + rule + IDetection + DESIGN.md  (XDP, alert-only)
-│   ├── cert_access/                        # event + rule + IDetection + DESIGN.md  (LSM)
-│   ├── rate_sweep/                         # 3 rules + events + DESIGN.md: conn rate, Slowloris, renegotiation storm
-│   └── traffic_observed/                   # the always-matching terminal entry + DESIGN.md
+│   ├── tls_version/                        # event + rule + IDetection + TLS_VERSION.md  (uprobe + XDP)
+│   ├── payload_anomaly/                    # event + rule + IDetection + PAYLOAD_ANOMALY.md  (uprobe + XDP)
+│   ├── cipher_suite/                       # event + rule + IDetection + CIPHER_SUITE.md  (XDP, alert-only)
+│   ├── sni/                                # event + rule + IDetection + SNI.md  (XDP, alert-only)
+│   ├── cert_access/                        # event + rule + IDetection + CERT_ACCESS.md  (LSM)
+│   ├── rate_sweep/                         # 3 rules + events + RATE_SWEEP.md: conn rate, Slowloris, renegotiation storm
+│   └── traffic_observed/                   # the always-matching terminal entry + TRAFFIC_OBSERVED.md
 ├── actions/                                # Dispatch
 │   ├── CMakeLists.txt                      # actions_lib (OBJECT) + the action_runner binary
-│   ├── DESIGN.md                           # ActionLoop: why coroutines, why unbounded here
+│   ├── ACTIONS.md                          # ActionLoop: why coroutines, why unbounded here
 │   ├── core/{ActionLoop.{hpp,cpp},main.cpp}
-│   ├── blocklist/                          # the BPF map XDP reads + DESIGN.md
-│   ├── tcp/                                # netlink SOCK_DESTROY + DESIGN.md
-│   └── log/                                # Redfish JSON + coroutine-safe file I/O + DESIGN.md
+│   ├── blocklist/                          # the BPF map XDP reads + BLOCKLIST.md
+│   ├── tcp/                                # netlink SOCK_DESTROY + TCP.md
+│   └── log/                                # Redfish JSON + coroutine-safe file I/O + LOG.md
 └── tests/                                  # Host-only, off when cross-compiling; see TESTS.md
     ├── parsing/client_hello_parsing_test.cpp   # The real parse_client_hello.h against hand-built wire bytes
     ├── detections/                          # One file per family, mirroring detections/<family>/
@@ -167,7 +167,7 @@ ${STAGING_KERNEL_BUILDDIR}/vmlinux
 
 That kernel must be built with `CONFIG_DEBUG_INFO_BTF=y` so the ELF contains
 kernel BTF metadata. The layer enables this in
-[`bpf-kernel-config.cfg`](recipes-kernel/linux/bpf-kernel-config.cfg), along
+[`bpf-kernel-config.cfg`](../recipes-kernel/linux/bpf-kernel-config.cfg), along
 with the runtime features needed by the daemon such as `CONFIG_BPF`,
 `CONFIG_UPROBES`/`CONFIG_UPROBE_EVENTS`, and `CONFIG_NET_XDP`.
 
@@ -214,7 +214,7 @@ untyped `pt_regs`-derived pointer — `struct sock` *does* have kernel BTF,
 unlike `ssl_st`, which is exactly why this one path uses `BPF_CORE_READ_INTO()`
 instead of a build-time offset. `bpf_core_read.h` is therefore included from
 `programs/core/ebpf/https_guard.bpf.c`. See
-[`programs/DESIGN.md`](recipes-https-guard/https-guard/files/programs/DESIGN.md)
+[`PROGRAM.md`](PROGRAM.md)
 for the per-access decision table.
 
 ### gen_ssl_offset.c
@@ -354,7 +354,7 @@ adding any of them only grows `main.cpp`'s composition root by a line.
 ### A detection: one directory, parse and rule together
 
 A detection owns everything about itself — its event struct, its parse, its rule
-and its `DESIGN.md` — and plugs in through one seam:
+and its specific markdown document — and plugs in through one seam:
 
 ```cpp
 class IDetection {
@@ -414,7 +414,7 @@ Three things follow:
 
 **Lowest-index match wins**, which is what keeps one record to one Redfish
 event — every entry is evaluated regardless (so a future I/O-bound detection
-can suspend without holding up its siblings; see `detections/DESIGN.md`), but
+can suspend without holding up its siblings; see `DETECTIONS.md`), but
 only the lowest-index verdict is ever dispatched.
 
 **List order is priority order, and it lives in the hook.** That is the one real
@@ -469,6 +469,39 @@ The last two only fire when a `Verdict::actionable` is true and the event has a 
 
 Note that gating on "do we have an address" rather than "did resolution run" matters: events that already know their own address carry no resolver, and conflating the two once disabled enforcement for every XDP and synthesised verdict while looking like it worked.
 
+## Detection Reference
+
+The following table is the operational vocabulary: a detection produces one
+Redfish message, is fed by one or more hooks (or by the periodic userspace
+sweep), and either enters the enforcement actions or is logged only. `Log` is
+always dispatched; `TCP teardown` requires a full connection tuple, while
+`blocklist` requires an IPv4 source address because the XDP map is IPv4-only.
+
+| Detection | Redfish message ID | Detected by | Action path |
+|---|---|---|---|
+| TLS version violation | `OemSecurityEvent.1.0.HttpsTlsVersionViolation` | `ssl_uprobe`, `xdp_tls` | `TCP teardown` + `blocklist` + `Log` |
+| Payload anomaly | `OemSecurityEvent.1.0.HttpsPayloadAnomalyDetected` | `ssl_uprobe`, `xdp_tls` | `TCP teardown` + `blocklist` + `Log` |
+| Weak cipher suite | `OemSecurityEvent.1.0.HttpsWeakCipherSuiteDetected` | `xdp_tls` | `Log` only |
+| SNI anomaly | `OemSecurityEvent.1.0.HttpsSniAnomalyDetected` | `xdp_tls` | `Log` only |
+| Certificate access violation | `OemSecurityEvent.1.0.HttpsCertificateAccessViolation` | `lsm_cert_guard` | `Log` only |
+| Connection-rate violation | `OemSecurityEvent.1.0.HttpsConnectionRateViolation` | `ConnRateSweeper` from `xdp_tls` counters | `blocklist` + `Log` |
+| Slowloris | `OemSecurityEvent.1.0.HttpsSlowlorisDetected` | `ConnRateSweeper` from `xdp_tls` counters | `blocklist` + `Log` |
+| TLS renegotiation storm | `OemSecurityEvent.1.0.HttpsTlsRenegotiationStorm` | `ConnRateSweeper` from `xdp_tls` counters | `blocklist` + `Log` |
+| Traffic observed | `OemSecurityEvent.1.0.HttpsTrafficObserved` | `ssl_uprobe`, `xdp_tls` | `Log` only |
+
+### Inventory
+
+Event types: TLS version violation, payload anomaly, weak cipher suite, SNI
+anomaly, certificate access violation, connection-rate violation, Slowloris,
+TLS renegotiation storm, and traffic observed.
+
+Hooks: `ssl_uprobe` (OpenSSL `SSL_write`/`SSL_read` plus session binding),
+`xdp_tls` (XDP ClientHello, HTTP hints, and counters), and `lsm_cert_guard`
+(BPF-LSM file-open observation).
+
+Actions: `LogAction`, `BlockTcpAction` using `SOCK_DESTROY`, and
+`BlocklistAddAction` updating the XDP source-address map.
+
 ## Event Processing Pipeline
 
 ### Ring Buffer → Classification → Enforcement
@@ -487,13 +520,17 @@ HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──
 ════════════ thread boundary ═════════════════════════════ │ ════════════
                      ▼                                    ▼
    DetectLoop::handleRecord() ── io_context ──  steady_timer, every 2s,
-     (on record_strand_: serialized,             co_spawn()s sweepRates():
-      arrival order preserved)                   ConnRateSweeper reads the
-                     │                           counters, evaluates each of
-                     │                           the 3 rate_sweep/ rules and
-                     │                           dispatches directly. NOT on
-                     │                           the strand, so a record
-                     │                           backlog cannot delay it.
+     (on record_strand_: serialized,             co_spawn()s sweepAll():
+      arrival order preserved)                   awaits ConnRateSweeper's
+                     │                           sweep() (reads counters,
+                     │                           dispatches the 3 rate_sweep/
+                     │                           rules), then awaits
+                     │                           SessionTupleSweeper's sweep()
+                     │                           (evicts ssl_uprobe's stale
+                     │                           session-binding map entries).
+                     │                           Neither is on the strand, so
+                     │                           a record backlog cannot delay
+                     │                           either sweep.
                      ▼                                    │
         fan out rec.detections concurrently, gather in order ◄──┘
                      │
@@ -509,10 +546,11 @@ HttpGuardProgram::ringBufferHandler()   ── poll thread ────┼──
                      │
                      ├─ if Verdict::actionable:
                      │   ├─ ensurePeerResolved()   ← the /proc walk, only now
-                     │   ├─ if remote_ip_v4 != 0:
+                     │   ├─ if remote_ip.isSet():
                      │   │   ├─ BlockTcpAction   (only with a full 4-tuple:
                      │   │   │   an address-only verdict has no socket to kill)
-                     │   │   └─ BlocklistAddAction(remote_ip, ttl)
+                     │   │   └─ if family == kV4: BlocklistAddAction(remote_ip, ttl)
+                     │   │       else: log "blocklisting skipped (map is IPv4-only)"
                      │   └─ else: log "declining to enforce"
                      │
                      └─ LogAction (always, regardless of severity)
@@ -539,22 +577,20 @@ concurrently with a record is safe only because classification holds no
 shared mutable state, which makes detector statelessness a threading
 requirement here rather than a style preference.
 
-Per-detection rationale — what each rule looks for, why it enforces or only alerts, and its limits — lives in `detections/<family>/DESIGN.md`, one document per detection. Hook *attachment* mechanics, and exactly what each hook can observe, live in `programs/<hook>/DESIGN.md`.
+Per-detection rationale — what each rule looks for, why it enforces or only alerts, and its limits — lives in `detections/<family>/<FAMILY>.md`, one document per detection. Hook *attachment* mechanics, and exactly what each hook can observe, live in `docs/PROGRAM.md`.
 
-To actually *fire* each of these rules and see which message ID it produces, see [README.md § Exercising the Detections](README.md#exercising-the-detections); `DESIGN.html` § 4 has the class-relationship diagrams, the capability matrix and the ownership table.
+To actually *fire* each of these rules and see which message ID it produces, see [README.md § Exercising the Detections](../README.md#exercising-the-detections); `DESIGN.html` § 4 has the class-relationship diagrams, the capability matrix and the ownership table.
 
 ### ActionLoop - Async Dispatcher
 
 Decouples event callback processing from I/O using Boost.Asio:
 
 ```
-DetectLoop worker thread
+DetectLoop::process()
     │
-    └─ classifyAndDispatch()
-        ├─ pushAction(LogAction)          → ActionLoop queue
-        ├─ pushAction(BlocklistAddAction) → ActionLoop queue
-        └─ pushAction(BlockTcpAction)     → ActionLoop queue
-                │
+    └─ dispatchVerdict()
+        └─ pushActions({LogAction, BlocklistAddAction?, BlockTcpAction?})
+                │              one awaited group → ActionLoop queue
                 ▼
         Background thread (io_context::run)
                 │
@@ -562,10 +598,10 @@ DetectLoop worker thread
                 │   └─ AsyncFileStreamManager::acquire_stream()
                 │       └─ async_write() to log file
                 │
-                ├─ co_spawn BlocklistAddAction::execute_async()
-                │   └─ Blocklist::instance().add(src_ip, ttl)
+                ├─ co_spawn BlocklistAddAction::execute_async()   (IPv4 only)
+                │   └─ Blocklist::instance().add(remote_ip, ttl)
                 │
-                └─ co_spawn BlockTcpAction::execute_async()
+                └─ co_spawn BlockTcpAction::execute_async()       (either family)
                     └─ SOCK_DESTROY via NETLINK_INET_DIAG
 ```
 
@@ -683,9 +719,9 @@ Packet arrives on port 443
   │    concurrently; lowest-index  │
   │    verdict wins                │
   │  → if Verdict.actionable:      │
-  │    → BlockTcpAction(src,dst)   │
+  │    → BlockTcpAction(tuple)     │
   │    → SOCK_DESTROY connection   │
-  │    → BlocklistAddAction(src_ip)│
+  │    → BlocklistAddAction(peer)  │
   │    → writes expiry into BPF map│  ← Feeds Tier 1
   └────────────────────────────────┘
 ```
@@ -702,16 +738,16 @@ Key design decisions this leads to:
 
 1. **BPF is observational** — no classification fields exist in either raw event struct; `xdp_tls`'s `is_violation` is the one deliberate exception (a line-rate synchronous decision, not full classification), and it's surfaced to userspace as `XdpEvent::violation_hint`, not baked into any rule's logic.
 2. **Userspace is intelligent** — the event types, the parsing and the rules all live in `detections/`; `programs/` only attaches and hands over bytes. Neither names a type belonging to the other.
-3. **Different structs per hook** — `uprobe_event` has no socket info; `xdp_event` does (available from packet headers, unlike from uprobe context).
+3. **Different structs per hook** — `uprobe_event` may carry a kernel-bound session tuple and otherwise uses its /proc fallback; `xdp_event` does (available from packet headers, unlike from uprobe context).
 4. **No CO-RE for userspace structs** — `ssl_st` is a userspace type, not in kernel BTF, hence `gen_ssl_offset.c`.
 
 ### Platform-Adaptive Enforcement
 
-The uprobe attaches unconditionally; failing to attach it is logged as required but does not by itself stop the daemon (only zero hooks attaching does). XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available. `HttpGuardProgram::attachHooks()` requires at least one hook of any kind to succeed; the summary line it logs (`"https_guard: enforcement active via N of M hook(s)"`) is intentionally hook-agnostic — the orchestrator sees only the generic `BpfProgram` base. Each hook still logs its own specific attach outcome internally; the attach mechanics for all three are in [`programs/DESIGN.md`](recipes-https-guard/https-guard/files/programs/DESIGN.md).
+The uprobe attaches unconditionally; failing to attach it is logged as required but does not by itself stop the daemon (only zero hooks attaching does). XDP is attempted twice — native, then generic (SKB) — and skipped without error if neither is available. `HttpGuardProgram::attachHooks()` requires at least one hook of any kind to succeed; the summary line it logs (`"https_guard: enforcement active via N of M hook(s)"`) is intentionally hook-agnostic — the orchestrator sees only the generic `BpfProgram` base. Each hook still logs its own specific attach outcome internally; the attach mechanics for all three are in [`PROGRAM.md`](PROGRAM.md).
 
 **x86 servers / QEMU TAP+BRIDGE with virtio-net** — both hooks load. XDP proactively drops TLS violations at the wire, the uprobe still resolves PID→socket for enforcement, and the blocklist protects future connections from repeat offenders. Generic (SKB) XDP hooks `netif_receive_skb()` in software, so `virtio-net-device` attaches successfully even without native driver support.
 
-**AST2600 (johnblue)** — see [the top-level README](README.md#bridge-mode-recommended-for-xdp) for the TAP/bridge setup. Verified via a real QEMU boot (SLIRP mode) on the actual shipped kernel: both the uprobe *and* XDP (native mode) attached successfully — `journalctl` showed `"https_guard: enforcement active via 2 of 2 hook(s)"`. (Earlier notes on this machine assumed XDP would be uprobe-only under SLIRP; this build's kernel/QEMU combination supports native XDP attach even there — the attach *succeeding* doesn't necessarily mean real hardware offload semantics are exercised, since SLIRP's backend isn't a real NIC, but the driver-level `ndo_bpf` registration itself went through.)
+**AST2600 (johnblue)** — see [the top-level README](../README.md#bridge-mode-recommended-for-xdp) for the TAP/bridge setup. Verified via a real QEMU boot (SLIRP mode) on the actual shipped kernel: both the uprobe *and* XDP (native mode) attached successfully — `journalctl` showed `"https_guard: enforcement active via 2 of 2 hook(s)"`. (Earlier notes on this machine assumed XDP would be uprobe-only under SLIRP; this build's kernel/QEMU combination supports native XDP attach even there — the attach *succeeding* doesn't necessarily mean real hardware offload semantics are exercised, since SLIRP's backend isn't a real NIC, but the driver-level `ndo_bpf` registration itself went through.)
 
 **Any platform where XDP genuinely can't attach** — both native and generic XDP fail; both failures are logged but non-fatal, and detection continues via the uprobe alone:
 
@@ -728,7 +764,7 @@ Process calls SSL_write(ssl, buf, num)
        ├── If version < 0x0303 (TLS 1.2) and version > 0:
        │     → TlsVersionDetector: Verdict{Critical, HttpsTlsVersionViolation, actionable=true}
        │
-       └── Submits event to ring buffer (PID + TLS version, no socket info)
+       └── Submits event to ring buffer (PID + TLS version, with an optional kernel-bound session tuple)
        │
        ▼
   Userspace daemon receives event
@@ -740,7 +776,7 @@ Process calls SSL_write(ssl, buf, num)
        ├── BlockTcpAction → TcpDestroyer::async_execute()
        │     → SOCK_DESTROY via NETLINK_INET_DIAG
        │
-       ├── BlocklistAddAction(src_ip, ttl)
+       ├── BlocklistAddAction(remote_ip, ttl)
        │     → future XDP packets from this IP would be dropped, on platforms that have XDP
        │
        └── LogAction → Redfish event JSON line
@@ -836,6 +872,6 @@ build compiles the BPF object and therefore needs a target kernel carrying BTF.
 
 ## Development
 
-For top-level project overview, build instructions, and deployment guidance, see the root [README.md](README.md).
+For top-level project overview, build instructions, and deployment guidance, see the root [README.md](../README.md).
 
-For rationale one level down, every unit has its own document: `detections/<family>/DESIGN.md` per detection, `actions/<kind>/DESIGN.md` per countermeasure, and one per layer — `programs/DESIGN.md`, `detections/DESIGN.md`, `actions/DESIGN.md`.
+For rationale one level down, every unit has its own document: `detections/<family>/<FAMILY>.md` per detection, `actions/<kind>/<KIND>.md` per countermeasure, and one per layer — `PROGRAM.md`, `DETECTIONS.md`, `ACTIONS.md`.

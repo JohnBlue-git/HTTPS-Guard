@@ -2,7 +2,7 @@
 
 **Emits:** `OemSecurityEvent.1.0.HttpsSniAnomalyDetected` (Warning) ·
 **Enforces:** **no — alert only**, for the same reason as
-[`cipher_suite`](../cipher_suite/DESIGN.md).
+[`cipher_suite`](../cipher_suite/CIPHER_SUITE.md).
 
 ## Why detect this
 
@@ -149,7 +149,7 @@ proportionate response.
 
 ## What to hook
 
-`xdp_tls`, `SEC("xdp")`. See [`programs/DESIGN.md`](../../programs/DESIGN.md).
+`xdp_tls`, `SEC("xdp")`. See [`PROGRAM.md`](../../../../../docs/PROGRAM.md).
 
 ## How to trigger it
 

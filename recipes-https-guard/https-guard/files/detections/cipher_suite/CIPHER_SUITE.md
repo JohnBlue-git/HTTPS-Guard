@@ -11,7 +11,7 @@ a downgrade probe sizing up what the server will accept.
 
 **Offering is not negotiating.** bmcweb refuses anything it does not like, so
 this fires on *intent* rather than outcome. Hence Warning rather than Critical —
-unlike [`tls_version`](../tls_version/DESIGN.md), which can fire on a version
+unlike [`tls_version`](../tls_version/TLS_VERSION.md), which can fire on a version
 that actually was negotiated.
 
 ## How to detect
@@ -41,7 +41,7 @@ Client                                                             bmcweb (serve
 
 **Where this sits:** inside the ClientHello, same message as `legacy_version`
 and the SNI extension — an offer, not yet a negotiated outcome. Same reason as
-[`sni`](../sni/DESIGN.md): nothing later in this diagram ever exposes the
+[`sni`](../sni/SNI.md): nothing later in this diagram ever exposes the
 offered list again, so a wire-side hook is the only place this is visible.
 
 Only a hook on the wire can see a ClientHello at all: it is the client's first
@@ -105,14 +105,14 @@ offering a weak suite in a handshake bmcweb then refuses does not justify that.
 So the response is proportionate to the signal: a Redfish event, and nothing
 else. If a site wants enforcement here it belongs behind an explicit opt-in, not
 the default. Background in
-[`actions/blocklist/DESIGN.md`](../../actions/blocklist/DESIGN.md).
+[`actions/blocklist/BLOCKLIST.md`](../../actions/blocklist/BLOCKLIST.md).
 
 ## What to hook
 
 `xdp_tls`, `SEC("xdp")` on the NIC RX path. Attach mechanics — the BPF-link
 ownership that makes attachment leaks structurally impossible, and the
 native→generic→skip fallback — are in
-[`programs/DESIGN.md`](../../programs/DESIGN.md).
+[`PROGRAM.md`](../../../../../docs/PROGRAM.md).
 
 ## How to trigger it
 

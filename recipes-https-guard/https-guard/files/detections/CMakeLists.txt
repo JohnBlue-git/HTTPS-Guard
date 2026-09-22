@@ -1,5 +1,5 @@
-# Classify layer: the detection rules behind IDetector, the shared pipeline
-# vocabulary they and the hooks both speak (hg_event, Verdict,
+# Classify layer: the detection rules behind IDetection, the shared pipeline
+# vocabulary they and the hooks both speak (EventMeta, Verdict,
 # hg_event_source, IPeerResolver), and DetectLoop -- the engine that drives
 # parse -> classify -> dispatch on its own Boost.Asio loop.
 #

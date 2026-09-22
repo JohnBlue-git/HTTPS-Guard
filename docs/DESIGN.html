@@ -396,8 +396,36 @@
       <div class="prose">
         <p>The two kernel probes see different things and submit different structs &mdash; there is no shared "event" type, because the uprobe has no access to socket info and the XDP program has no access to the OpenSSL session. The daemon tells them apart by an <code>event_source</code> discriminator that is always the struct's first field.</p>
       </div>
+      <div class="table-wrap">
+        <table>
+          <caption>Detected &rarr; Hook &rarr; Action</caption>
+          <thead><tr><th>Detection</th><th>Hook</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td>TLS version</td><td class="mono">ssl_uprobe, xdp_tls</td><td>TCP teardown + IPv4 blocklist + log</td></tr>
+            <tr><td>Payload anomaly</td><td class="mono">ssl_uprobe, xdp_tls</td><td>TCP teardown + IPv4 blocklist + log</td></tr>
+            <tr><td>Weak cipher suite</td><td class="mono">xdp_tls</td><td>log only</td></tr>
+            <tr><td>SNI anomaly</td><td class="mono">xdp_tls</td><td>log only</td></tr>
+            <tr><td>Certificate access</td><td class="mono">lsm_cert_guard</td><td>log only</td></tr>
+            <tr><td>Connection rate</td><td class="mono">ConnRateSweeper</td><td>IPv4 blocklist + log</td></tr>
+            <tr><td>Slowloris</td><td class="mono">ConnRateSweeper</td><td>IPv4 blocklist + log</td></tr>
+            <tr><td>Renegotiation storm</td><td class="mono">ConnRateSweeper</td><td>IPv4 blocklist + log</td></tr>
+            <tr><td>Traffic observed</td><td class="mono">ssl_uprobe, xdp_tls</td><td>log only</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div class="prose">
         <p>Both the BPF program and the C++ hook module compile the same header, so there is no marshalling step &mdash; and equally nothing to catch a mismatch, which is why the layout is nested rather than flat. Three consequences worth knowing. The five common fields live in one shared struct, so they <em>cannot</em> drift between hooks (all three previously carried their own copy, and one called <code>comm</code> &ldquo;process&rdquo;). A parser can be handed the sub-struct it fills rather than the whole event &mdash; <code>parse_client_hello_detail()</code> takes <code>hg_client_hello*</code>, so it is structurally unable to touch anything the caller already wrote. And <code>event_source</code> must stay first inside <code>hg_event_hdr</code>, with <code>hdr</code> first in every event struct, because <code>DetectLoop::process()</code> reads a <code>uint32</code> at offset 0 before it knows the record's type; two <code>static_assert</code>s per hook pin that rather than trusting nobody reorders a member.</p>
+      </div>
+      <div class="prose">
+        <p>The uprobe path now has an additive kernel-side session-binding path:
+        <code>tcp_recvmsg</code>/<code>tcp_sendmsg</code> kprobes associate the
+        calling thread with an IPv4 or IPv6 port-443 tuple, and the OpenSSL
+        uprobes consume it. When that path does not apply, attribution falls
+        back to the existing <code>/proc</code> resolver. The periodic sweep
+        also removes stale binding entries so they cannot accumulate.</p>
+        <p>The table below is the compact event vocabulary. The detailed
+        Detected &rarr; Hook &rarr; Action reference is in
+        <a href="DESIGN.md#detection-reference">DESIGN.md</a>.</p>
       </div>
       <div class="table-wrap">
         <table>
@@ -438,7 +466,7 @@ push(LogAction{...});                  // always</pre>
       <div class="prose">
         <p>Two properties of that loop are easy to lose in a rewrite and worth stating. Admission is bounded by an explicit in-flight count, because <code>post()</code> is an unbounded queue and on a ~1GB BMC an OOM &mdash; which takes <em>all</em> detection with it &mdash; is a far worse outcome than one dropped event; the policy is drop-the-newest, so what remains is a coherent prefix of history rather than a hole in the middle. And the loop runs two threads with the connection-rate sweep timer deliberately <em>off</em> the record strand: a single-threaded loop starves that timer by FIFO fairness alone, since it queues behind every record already posted. Measured against a deliberate backlog, one thread produced zero sweeps in nine seconds where two produced one every two.</p>
         <p>A rule reaches an event's data off a plain struct, and binds to it through a <em>concept</em> rather than a shared base class &mdash; so a certificate-access event is not obliged to carry a TLS version or a cipher-suite list, and a rule that reads a field its event cannot supply does not compile. There is no downcast anywhere on this path.</p>
-        <p>A <code>uprobe_event</code> carries no socket info, so the 4-tuple is recovered from <code>/proc</code> &mdash; but lazily, only once a verdict is actionable, since that walk is the most expensive step in the pipeline and most events never reach it. It also fails closed: a process owning several established connections cannot be attributed to one, and enforcement declines rather than guessing. An <code>xdp_event</code> already has the tuple from the packet headers.</p>
+        <p>A <code>uprobe_event</code> first uses kernel-side session binding; when it is unavailable, the 4-tuple is recovered from <code>/proc</code> &mdash; but lazily, only once a verdict is actionable, since that walk is the most expensive step in the pipeline and most events never reach it. It also fails closed: a process owning several established connections cannot be attributed to one, and enforcement declines rather than guessing. An <code>xdp_event</code> already has the tuple from the packet headers.</p>
       </div>
       <div class="table-wrap">
         <table>
@@ -714,7 +742,7 @@ push(LogAction{...});                  // always</pre>
       </div>
       <figure class="diagram">
         <div class="diagram-frame">
-          <svg viewBox="0 0 720 680" role="img" aria-label="Decision flow: the daemon always attaches the uprobe, then tries native XDP attach; if that fails it tries generic SKB-mode XDP; if that also fails it falls back to uprobe-only. Both XDP-attach outcomes converge on full enforcement with proactive drop and reactive SOCK_DESTROY. The uprobe-only outcome leads to reactive-only enforcement via /proc lookup, which is what happens on the AST2600 and QEMU SLIRP.">
+          <svg viewBox="0 0 720 680" role="img" aria-label="Decision flow: the daemon always attaches the uprobe, then tries native XDP attach; if that fails it tries generic SKB-mode XDP; if that also fails it falls back to uprobe-only. Both XDP-attach outcomes converge on full enforcement with proactive drop and reactive SOCK_DESTROY. The uprobe-only outcome leads to reactive-only enforcement via /proc lookup, with the actual mode recorded by the attach log.">
             <defs>
               <marker id="arrowN3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                 <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
@@ -842,12 +870,12 @@ push(LogAction{...});                  // always</pre>
       <h2><span class="num">&sect;8</span> Where to Go Next</h2>
       <div class="prose">
         <ul>
-          <li><a href="README.md">README.md</a> &mdash; build steps, QEMU bridge/SLIRP setup, deployment, and Redfish subscription walkthrough.</li>
+          <li><a href="../README.md">README.md</a> &mdash; build steps, QEMU bridge/SLIRP setup, deployment, and Redfish subscription walkthrough.</li>
           <li><a href="DESIGN.md">DESIGN.md</a> &mdash; the per-file reference this document distills: full struct layouts, the BitBake build flow, and the synchronous-vs-asynchronous strategy write-up in depth.</li>
-          <li><a href="README.md#exercising-the-detections">README.md &sect; Exercising the Detections</a> &mdash; how to make each of the nine event types fire, which message ID each produces, and which have actually been driven end-to-end on hardware rather than only unit-tested.</li>
+          <li><a href="../README.md#exercising-the-detections">README.md &sect; Exercising the Detections</a> &mdash; how to make each of the nine event types fire, which message ID each produces, and which have actually been driven end-to-end on hardware rather than only unit-tested.</li>
           <li><a href="LIMITATIONS.md">LIMITATIONS.md</a> &mdash; what this tool does <em>not</em> do: the ARM32 trampoline gap, the capture caps, and the fact that the blocklist applies to a source address on every port.</li>
-          <li><a href="scripts/trigger/trigger_detections.py">scripts/trigger/trigger_detections.py</a> &mdash; builds TLS ClientHellos by hand, because OpenSSL 3.x refuses to offer the weak suites and legacy versions the XDP rules look for.</li>
-          <li><a href="scripts/listener/">scripts/listener/</a> &mdash; a minimal HTTPS receiver for testing Redfish EventService push end-to-end.</li>
+          <li><a href="../scripts/trigger/trigger_detections.py">scripts/trigger/trigger_detections.py</a> &mdash; builds TLS ClientHellos by hand, because OpenSSL 3.x refuses to offer the weak suites and legacy versions the XDP rules look for.</li>
+          <li><a href="../scripts/listener/">scripts/listener/</a> &mdash; a minimal HTTPS receiver for testing Redfish EventService push end-to-end.</li>
         </ul>
       </div>
     </section>

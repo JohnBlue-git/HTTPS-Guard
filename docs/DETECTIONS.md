@@ -2,10 +2,10 @@
 
 Everything about **what an event is and what it means**. One directory per
 detection, each holding its own event struct, its parse, its rule and its
-`DESIGN.md`; plus `core/`, which holds the seam they implement, the vocabulary
+its specific markdown document; plus `core/`, which holds the seam they implement, the vocabulary
 they share, and the loop that drives them.
 
-Per-detection rationale is in each detection's own `DESIGN.md`. This document is
+Per-detection rationale is in each detection.s own specific markdown document. This document is
 about `DetectLoop` and the shape of the pipeline around it.
 
 ## What DetectLoop is, and what it deliberately is not
@@ -69,18 +69,23 @@ coroutine frame per record for no behavioural difference: every submitted
 detection is evaluated regardless, and results are gathered back in list order,
 so the lowest-index verdict still wins exactly as the sequential loop produced.
 
-The one place this remains `post()`, deliberately, is `enableRateSweeps()`
-arming the sweep timer *for the first time*: that one call never has anything
-to await, and turning it into a coroutine would be pure overhead with no
-future case to prepare for. Every sweep after that runs the same way the
-record path does: `armSweepTimer()`'s timer handler `co_spawn()`s
-`sweepRates()`, which `co_await`s `ConnRateSweeper::sweep()` and evaluates each
-of the three counting rules directly against its own event, dispatching its
-verdict inline — no per-rule handler function, the same shape `process()` uses
-for `IDetection::inspect()`. `sweepRates()` re-arms the timer only once that
-`co_await` returns, which is what keeps sweeps serial (see `ConnRateSweeper`'s
-own class comment for why `sweep()` is a coroutine despite nothing in it
-awaiting anything yet, same reasoning as `inspect()` above).
+The one place this remains `post()`, deliberately, is
+`ensureSweepTimerStarted()` arming the sweep timer *for the first time*
+(called from whichever of `enableRateSweeps()`/`enableSessionTupleSweeps()`
+runs first — idempotent, so it doesn't matter which or in what order): that
+one call never has anything to await, and turning it into a coroutine would
+be pure overhead with no future case to prepare for. Every sweep after that
+runs the same way the record path does: `armSweepTimer()`'s timer handler
+`co_spawn()`s `sweepAll()`, which `co_await`s `ConnRateSweeper::sweep()` —
+evaluating the three counting rules directly against its own event and
+dispatching inline — then `co_await`s `SessionTupleSweeper::sweep()`, which
+evicts `ssl_uprobe`'s stale session-binding map entries the same way, no
+per-rule handler function either time, the same shape `process()` uses for
+`IDetection::inspect()`. `sweepAll()` re-arms the timer only once every
+configured sweeper has returned, which is what keeps sweeps serial (see
+`ConnRateSweeper`'s own class comment for why `sweep()` is a coroutine
+despite nothing in it awaiting anything yet, same reasoning as `inspect()`
+above).
 
 ### Admission is bounded explicitly
 
@@ -150,7 +155,7 @@ event source=1 pid=493 (openssl)  claimed by 'payload_anomaly' (2 of 3): ...Payl
 
 **There is no "nothing matched" branch.** A hook puts an always-matching
 `traffic_observed` entry last, so first-match-wins covers it with no special
-case — see [`traffic_observed/DESIGN.md`](traffic_observed/DESIGN.md).
+case — see [`TRAFFIC_OBSERVED.md`](../recipes-https-guard/https-guard/files/detections/traffic_observed/TRAFFIC_OBSERVED.md).
 
 ## The enforcement gate
 
@@ -160,9 +165,10 @@ it is the most consequential logic here and has been got wrong once:
 ```cpp
 if (verdict.actionable) {
     meta.ensurePeerResolved();          // the /proc walk, only here
-    if (meta.remote_ip_v4 != 0) {       // ← gate on an ADDRESS, not on
+    if (meta.remote_ip.isSet()) {       // ← gate on an ADDRESS, not on
         if (have_full_tuple) push(BlockTcpAction{...});   //  whether resolution ran
-        push(BlocklistAddAction{meta.remote_ip_v4, ttl});
+        if (meta.remote_ip.family == IpFamily::kV4)        //  blocklist map is IPv4-only
+            push(BlocklistAddAction{meta.remote_ip.v4(), ttl});
     } else {
         log("no connection could be attributed, declining to enforce");
     }
@@ -186,7 +192,7 @@ regression test pins it now.
 
 A verdict's actions are collected into a `std::vector` and handed over in **one**
 call, so `ActionLoop` can run them as a group and report their outcomes together
-— see [`actions/DESIGN.md`](../actions/DESIGN.md).
+— see [`ACTIONS.md`](ACTIONS.md).
 
 ## Could a detection have a suspension point worth optimizing?
 

@@ -1,6 +1,6 @@
 # Split hook attachment and detection into separate, pluggable layers
 
-Status: ready-for-agent
+Status: done — all 4 tickets closed, see PRIORITY.md
 
 ## Problem Statement
 

@@ -62,7 +62,7 @@ detection rather than a global setting:
 
 ## Always the peer, never us
 
-`dispatchVerdict()` passes `meta.remote_ip_v4`, and the naming in `EventMeta` is
+`dispatchVerdict()` passes `meta.remote_ip.v4()`, and the naming in `EventMeta` is
 by **role** (`local_`/`remote_`) rather than by direction specifically to keep
 that unambiguous. Under the old `src_`/`dst_` names the two hooks took opposite
 frames of reference — the uprobe read `/proc`'s local address into `src_`, while

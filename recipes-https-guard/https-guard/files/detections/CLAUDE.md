@@ -6,7 +6,7 @@ the whole thing. `../programs/` only attaches BPF and hands over bytes.
 
 The tree is organised by **detection**, not by hook, because that is the question
 a reader actually arrives with. Each detection family owns a directory with its
-rule and its `DESIGN.md`.
+rule and its specific markdown document.
 
 ## Layout
 
@@ -60,7 +60,7 @@ A detection directory holds **all** of it:
 detections/<family>/<Family>Event.hpp       what this rule reads, and nothing else
 detections/<family>/<Family>Detector.hpp    the rule: one event in, optional Verdict out
 detections/<family>/<Family>Detection.hpp   IDetection: parse + evaluate
-detections/<family>/DESIGN.md               why it exists and what it cannot see
+detections/<family>/<FAMILY>.md             why it exists and what it cannot see
 ```
 
 `IDetection` (in `core/`) is the seam:
@@ -105,7 +105,7 @@ never fires.
 
 ## Why some rules enforce and others only alert
 
-**"Enforces" (in every `DESIGN.md` and in `README.md`) and `Verdict::actionable`
+**"Enforces" (in every per-detection document and in `README.md`) and `Verdict::actionable`
 (in code, and in the table's `Actionable?` column above) name the same switch** —
 prose says "enforces", the field is called `actionable`. Setting it `true` does
 two concrete things, both in `dispatchVerdict()`: it blocklists the verdict's
@@ -183,7 +183,7 @@ DetectLoop::getInstance().submit(data, size, detections_);
 
 Three consequences:
 
-- **Lowest-index match wins**, which is what keeps one record to one Redfish event. Every entry is evaluated regardless — the loop no longer stops at the first verdict, so a future I/O-bound detection can suspend without holding up its siblings (see `detections/DESIGN.md`) — but only the lowest-index verdict is ever dispatched.
+- **Lowest-index match wins**, which is what keeps one record to one Redfish event. Every entry is evaluated regardless — the loop no longer stops at the first verdict, so a future I/O-bound detection can suspend without holding up its siblings (see `docs/DETECTIONS.md`) — but only the lowest-index verdict is ever dispatched.
 - **Rule priority is the hook's list order.** That is the one real cost of this shape: which rule wins is a classification decision, and it is now expressed in `programs/`. Accepted deliberately — each list is 2–5 entries, readable at the point where the hook says what it can observe — and visible at runtime, because the loop logs which index claimed each record.
 - **There is no "nothing matched" branch.** A hook puts an always-matching `TrafficObservedDetection` last, so an always-matching entry at the end covers it.
 
@@ -243,7 +243,7 @@ callback that runs long lets the ring buffer fill, and a full ring buffer **drop
 events** — a missed detection nothing reports. Three properties of its shape are
 deliberate, each because the obvious version was wrong: `co_spawn()`, ready for a
 detection that awaits, even though nothing does yet (see "`co_spawn()`, ready for
-a detection that awaits" in `DESIGN.md`); explicitly bounded admission (`post()`
+a detection that awaits" in `DETECTIONS.md`); explicitly bounded admission (`post()`
 — still used to arm the sweep timer, which never has anything to await — is an
 unbounded queue, and on a ~1GB BMC an OOM takes *all* detection with it); and two
 threads with the sweep timer off the record strand (a single-threaded loop
@@ -271,12 +271,12 @@ fanning out *calls to* today's synchronous `inspect()`, in preparation for one
 that eventually isn't. List order still decides the winner: results are
 gathered back in order, and the lowest-index verdict wins exactly as the
 sequential loop produced. See `core/engine/DetectLoop.hpp` and
-`detections/DESIGN.md`.
+`docs/DETECTIONS.md`.
 
 The actions are the opposite case, which is why the coroutines live there. Full
 reasoning, what would make it worth revisiting, and the one optimisation that *is*
 available today (a different executor for peer resolution, which is not
-unambiguously a win) are in [`DESIGN.md`](DESIGN.md).
+unambiguously a win) are in [`DETECTIONS.md`](../../../../docs/DETECTIONS.md).
 
 ## Testing
 

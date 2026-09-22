@@ -65,7 +65,7 @@ container" the way Falco can, has no dynamic rule language, and enforces
 asynchronously rather than in-kernel-synchronously like Tetragon — a choice
 made because a mistuned *synchronous* threshold on a resource-constrained BMC
 risks dropping legitimate traffic at line rate with nothing in the loop to
-catch it (see `detections/DESIGN.md` and `detections/CLAUDE.md`'s "Why some
+catch it (see [DETECTIONS.md](docs/DETECTIONS.md) and `detections/CLAUDE.md`'s "Why some
 rules enforce and others only alert").
 
 *(Falco and Tetragon are both under active development — verify current
@@ -137,7 +137,7 @@ complete or permanent feature list.)*
 
 **Design Principle:** BPF is **OBSERVATIONAL** (data collection only), userspace is **INTELLIGENT** (classification, decision-making, enforcement).
 
-> For an interactive, diagram-based walkthrough of this pipeline, see [DESIGN.html](DESIGN.html).
+> For an interactive, diagram-based walkthrough of this pipeline, see [DESIGN.html](docs/DESIGN.html).
 
 ## Source Code Structure
 
@@ -148,7 +148,7 @@ meta-https-guard/
 ├── conf/machine/johnblue.conf        # QEMU AST2600 machine definition (networking modes)
 ├── recipes-https-guard/https-guard/  # Main recipe + all C++/eBPF source
 │   ├── https-guard-openbmc.bb        # BitBake recipe (build flags, install, PACKAGECONFIG)
-│   └── files/                        # Source tree — see DESIGN.md for full details
+│   └── files/                        # Source tree — see docs/DESIGN.md for full details
 ├── recipes-kernel/linux/             # Kernel BPF/XDP config fragment
 ├── recipes-bmcweb/bmcweb/            # bmcweb OemSecurityEvent schema append
 ├── scripts/qemu-bridge/qemu-setup-tap.sh # Host bridge / TAP / NAT setup for QEMU testing
@@ -161,15 +161,15 @@ The source under `files/` is organized around the **Detect → Classify → Disp
 
 | Component | Path | Role |
 |-----------|------|------|
-| **Detect** | `programs/` | Attaches BPF hooks and hands raw records over — no parsing, no rules. Three hooks derive from `BpfProgram`: `ssl_uprobe/` (uprobes on `SSL_write()` **and** `SSL_read()`, PRIMARY), `xdp_tls/` (ClientHello inspection, blocklist enforcement, and the per-source connection counters, AUXILIARY), and `lsm_cert_guard/` (BPF-LSM on the HTTPS key — cannot attach on ARM32, see [LIMITATIONS.md](LIMITATIONS.md)). Each hook splits into `ebpf/` and `src/`; `core/` holds `BpfProgram` and `HttpGuardProgram`, which owns the one object, ring buffer and poll loop |
-| **Classify** | `detections/` | Eight detections, each with its own event struct, its parse and its rule: `tls_version/`, `payload_anomaly/`, `cipher_suite/`, `sni/`, `cert_access/` (one per directory), plus `rate_sweep/` (connection rate, Slowloris and renegotiation storm together, since all three come from one BPF counter map). One `DESIGN.md` per directory. Plus `core/` — the `IDetection` seam, `EventMeta`, `DetectLoop` (walks a submitted list, knows nothing about events), and `ConnRateSweeper` (timer-driven, aggregates the counter map and dispatches the three `rate_sweep/` rules directly) |
+| **Detect** | `programs/` | Attaches BPF hooks and hands raw records over — no parsing, no rules. Three hooks derive from `BpfProgram`: `ssl_uprobe/` (uprobes on `SSL_write()` **and** `SSL_read()`, PRIMARY), `xdp_tls/` (ClientHello inspection, blocklist enforcement, and the per-source connection counters, AUXILIARY), and `lsm_cert_guard/` (BPF-LSM on the HTTPS key — cannot attach on ARM32, see [LIMITATIONS.md](docs/LIMITATIONS.md)). Each hook splits into `ebpf/` and `src/`; `core/` holds `BpfProgram` and `HttpGuardProgram`, which owns the one object, ring buffer and poll loop |
+| **Classify** | `detections/` | Nine detections, each with its own event struct, its parse and its rule: `tls_version/`, `payload_anomaly/`, `cipher_suite/`, `sni/`, `cert_access/` (one per directory), plus `rate_sweep/` (connection rate, Slowloris and renegotiation storm together, since all three come from one BPF counter map). One specific markdown document per directory. Plus `core/` — the `IDetection` seam, `EventMeta`, `DetectLoop` (walks a submitted list, knows nothing about events), and `ConnRateSweeper` (timer-driven, aggregates the counter map and dispatches the three `rate_sweep/` rules directly) |
 | **Dispatch** | `actions/` | Three async countermeasures run through `ActionLoop`: `log/` (file write), `tcp/` (SOCK_DESTROY via Netlink), `blocklist/` (BPF map update) |
 | **Tests** | `tests/` | GoogleTest-based unit tests for the `detections/` layer and the real parsers, one file per detection family — no kernel/BPF/root/QEMU access at runtime; see `tests/TESTS.md` |
 | **Event bridge** | `service/https-guard-event-bridge.sh` | Shell script that tails the event log and forwards entries to D-Bus and/or the Redfish filesystem log |
 
 **Which rules enforce:** the blocklist applies to a source address on *every* port, so an actionable false positive removes all access to the BMC for the blocklist TTL. TLS-version, payload-anomaly and the three counting rules enforce; cipher-suite, SNI and certificate-access alert only. The reasoning is in `detections/CLAUDE.md`, and it is worth reading before changing a rule's `actionable` flag.
 
-> For build system internals, the raw event ABI, and the security-model rationale, see [DESIGN.md](DESIGN.md). One level down, every unit documents itself: `detections/<family>/DESIGN.md` per detection (why detect it, how, how to protect, what to hook), `actions/<kind>/DESIGN.md` per countermeasure, plus a layer document each for `programs/`, `detections/` and `actions/`. Known gaps and unverified claims: [LIMITATIONS.md](LIMITATIONS.md).
+> For build system internals, the raw event ABI, and the security-model rationale, see [DESIGN.md](docs/DESIGN.md). One level down, every unit documents itself: `detections/<family>/<FAMILY>.md` per detection (why detect it, how, how to protect, what to hook), `actions/<kind>/<KIND>.md` per countermeasure, plus a layer document each for `programs/`, `detections/` and `actions/`. Known gaps and unverified claims: [LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## Building HTTPS-Guard
 
@@ -309,7 +309,7 @@ echo 'nameserver 8.8.8.8' > /etc/resolv.conf
 ping -c 3 192.168.200.2
 
 # Test Redfish access
-# (but the --tlsvX.X flag is ignored by curl — see the curl/OpenSSL 3.x caveat in DESIGN.md)
+# (but the --tlsvX.X flag is ignored by curl — see the curl/OpenSSL 3.x caveat in docs/DESIGN.md)
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.3
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.2
 curl -ku root:0penBmc https://192.168.200.2/redfish/v1 --tlsv1.1
@@ -687,7 +687,7 @@ header, not a late one.
 Expect a *second* event from the same request: the `SSL_read` uprobe sees
 bmcweb receiving the same bytes. That one usually declines to enforce
 ("no connection could be attributed") — see
-[Attribution](LIMITATIONS.md#attribution-and-enforcement).
+[Attribution](docs/LIMITATIONS.md#attribution-and-enforcement).
 
 ### Legacy TLS version
 
@@ -814,7 +814,7 @@ below that to see it fire.
 minutes late. `systemctl restart https-guard-daemon` flushes it. Every other
 diagnostic uses `std::cerr` and appears immediately — so the *absence* of a
 recent counters line means nothing. Recorded in
-[LIMITATIONS.md](LIMITATIONS.md#observability).
+[LIMITATIONS.md](docs/LIMITATIONS.md#observability).
 
 Note `process=` is meaningless for XDP-sourced events (`swapper/0`,
 `systemd-journal`, whatever was on-CPU when the packet arrived) — XDP runs in
@@ -843,7 +843,7 @@ https_guard: enforcement active via 2 of 3 hook(s)
 ```
 
 `2 of 3` is the expected healthy state on this platform, not a fault. Full
-reasoning in [LIMITATIONS.md](LIMITATIONS.md#platform-the-certificate-guard-cannot-enforce-on-arm32).
+reasoning in [LIMITATIONS.md](docs/LIMITATIONS.md#platform-the-certificate-guard-cannot-enforce-on-arm32).
 
 ### Which rules enforce, and why that matters
 
@@ -899,7 +899,7 @@ Every one of these cost real debugging time before being understood.
   `bpf_link`-owned and released by the kernel on process exit, including on
   `SIGKILL`. `bpftool` is not installed and cannot be cleanly built for this
   ARM32 target — the reasoning, and why it is not needed, is in
-  [LIMITATIONS.md](LIMITATIONS.md#tooling-no-bpftool-on-the-target-and-it-will-not-build-for-arm32).
+  [LIMITATIONS.md](docs/LIMITATIONS.md#tooling-no-bpftool-on-the-target-and-it-will-not-build-for-arm32).
   The `bpftool` commands in the deployment and troubleshooting steps below are
   therefore host-side / bridged-debugging steps, not on-BMC commands.
 
@@ -1011,4 +1011,4 @@ catch-up flush.
 
 ## Development
 
-For detailed source code documentation, event struct layouts, and the security strategy deep-dive, see [DESIGN.md](DESIGN.md), or [DESIGN.html](DESIGN.html) for a diagram-first version of the same material.
+For detailed source code documentation, event struct layouts, and the security strategy deep-dive, see [DESIGN.md](docs/DESIGN.md), or [DESIGN.html](docs/DESIGN.html) for a diagram-first version of the same material.

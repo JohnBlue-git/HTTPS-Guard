@@ -1,6 +1,6 @@
 # Dual-stack peer attribution for the ssl_uprobe hook
 
-Status: ready-for-agent
+Status: done — see ./issues/ (01-03 fully done; 04 done with two caveats)
 
 ## Problem Statement
 

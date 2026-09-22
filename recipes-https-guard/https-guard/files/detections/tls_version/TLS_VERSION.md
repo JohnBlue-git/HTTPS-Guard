@@ -128,8 +128,8 @@ than `evt->tls.is_violation`.
 `dispatchVerdict()` blocklists the peer and — where a full 4-tuple is known —
 tears the connection down with `SOCK_DESTROY`. The blocklist entry then makes
 Tier 1 drop that source's *next* packet even on the uprobe-only path. See
-[`actions/blocklist/DESIGN.md`](../../actions/blocklist/DESIGN.md) and
-[`actions/tcp/DESIGN.md`](../../actions/tcp/DESIGN.md).
+[`actions/blocklist/BLOCKLIST.md`](../../actions/blocklist/BLOCKLIST.md) and
+[`actions/tcp/TCP.md`](../../actions/tcp/TCP.md).
 
 ## What to hook
 
@@ -140,7 +140,7 @@ Tier 1 drop that source's *next* packet even on the uprobe-only path. See
 
 `TlsVersionDetection<RawT>` is templated over the raw layout, so both share one
 rule and one event struct. Attach mechanics for either hook are in
-[`programs/DESIGN.md`](../../programs/DESIGN.md).
+[`PROGRAM.md`](../../../../../docs/PROGRAM.md).
 
 ## How to trigger it
 

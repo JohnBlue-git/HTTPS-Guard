@@ -8,16 +8,20 @@ working records, not something an operator or a future maintainer will read.
 Every entry below is established, not speculative — each was either measured,
 traced to kernel source, or observed failing on real hardware.
 
-**Two related things live in [README.md](README.md) instead, deliberately —
+**Two related things live in [README.md](../README.md) instead, deliberately —
 they belong next to the commands they qualify, and duplicating them here would
 guarantee the two copies drift apart:**
 
 - **How to trigger each detection**, and which Redfish message ID each
-  produces → [Exercising the Detections](README.md#exercising-the-detections)
+  produces → [Exercising the Detections](../README.md#exercising-the-detections)
 - **Which rules have been driven end-to-end on hardware** and which are only
   unit-tested, plus the QEMU/SLIRP traps that decide which is which →
-  [Verification status](README.md#verification-status) and
-  [Test-environment caveats](README.md#test-environment-caveats)
+  [Verification status](../README.md#verification-status) and
+  [Test-environment caveats](../README.md#test-environment-caveats)
+
+The mechanics behind the XDP ceiling, attach diagnosis, and target-kernel
+capability checks live in [XDP_INTERNALS.md](XDP_INTERNALS.md),
+[DEBUGGING.md](DEBUGGING.md), and [PLATFORM_CHECKS.md](PLATFORM_CHECKS.md).
 
 ---
 
@@ -42,6 +46,11 @@ after the file has already been opened. The hook can report that an
 unrecognised process read the HTTPS private key; it cannot prevent it. On a
 platform with trampoline support the hook attaches, but its deny branch is
 still gated on a spoofable `comm` check and should not be enabled as-is.
+
+```text
+file_open -> BPF-LSM attach unavailable on ARM32 -> userspace report
+                                           (no in-kernel deny)
+```
 
 ## Tooling: no `bpftool` on the target, and it will not build for ARM32
 
@@ -70,11 +79,24 @@ overlooked.
   **x86_64 host** in a bridged/TAP setup, where it builds and runs normally,
   rather than putting a multi-MB debug binary on the BMC's ~64 MB flash.
 
-Consequence: any command in [README.md](README.md) that runs `bpftool` on the
+Consequence: any command in [README.md](../README.md) that runs `bpftool` on the
 BMC — the deployment and troubleshooting verification steps — assumes a tool
 the image does not carry. Treat those as host-side or bridged-debugging steps.
 
+```text
+AST2600 image --no bpftool--> daemon logs / procfs / dmesg
+                                      ^
+                                      |
+                         host-side bpftool over TAP/bridge
+```
+
 ## Detection coverage
+
+```text
+full request or ClientHello -> fixed capture window -> detector input
+              |
+            excess is unseen
+```
 
 - **Payload inspection is capped at 127 bytes per call.** A signature that
   falls entirely past that offset in a single `SSL_write`/`SSL_read` is not
@@ -99,6 +121,11 @@ the image does not carry. Treat those as host-side or bridged-debugging steps.
 
 ## Attribution and enforcement
 
+```text
+verdict -> address? -> IPv4 blocklist map -> future packets dropped
+  \-> full 4-tuple? -> SOCK_DESTROY -> current connection torn down
+```
+
 - **The blocklist applies to a source address on every port**, not just 443.
   A false positive therefore removes access to *all* BMC services for the
   blocklist TTL (300s). This is why cipher-suite and SNI detection are
@@ -116,15 +143,18 @@ the image does not carry. Treat those as host-side or bridged-debugging steps.
 - **Kernel-side session binding (`ssl_uprobe`'s `tcp_recvmsg`/`tcp_sendmsg`
   kprobes plus `SSL_accept`/`SSL_connect`/`SSL_free` uprobes) now resolves this
   without `/proc`**, for both IPv4 and IPv6, port 443 only — see
-  `programs/DESIGN.md`'s "Kernel-side session binding" section for the
-  mechanism and `detections/DESIGN.md` for how a resolved tuple reaches
+  `PROGRAM.md`'s "Kernel-side session binding" section for the
+  mechanism and `DETECTIONS.md` for how a resolved tuple reaches
   `EventMeta`. It is entirely additive: `/proc`-based `ProcPeerResolver`
   remains the fallback, unchanged, whenever the binding does not apply —
   chiefly a connection that predates the daemon's attach (nothing recorded its
   tuple before the socket started being used), a non-OpenSSL-API caller this
   binding's uprobes never see, or the rare thread-affinity miss described
   next. Fixes the common bmcweb case; does not claim to resolve every uprobe
-  event.
+  event. The genuine (non-mapped) IPv6 code path is implemented and reviewed
+  but not live-verified — this project's QEMU/SLIRP test networking has IPv6
+  disabled at the kernel level; only an IPv4 peer through bmcweb's dual-stack
+  (`::`) listener has actually been exercised live.
 - **The binding trusts calling-thread affinity between record and consume,
   and is safe by construction if that trust is misplaced.** A kprobe records
   "the port-443 socket this thread most recently touched"; `SSL_accept`/
@@ -186,4 +216,4 @@ the image does not carry. Treat those as host-side or bridged-debugging steps.
 ---
 
 *Per-detection trigger recipes, live-verification status, and the QEMU/SLIRP
-testing traps are in [README.md](README.md#exercising-the-detections).*
+testing traps are in [README.md](../README.md#exercising-the-detections).*
