@@ -64,7 +64,7 @@ TrafficObservedDetection<struct uprobe_event> detection{&resolver};
 detection.inspect(&raw, sizeof(raw), meta);
 
 EXPECT_EQ(meta.peer_resolver, &resolver);
-EXPECT_EQ(meta.remote_ip_v4, 0u);
+EXPECT_FALSE(meta.remote_ip.isSet());
 ```
 
 `::testing::_` matches any argument. Other useful matchers include
@@ -77,7 +77,7 @@ interaction the test requires:
 EXPECT_CALL(resolver, resolvePeer(::testing::_))
       .Times(1)
       .WillOnce(::testing::Invoke([](EventMeta& resolved) noexcept {
-            resolved.remote_ip_v4 = 0x0100000A;
+            resolved.remote_ip.setV4(0x0100000A);
             return true;
       }));
 

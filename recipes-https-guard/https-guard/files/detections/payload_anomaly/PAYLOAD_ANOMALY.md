@@ -181,12 +181,12 @@ uprobe-fed detection shares.
 | `xdp_tls` | `SEC("xdp")` | plaintext-HTTP-on-443 bytes |
 
 Attach mechanics, including why `pid = -1` is deliberate, are in
-[`programs/DESIGN.md`](../../programs/DESIGN.md).
+[`PROGRAM.md`](../../../../../docs/PROGRAM.md).
 
 ## Limits worth knowing
 
 - **Capped at 127 bytes per call.** A signature landing entirely past that offset in a single call is not seen. Observed directly: a signature in a late custom header did not fire, while the same signature early in the request path did — on both directions.
-- **Process identity is not verified.** `pid = -1` means this cannot distinguish bmcweb from anything else using the same library, and the reported process name is self-reported `comm`, changeable by the process itself (`prctl(PR_SET_NAME)`, or just naming the binary anything). Treat it as a hint. [`cert_access/`](../cert_access/DESIGN.md) is the stronger mechanism aimed at a related but distinct question.
+- **Process identity is not verified.** `pid = -1` means this cannot distinguish bmcweb from anything else using the same library, and the reported process name is self-reported `comm`, changeable by the process itself (`prctl(PR_SET_NAME)`, or just naming the binary anything). Treat it as a hint. [`cert_access/`](../cert_access/CERT_ACCESS.md) is the stronger mechanism aimed at a related but distinct question.
 - **One request usually produces two events** — the client's write and bmcweb's read of the same bytes. The second frequently cannot be attributed to a connection and declines to enforce.
 
 ## How to trigger it

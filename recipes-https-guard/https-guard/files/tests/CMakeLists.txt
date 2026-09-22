@@ -1,5 +1,5 @@
 # Unit-test target: exercises pure C++ logic — currently the detections/
-# layer (IDetector implementations) — with no kernel/BPF/root/QEMU access at
+# layer (IDetection implementations) — with no kernel/BPF/root/QEMU access at
 # runtime (nothing here opens a BPF map, kills a socket or needs privilege).
 # It does link libbpf and actions_lib (see the comment below) since
 # detections_lib's object files need those symbols to resolve, even though no

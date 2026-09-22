@@ -6,7 +6,7 @@ does not parse events, decide whether one is a violation, or dispatch a
 countermeasure.
 
 Per-detection rationale — what each rule looks for, how it is fed, and what it
-cannot see — lives in [`detections/<family>/DESIGN.md`](../detections/), one
+cannot see — lives in [`detections/<family>/<FAMILY>.md`](../recipes-https-guard/https-guard/files/detections/), one
 document per detection. This document is about the machinery underneath them.
 
 ## Two classes, and which way the inheritance runs
@@ -103,7 +103,7 @@ means every process on the system**, not just bmcweb. That is deliberate: a
 compromised BMC service exfiltrating over TLS, or a tool other than bmcweb
 probing something over HTTPS, shows up here exactly as a legitimate client does.
 It is also this hook's biggest gap — see
-[`detections/payload_anomaly/DESIGN.md`](../detections/payload_anomaly/DESIGN.md)
+[`detections/payload_anomaly/PAYLOAD_ANOMALY.md`](../recipes-https-guard/https-guard/files/detections/payload_anomaly/PAYLOAD_ANOMALY.md)
 on why `comm` is a hint and not an identity.
 
 Three BPF programs attach, not two, because `SSL_read` needs a paired
@@ -116,7 +116,7 @@ entry+return probe:
 | `https_guard_ssl_read_exit` | `uprobe/ssl_read` | `retprobe=true`, reads + submits |
 
 The reason is in
-[`detections/payload_anomaly/DESIGN.md`](../detections/payload_anomaly/DESIGN.md):
+[`detections/payload_anomaly/PAYLOAD_ANOMALY.md`](../recipes-https-guard/https-guard/files/detections/payload_anomaly/PAYLOAD_ANOMALY.md):
 `SSL_read`'s buffer is an *output* parameter, uninitialised at entry.
 
 **Attach criticality:** `SSL_write` is this hook's required signal. Either half
@@ -124,7 +124,7 @@ of the `SSL_read` pair failing is logged but non-fatal, since `SSL_write` alone
 still works. The daemon refuses to start only if *zero* hooks attach.
 
 **Kernel-side session binding** (five more programs, all non-fatal — see
-`detections/DESIGN.md`'s peer-attribution notes and `LIMITATIONS.md`) resolves
+`DETECTIONS.md`'s peer-attribution notes and `LIMITATIONS.md`) resolves
 an `SSL*` to its socket 4-tuple without `/proc`, so attribution keeps working
 once a process — chiefly bmcweb — owns more than one established connection,
 which is exactly where the `/proc`-based `ProcPeerResolver` fails closed:
@@ -195,7 +195,7 @@ virtual NICs during development, at a cost that does not matter there. Passing
 no mode bit already defaults to native, but the code names `XDP_FLAGS_DRV_MODE`
 explicitly and does the DRV→SKB downgrade itself, so the startup log says which
 mode actually took. See also the platform-adaptive section of the top-level
-[`DESIGN.md`](../../../../DESIGN.md). XDP requires a real netdev, which SLIRP-mode
+[`DESIGN.md`](DESIGN.md). XDP requires a real netdev, which SLIRP-mode
 QEMU and some NICs do not offer, so this hook is auxiliary specifically so its
 absence never stops the daemon.
 
@@ -213,7 +213,7 @@ https_guard: failed to attach LSM cert-access-guard (non-fatal): Unknown error 5
 fixable at the BPF-program level. `2 of 3` is therefore the expected healthy
 state here. Full reasoning, and the two approaches tried before settling on a
 userspace identity check, in
-[`detections/cert_access/DESIGN.md`](../detections/cert_access/DESIGN.md).
+[`detections/cert_access/CERT_ACCESS.md`](../recipes-https-guard/https-guard/files/detections/cert_access/CERT_ACCESS.md).
 
 ## The BPF object is one translation unit
 
@@ -263,5 +263,5 @@ Each hook's `ebpf/<hook>_event.h` defines the bytes it puts on the ring buffer.
 Both the BPF program and the C++ side compile the same header, so there is no
 marshalling step — and nothing to catch a mismatch, which is why the layout is
 nested rather than flat. Full detail, including the two `static_assert`ed
-invariants, is in the top-level [`DESIGN.md`](../../../../DESIGN.md) under "The raw
+invariants, is in the top-level [`DESIGN.md`](DESIGN.md) under "The raw
 event ABI".

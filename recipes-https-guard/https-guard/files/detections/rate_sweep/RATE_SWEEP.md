@@ -9,7 +9,7 @@
 the TTL); no TCP teardown, since each verdict is attributed to an address, not
 a socket.
 
-## Why one DESIGN.md for three rules
+## Why one RATE_SWEEP.md for three rules
 
 All three read the same `LRU_HASH`, counted by the same two points in
 `xdp_tls`'s XDP program, aggregated by the one `ConnRateSweeper` (in
@@ -235,7 +235,7 @@ whichever of these three rules is over its threshold, and dispatches directly.
 It lives under `core/` rather than in this directory because it is pipeline
 machinery that drives three rules, the same relationship `core/engine/`'s
 `DetectLoop` has to `IDetection` — not a fourth rule of its own. See
-[`detections/DESIGN.md`](../DESIGN.md) for why its timer runs off the record
+[`DETECTIONS.md`](../../../../../docs/DETECTIONS.md) for why its timer runs off the record
 strand, and `core/sweep/ConnRateSweeper.hpp` for why `sweep()` is a coroutine
 despite nothing in it awaiting anything yet.
 
@@ -251,7 +251,7 @@ Nothing hooks any of these three detections directly — there is no
 - **`SlowlorisDetector`** — verified live once at a **lowered** threshold (5 connections against a limit of 3), never at the shipped default of 100. **Not reliably reproducible through a QEMU SLIRP hostfwd:** the original run reached 5 held connections, but a later re-measurement saw only ~1 of 3–8 held host connections arrive as guest-side `open_conns` — SLIRP does not forward held connections to the guest consistently, and how many arrive is environment/timing/version-dependent. Exercise this rule on a real netdev or a bridged/TAP network for a dependable result.
 - **`RenegotiationDetector`** — verified live at a **lowered** threshold, not at the shipped default. The trigger sends its `0x16` handshake records down *one* connection (a storm is many handshakes on a single connection, not one connection each), which is also what survives SLIRP's per-connection loss. bmcweb RSTs the malformed record stream after ~3 records, so one connection delivers ~3 countable records regardless of how many are sent — enough to cross a threshold of 2 (fires; full enforcement and a measured 326s lockout), never the shipped 200.
 
-See [LIMITATIONS.md](../../../../../LIMITATIONS.md) for the SLIRP ceiling in full.
+See [LIMITATIONS.md](../../../../../docs/LIMITATIONS.md) for the SLIRP ceiling in full.
 
 ## How to trigger it
 

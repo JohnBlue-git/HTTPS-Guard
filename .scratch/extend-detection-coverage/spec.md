@@ -1,6 +1,6 @@
 # Extend detection coverage beyond TLS-version and payload-anomaly
 
-Status: ready-for-agent
+Status: done — 20 tickets closed (1 superseded), see PRIORITY.md
 
 ## Problem Statement
 

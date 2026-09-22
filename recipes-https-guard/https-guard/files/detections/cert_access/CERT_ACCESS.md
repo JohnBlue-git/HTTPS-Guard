@@ -141,7 +141,7 @@ or did not — before the rule ever ran.
 
 `lsm_cert_guard`, `SEC("lsm.s/file_open")` — sleepable, because the path
 comparison needs it. Attach mechanics and the expected failure are in
-[`programs/DESIGN.md`](../../programs/DESIGN.md).
+[`PROGRAM.md`](../../../../../docs/PROGRAM.md).
 
 ## Limits worth knowing
 

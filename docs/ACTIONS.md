@@ -16,8 +16,8 @@ detections/  ──── Verdict{severity, message_id, message, actionable} ─
                          full 4-tuple)        an address)
 ```
 
-Per-action rationale: [`log/`](log/DESIGN.md), [`tcp/`](tcp/DESIGN.md),
-[`blocklist/`](blocklist/DESIGN.md). This document is `ActionLoop`.
+Per-action rationale: [`log/`](../recipes-https-guard/https-guard/files/actions/log/LOG.md), [`tcp/`](../recipes-https-guard/https-guard/files/actions/tcp/TCP.md),
+[`blocklist/`](../recipes-https-guard/https-guard/files/actions/blocklist/BLOCKLIST.md). This document is `ActionLoop`.
 
 ## ActionLoop
 
@@ -90,7 +90,7 @@ pure overhead. The two loops look similar and are not interchangeable.
 The full argument — including what would make an awaitable `inspect()` worth
 having, and why the obvious optimisation on that path is a different executor
 rather than a coroutine — is in
-[`detections/DESIGN.md`](../detections/DESIGN.md#could-a-detection-have-a-suspension-point-worth-optimizing).
+[`DETECTIONS.md`](DETECTIONS.md#could-a-detection-have-a-suspension-point-worth-optimizing).
 
 ### Why unbounded here, when DetectLoop is bounded
 
@@ -118,7 +118,7 @@ others still run to completion. Enforcement is best-effort, and partial
 enforcement beats none. The group's joint reporting is what stops a partial
 failure being *invisible*, which is how
 `SOCK_DESTROY` managed to fail on every single event for a long time while the
-Redfish log looked healthy — see [`tcp/DESIGN.md`](tcp/DESIGN.md).
+Redfish log looked healthy — see [`TCP.md`](../recipes-https-guard/https-guard/files/actions/tcp/TCP.md).
 
 ### Producers
 
